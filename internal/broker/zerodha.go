@@ -184,6 +184,28 @@ func (z *ZerodhaBroker) loadSession() error {
 	return nil
 }
 
+// CreateTicker creates a new ticker instance using the current session.
+func (z *ZerodhaBroker) CreateTicker() (*ZerodhaTicker, error) {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+	
+	if !z.authenticated || z.accessToken == "" {
+		return nil, fmt.Errorf("not authenticated - please login first")
+	}
+	
+	return NewZerodhaTicker(ZerodhaTickerConfig{
+		APIKey:      z.apiKey,
+		AccessToken: z.accessToken,
+	}), nil
+}
+
+// GetAccessToken returns the current access token (for ticker initialization).
+func (z *ZerodhaBroker) GetAccessToken() string {
+	z.mu.RLock()
+	defer z.mu.RUnlock()
+	return z.accessToken
+}
+
 func (z *ZerodhaBroker) saveSession(accessToken string) error {
 	// Ensure directory exists
 	dir := filepath.Dir(z.tokenPath)

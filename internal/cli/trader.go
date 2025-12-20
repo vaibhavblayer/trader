@@ -4,9 +4,14 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"zerodha-trader/internal/agents"
+	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
 	"zerodha-trader/internal/store"
 )
@@ -64,7 +69,7 @@ This command provides access to:
 }
 
 func newTraderStartCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start the autonomous trading daemon",
 		Long: `Start the autonomous trading daemon.
@@ -81,18 +86,31 @@ The daemon will:
 			output := NewOutput(cmd)
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			watchlist, _ := cmd.Flags().GetString("watchlist")
+			interval, _ := cmd.Flags().GetInt("interval")
 
 			output.Bold("Starting Autonomous Trading Daemon")
 			output.Println()
 
+			// Validate prerequisites
+			if app.Broker == nil {
+				output.Error("Broker not initialized. Please run 'trader auth login' first.")
+				return fmt.Errorf("broker not initialized")
+			}
+
+			if !app.Broker.IsAuthenticated() {
+				output.Error("Not authenticated. Please run 'trader auth login' first.")
+				return fmt.Errorf("not authenticated")
+			}
+
 			// Display configuration
-			output.Printf("  Mode:           %s\n", app.Config.Agents.AutonomousMode)
-			output.Printf("  Confidence:     %.0f%%\n", app.Config.Agents.AutoExecuteThreshold)
+			output.Printf("  Mode:             %s\n", app.Config.Agents.AutonomousMode)
+			output.Printf("  Confidence:       %.0f%%\n", app.Config.Agents.AutoExecuteThreshold)
 			output.Printf("  Max Daily Trades: %d\n", app.Config.Agents.MaxDailyTrades)
-			output.Printf("  Max Daily Loss: %s\n", FormatIndianCurrency(app.Config.Agents.MaxDailyLoss))
-			output.Printf("  Cooldown:       %d min\n", app.Config.Agents.CooldownMinutes)
+			output.Printf("  Max Daily Loss:   %s\n", FormatIndianCurrency(app.Config.Agents.MaxDailyLoss))
+			output.Printf("  Cooldown:         %d min\n", app.Config.Agents.CooldownMinutes)
+			output.Printf("  Scan Interval:    %d sec\n", interval)
 			if watchlist != "" {
-				output.Printf("  Watchlist:      %s\n", watchlist)
+				output.Printf("  Watchlist:        %s\n", watchlist)
 			}
 			output.Println()
 
@@ -106,21 +124,88 @@ The daemon will:
 				output.Println()
 			}
 
-			// Check market status
-			output.Info("Checking market status...")
-			output.Printf("  Market: %s\n", output.MarketStatus("OPEN"))
+			// Get watchlist symbols
+			symbols, err := getWatchlistSymbols(app, watchlist)
+			if err != nil {
+				output.Error("Failed to get watchlist: %v", err)
+				return err
+			}
+			output.Printf("  Monitoring %d symbols\n", len(symbols))
 			output.Println()
 
-			// Start daemon
+			// Create orchestrator with agents
+			orchestrator := createOrchestrator(app)
+
+			// Start the daemon
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// Handle graceful shutdown
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+			go func() {
+				<-sigChan
+				output.Println()
+				output.Info("Shutting down daemon...")
+				cancel()
+			}()
+
+			if err := orchestrator.Start(ctx); err != nil {
+				output.Error("Failed to start orchestrator: %v", err)
+				return err
+			}
+
 			output.Success("✓ Daemon started")
 			output.Println()
+			output.Dim("Press Ctrl+C to stop")
+			output.Println()
 
-			output.Dim("Use 'trader trader status' to check daemon status")
-			output.Dim("Use 'trader trader stop' to stop the daemon")
+			// Main trading loop
+			ticker := time.NewTicker(time.Duration(interval) * time.Second)
+			defer ticker.Stop()
 
-			return nil
+			scanCount := 0
+			for {
+				select {
+				case <-ctx.Done():
+					output.Info("Daemon stopped")
+					return nil
+				case <-ticker.C:
+					scanCount++
+					output.Dim("[%s] Scan #%d - Analyzing %d symbols...",
+						time.Now().Format("15:04:05"), scanCount, len(symbols))
+
+					// Process each symbol
+					for _, symbol := range symbols {
+						decision, err := processSymbol(ctx, app, orchestrator, symbol, dryRun)
+						if err != nil {
+							output.Dim("  %s: error - %v", symbol, err)
+							continue
+						}
+
+						if decision == nil {
+							continue
+						}
+
+						// Display decision
+						displayDecision(output, decision, dryRun)
+
+						// Execute if approved
+						if decision.Executed && !dryRun {
+							executeDecision(ctx, app, output, decision)
+						}
+					}
+				}
+			}
 		},
 	}
+
+	cmd.Flags().Bool("dry-run", false, "Run without executing trades")
+	cmd.Flags().String("watchlist", "default", "Watchlist to monitor")
+	cmd.Flags().Int("interval", 60, "Scan interval in seconds")
+
+	return cmd
 }
 
 func newTraderStopCmd(app *App) *cobra.Command {
@@ -307,7 +392,7 @@ Shows timestamp, symbol, action, confidence, execution status, and P&L for each 
 				return nil
 			}
 
-			output.Bold("Recent AI Decisions")
+			output.Bold("Recent AI Decisions %s", output.SourceTag(SourceAI))
 			output.Println()
 
 			table := NewTable(output, "ID", "Time", "Symbol", "Action", "Confidence", "Executed", "Outcome", "P&L")
@@ -661,7 +746,6 @@ func newTraderConfigCmd(app *App) *cobra.Command {
 			output.Println()
 
 			output.Printf("  Model:              %s\n", app.Config.Agents.Model)
-			output.Printf("  Temperature:        %.1f\n", app.Config.Agents.Temperature)
 			output.Printf("  Autonomous Mode:    %s\n", app.Config.Agents.AutonomousMode)
 			output.Printf("  Auto Threshold:     %.0f%%\n", app.Config.Agents.AutoExecuteThreshold)
 			output.Printf("  Max Daily Trades:   %d\n", app.Config.Agents.MaxDailyTrades)
@@ -760,4 +844,261 @@ func newTraderHealthCmd(app *App) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+
+// getWatchlistSymbols retrieves symbols from the specified watchlist.
+func getWatchlistSymbols(app *App, watchlistName string) ([]string, error) {
+	if app.Store == nil {
+		// Return default symbols if no store
+		return []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}, nil
+	}
+
+	ctx := context.Background()
+	symbols, err := app.Store.GetWatchlist(ctx, watchlistName)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(symbols) == 0 {
+		// Return default symbols
+		return []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}, nil
+	}
+
+	return symbols, nil
+}
+
+// createOrchestrator creates an orchestrator with all enabled agents.
+func createOrchestrator(app *App) *agents.Orchestrator {
+	var agentList []agents.Agent
+
+	// Get agent weights from config
+	weights := app.Config.Agents.AgentWeights
+	if weights == nil {
+		weights = map[string]float64{
+			"technical": 0.35,
+			"research":  0.25,
+			"news":      0.15,
+			"risk":      0.25,
+		}
+	}
+
+	// Create enabled agents
+	for _, agentName := range app.Config.Agents.EnabledAgents {
+		weight := weights[agentName]
+		if weight == 0 {
+			weight = 0.2 // Default weight
+		}
+
+		switch agentName {
+		case "technical":
+			agentList = append(agentList, agents.NewTechnicalAgent(app.LLMClient, weight))
+		case "research":
+			// WebSearchClient is optional - pass nil for now
+			agentList = append(agentList, agents.NewResearchAgent(app.LLMClient, nil, weight))
+		case "news":
+			// WebSearchClient is optional - pass nil for now
+			agentList = append(agentList, agents.NewNewsAgent(app.LLMClient, nil, weight))
+		}
+	}
+
+	// Create trader and risk agents
+	traderAgent := agents.NewTraderAgent(app.LLMClient, weights, 1.0)
+	riskAgent := agents.NewRiskAgent(nil, weights["risk"])
+
+	return agents.NewOrchestrator(
+		agentList,
+		traderAgent,
+		riskAgent,
+		&app.Config.Agents,
+		app.Store,
+		nil, // notifier - can be added later
+	)
+}
+
+// processSymbol analyzes a symbol and returns a trading decision.
+func processSymbol(ctx context.Context, app *App, orchestrator *agents.Orchestrator, symbol string, dryRun bool) (*models.Decision, error) {
+	// Format symbol with exchange prefix for Zerodha API
+	fullSymbol := "NSE:" + symbol
+
+	// Get current quote
+	quote, err := app.Broker.GetQuote(ctx, fullSymbol)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get quote: %w", err)
+	}
+
+	// Get historical data for analysis
+	candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+		Symbol:    symbol,
+		Exchange:  models.NSE,
+		Timeframe: "day",
+		From:      time.Now().AddDate(0, -3, 0),
+		To:        time.Now(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get historical data: %w", err)
+	}
+
+	// Build analysis request
+	req := agents.AnalysisRequest{
+		Symbol:       symbol,
+		CurrentPrice: quote.LTP,
+		Candles: map[string][]models.Candle{
+			"day": candles,
+		},
+	}
+
+	// Process through orchestrator
+	decision, err := orchestrator.ProcessSymbol(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("analysis failed: %w", err)
+	}
+
+	return decision, nil
+}
+
+// displayDecision shows a trading decision in the output.
+func displayDecision(output *Output, decision *models.Decision, dryRun bool) {
+	if decision.Action == "HOLD" {
+		return // Don't display HOLD decisions
+	}
+
+	actionColor := ColorYellow
+	if decision.Action == "BUY" {
+		actionColor = ColorGreen
+	} else if decision.Action == "SELL" {
+		actionColor = ColorRed
+	}
+
+	output.Println()
+	output.Bold("🤖 AI Decision: %s %s", output.ColoredString(actionColor, decision.Action), decision.Symbol)
+	output.Printf("   Confidence: %.1f%%\n", decision.Confidence)
+
+	if decision.EntryPrice > 0 {
+		output.Printf("   Entry: %s | SL: %s\n",
+			FormatIndianCurrency(decision.EntryPrice),
+			FormatIndianCurrency(decision.StopLoss))
+	}
+
+	if len(decision.Targets) > 0 {
+		output.Printf("   Targets: %s", FormatIndianCurrency(decision.Targets[0]))
+		for i := 1; i < len(decision.Targets) && i < 3; i++ {
+			output.Printf(", %s", FormatIndianCurrency(decision.Targets[i]))
+		}
+		output.Println()
+	}
+
+	if decision.Reasoning != "" {
+		output.Printf("   Reason: %s\n", truncateString(decision.Reasoning, 80))
+	}
+
+	if decision.Executed {
+		if dryRun {
+			output.Printf("   Status: %s\n", output.Yellow("⚡ WOULD EXECUTE (dry-run)"))
+		} else {
+			output.Printf("   Status: %s\n", output.Green("⚡ EXECUTING"))
+		}
+	} else {
+		output.Dim("   Status: ○ Not executed (below threshold or risk rejected)")
+	}
+}
+
+// executeDecision places an order based on the AI decision.
+func executeDecision(ctx context.Context, app *App, output *Output, decision *models.Decision) {
+	// Calculate position size based on config
+	positionSize := calculatePositionSize(app, decision)
+
+	// Determine order side
+	side := models.OrderSideBuy
+	if decision.Action == "SELL" {
+		side = models.OrderSideSell
+	}
+
+	// Create order
+	order := &models.Order{
+		Symbol:   decision.Symbol,
+		Exchange: models.NSE,
+		Side:     side,
+		Product:  models.ProductMIS, // Intraday
+		Type:     models.OrderTypeLimit,
+		Quantity: positionSize,
+		Price:    decision.EntryPrice,
+	}
+
+	// Place the order
+	result, err := app.Broker.PlaceOrder(ctx, order)
+	if err != nil {
+		output.Error("   ❌ Order failed: %v", err)
+		return
+	}
+
+	output.Success("   ✓ Order placed: %s", result.OrderID)
+
+	// Update decision with order ID
+	decision.OrderID = result.OrderID
+
+	// Save to store
+	if app.Store != nil {
+		if err := app.Store.SaveDecision(ctx, decision); err != nil {
+			output.Dim("   Warning: Failed to save decision: %v", err)
+		}
+	}
+
+	// Place stop-loss order (GTT)
+	if decision.StopLoss > 0 {
+		slSide := models.OrderSideSell
+		if decision.Action == "SELL" {
+			slSide = models.OrderSideBuy
+		}
+
+		slOrder := &models.GTTOrder{
+			Symbol:       decision.Symbol,
+			Exchange:     models.NSE,
+			TriggerType:  "single",
+			TriggerPrice: decision.StopLoss,
+			Orders: []models.GTTOrderLeg{
+				{
+					Side:     slSide,
+					Product:  models.ProductMIS,
+					Type:     models.OrderTypeMarket,
+					Quantity: positionSize,
+				},
+			},
+		}
+
+		gttResult, err := app.Broker.PlaceGTT(ctx, slOrder)
+		if err != nil {
+			output.Dim("   Warning: Failed to place SL order: %v", err)
+		} else {
+			output.Success("   ✓ Stop-loss GTT placed: %s", gttResult.TriggerID)
+		}
+	}
+}
+
+// calculatePositionSize determines the number of shares to trade.
+func calculatePositionSize(app *App, decision *models.Decision) int {
+	maxPosition := app.Config.Agents.MaxPositionSize
+	if maxPosition <= 0 {
+		maxPosition = 100000 // Default ₹1 lakh
+	}
+
+	if decision.EntryPrice <= 0 {
+		return 1
+	}
+
+	// Calculate quantity based on max position size
+	quantity := int(maxPosition / decision.EntryPrice)
+	if quantity < 1 {
+		quantity = 1
+	}
+
+	return quantity
+}
+
+// truncateString truncates a string to the specified length.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }

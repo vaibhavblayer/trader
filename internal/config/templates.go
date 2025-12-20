@@ -94,15 +94,16 @@ api_key = ""
 
 const agentsTemplate = `# Zerodha Go Trader Agent Configuration
 
-# LLM model to use
-model = "gpt-4o"
-# Temperature for LLM responses (0.0 - 1.0)
-temperature = 0.7
-# Maximum tokens for LLM responses
-max_tokens = 4096
+# LLM model to use (e.g., gpt-5.2, gpt-4o)
+model = "gpt-5.2"
 
-# Operating mode: FULL_AUTO, SEMI_AUTO, NOTIFY_ONLY, MANUAL
+# Operating mode:
+#   FULL_AUTO   - AI executes trades automatically when confidence >= threshold
+#   SEMI_AUTO   - AI recommends, user confirms each trade
+#   NOTIFY_ONLY - AI analyzes and notifies, no execution
+#   MANUAL      - AI only provides analysis on request
 autonomous_mode = "MANUAL"
+
 # Minimum confidence for automatic execution (0-100)
 auto_execute_threshold = 80.0
 # Maximum trades per day

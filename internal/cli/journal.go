@@ -4,9 +4,12 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"zerodha-trader/internal/store"
 )
 
 // addJournalCommands adds journal commands.
@@ -33,48 +36,61 @@ func newJournalTodayCmd(app *App) *cobra.Command {
 		Long:  "Display today's trades and journal entries.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 
 			output.Bold("Trading Journal - %s", FormatDate(time.Now()))
 			output.Println()
 
-			// Sample trades
-			trades := []struct {
-				time     time.Time
-				symbol   string
-				side     string
-				qty      int
-				entry    float64
-				exit     float64
-				pnl      float64
-				notes    string
-			}{
-				{time.Now().Add(-4 * time.Hour), "RELIANCE", "BUY", 10, 2440.00, 2465.00, 2500.00, "Breakout trade, good entry"},
-				{time.Now().Add(-2 * time.Hour), "INFY", "BUY", 5, 1525.00, 1510.00, -750.00, "Stopped out, weak market"},
-				{time.Now().Add(-1 * time.Hour), "TCS", "BUY", 8, 3420.00, 3455.00, 2800.00, "Momentum trade"},
+			// Get today's trades from store
+			if app.Store == nil {
+				output.Warning("Store not initialized. No trade data available.")
+				return nil
+			}
+
+			today := time.Now()
+			startOfDay := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, today.Location())
+			endOfDay := startOfDay.Add(24 * time.Hour)
+
+			trades, err := app.Store.GetTrades(ctx, store.TradeFilter{
+				StartDate: startOfDay,
+				EndDate:   endOfDay,
+				Limit:     100,
+			})
+			if err != nil {
+				output.Error("Failed to fetch trades: %v", err)
+				return err
+			}
+
+			if len(trades) == 0 {
+				output.Info("No trades recorded today.")
+				output.Println()
+				output.Dim("Tip: Trades are recorded when you execute orders through the trader CLI.")
+				return nil
 			}
 
 			var totalPnL float64
 			var wins, losses int
 
 			output.Bold("Trades")
-			table := NewTable(output, "Time", "Symbol", "Side", "Qty", "Entry", "Exit", "P&L", "Notes")
+			table := NewTable(output, "Time", "Symbol", "Side", "Qty", "Entry", "Exit", "P&L", "Strategy")
 			for _, t := range trades {
-				totalPnL += t.pnl
-				if t.pnl > 0 {
+				totalPnL += t.PnL
+				if t.PnL > 0 {
 					wins++
 				} else {
 					losses++
 				}
 
 				table.AddRow(
-					FormatTime(t.time),
-					t.symbol,
-					t.side,
-					fmt.Sprintf("%d", t.qty),
-					FormatPrice(t.entry),
-					FormatPrice(t.exit),
-					output.FormatPnL(t.pnl),
-					TruncateString(t.notes, 25),
+					FormatTime(t.Timestamp),
+					t.Symbol,
+					string(t.Side),
+					fmt.Sprintf("%d", t.Quantity),
+					FormatPrice(t.EntryPrice),
+					FormatPrice(t.ExitPrice),
+					output.FormatPnL(t.PnL),
+					TruncateString(t.Strategy, 15),
 				)
 			}
 			table.Render()
@@ -82,15 +98,26 @@ func newJournalTodayCmd(app *App) *cobra.Command {
 			output.Println()
 			output.Bold("Summary")
 			output.Printf("  Total Trades: %d\n", len(trades))
-			output.Printf("  Wins/Losses:  %d/%d (%.0f%% win rate)\n", wins, losses, float64(wins)/float64(len(trades))*100)
+			winRate := 0.0
+			if len(trades) > 0 {
+				winRate = float64(wins) / float64(len(trades)) * 100
+			}
+			output.Printf("  Wins/Losses:  %d/%d (%.0f%% win rate)\n", wins, losses, winRate)
 			output.Printf("  Total P&L:    %s\n", output.FormatPnL(totalPnL))
 			output.Println()
 
-			// Daily notes
-			output.Bold("Notes")
-			output.Println("  Market opened gap up, NIFTY above 19500.")
-			output.Println("  Good momentum in large caps, avoided mid-caps.")
-			output.Println("  Need to work on position sizing - INFY loss was too large.")
+			// Get today's journal entries
+			entries, err := app.Store.GetJournal(ctx, store.JournalFilter{
+				StartDate: startOfDay,
+				EndDate:   endOfDay,
+				Limit:     10,
+			})
+			if err == nil && len(entries) > 0 {
+				output.Bold("Notes")
+				for _, e := range entries {
+					output.Printf("  %s\n", e.Content)
+				}
+			}
 
 			return nil
 		},
@@ -204,6 +231,9 @@ func newJournalReportCmd(app *App) *cobra.Command {
   trader journal report --period monthly`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			period, _ := cmd.Flags().GetString("period")
 
 			var periodLabel string
@@ -228,71 +258,149 @@ func newJournalReportCmd(app *App) *cobra.Command {
 			output.Bold("%s Performance Report", periodLabel)
 			output.Printf("  %s to %s\n\n", FormatDate(startDate), FormatDate(now))
 
+			// Get trades from store
+			if app.Store == nil {
+				output.Warning("Store not initialized. No trade data available.")
+				return nil
+			}
+
+			trades, err := app.Store.GetTrades(ctx, store.TradeFilter{
+				StartDate: startDate,
+				EndDate:   now,
+				Limit:     1000,
+			})
+			if err != nil {
+				output.Error("Failed to fetch trades: %v", err)
+				return err
+			}
+
+			if len(trades) == 0 {
+				output.Info("No trades found for this period.")
+				return nil
+			}
+
+			// Calculate stats
+			var grossProfit, grossLoss float64
+			var wins, losses int
+			var largestWin, largestLoss float64
+			symbolStats := make(map[string]struct {
+				trades  int
+				pnl     float64
+				wins    int
+			})
+			strategyStats := make(map[string]struct {
+				trades  int
+				pnl     float64
+				wins    int
+			})
+
+			for _, t := range trades {
+				if t.PnL > 0 {
+					wins++
+					grossProfit += t.PnL
+					if t.PnL > largestWin {
+						largestWin = t.PnL
+					}
+				} else {
+					losses++
+					grossLoss += t.PnL
+					if t.PnL < largestLoss {
+						largestLoss = t.PnL
+					}
+				}
+
+				// By symbol
+				ss := symbolStats[t.Symbol]
+				ss.trades++
+				ss.pnl += t.PnL
+				if t.PnL > 0 {
+					ss.wins++
+				}
+				symbolStats[t.Symbol] = ss
+
+				// By strategy
+				strategy := t.Strategy
+				if strategy == "" {
+					strategy = "Manual"
+				}
+				st := strategyStats[strategy]
+				st.trades++
+				st.pnl += t.PnL
+				if t.PnL > 0 {
+					st.wins++
+				}
+				strategyStats[strategy] = st
+			}
+
+			netPnL := grossProfit + grossLoss
+			winRate := 0.0
+			if len(trades) > 0 {
+				winRate = float64(wins) / float64(len(trades)) * 100
+			}
+			avgWin := 0.0
+			if wins > 0 {
+				avgWin = grossProfit / float64(wins)
+			}
+			avgLoss := 0.0
+			if losses > 0 {
+				avgLoss = grossLoss / float64(losses)
+			}
+			profitFactor := 0.0
+			if grossLoss != 0 {
+				profitFactor = grossProfit / (-grossLoss)
+			}
+			expectancy := 0.0
+			if len(trades) > 0 {
+				expectancy = netPnL / float64(len(trades))
+			}
+
 			// Summary stats
 			output.Bold("Summary")
-			output.Printf("  Total Trades:     %d\n", 45)
-			output.Printf("  Winning Trades:   %d (%.0f%%)\n", 28, 62.2)
-			output.Printf("  Losing Trades:    %d (%.0f%%)\n", 17, 37.8)
-			output.Printf("  Gross Profit:     %s\n", output.Green(FormatIndianCurrency(85000)))
-			output.Printf("  Gross Loss:       %s\n", output.Red(FormatIndianCurrency(-32000)))
-			output.Printf("  Net P&L:          %s\n", output.FormatPnL(53000))
+			output.Printf("  Total Trades:     %d\n", len(trades))
+			output.Printf("  Winning Trades:   %d (%.0f%%)\n", wins, winRate)
+			output.Printf("  Losing Trades:    %d (%.0f%%)\n", losses, 100-winRate)
+			output.Printf("  Gross Profit:     %s\n", output.Green(FormatIndianCurrency(grossProfit)))
+			output.Printf("  Gross Loss:       %s\n", output.Red(FormatIndianCurrency(grossLoss)))
+			output.Printf("  Net P&L:          %s\n", output.FormatPnL(netPnL))
 			output.Println()
 
 			// Performance metrics
 			output.Bold("Performance Metrics")
-			output.Printf("  Win Rate:         %.1f%%\n", 62.2)
-			output.Printf("  Profit Factor:    %.2f\n", 2.65)
-			output.Printf("  Avg Win:          %s\n", FormatIndianCurrency(3035))
-			output.Printf("  Avg Loss:         %s\n", FormatIndianCurrency(-1882))
-			output.Printf("  Largest Win:      %s\n", FormatIndianCurrency(8500))
-			output.Printf("  Largest Loss:     %s\n", FormatIndianCurrency(-4200))
-			output.Printf("  Avg R:R:          1:1.61\n")
-			output.Printf("  Expectancy:       %s\n", FormatIndianCurrency(1178))
+			output.Printf("  Win Rate:         %.1f%%\n", winRate)
+			output.Printf("  Profit Factor:    %.2f\n", profitFactor)
+			output.Printf("  Avg Win:          %s\n", FormatIndianCurrency(avgWin))
+			output.Printf("  Avg Loss:         %s\n", FormatIndianCurrency(avgLoss))
+			output.Printf("  Largest Win:      %s\n", FormatIndianCurrency(largestWin))
+			output.Printf("  Largest Loss:     %s\n", FormatIndianCurrency(largestLoss))
+			output.Printf("  Expectancy:       %s\n", FormatIndianCurrency(expectancy))
 			output.Println()
 
-			// By symbol
-			output.Bold("Top Performers")
-			topSymbols := []struct {
-				symbol string
-				trades int
-				pnl    float64
-				winRate float64
-			}{
-				{"RELIANCE", 8, 15000, 75.0},
-				{"TCS", 6, 12500, 66.7},
-				{"HDFC", 5, 8500, 60.0},
+			// Top performers by symbol
+			if len(symbolStats) > 0 {
+				output.Bold("By Symbol")
+				for symbol, stats := range symbolStats {
+					wr := 0.0
+					if stats.trades > 0 {
+						wr = float64(stats.wins) / float64(stats.trades) * 100
+					}
+					output.Printf("  %-12s %d trades  %s  %.0f%% win\n",
+						symbol, stats.trades, output.FormatPnL(stats.pnl), wr)
+				}
+				output.Println()
 			}
-
-			for _, s := range topSymbols {
-				output.Printf("  %-12s %d trades  %s  %.0f%% win\n",
-					s.symbol, s.trades, output.FormatPnL(s.pnl), s.winRate)
-			}
-			output.Println()
 
 			// By strategy
-			output.Bold("By Strategy")
-			strategies := []struct {
-				name    string
-				trades  int
-				pnl     float64
-				winRate float64
-			}{
-				{"Breakout", 18, 28000, 66.7},
-				{"Pullback", 15, 18000, 60.0},
-				{"Momentum", 12, 7000, 58.3},
+			if len(strategyStats) > 0 {
+				output.Bold("By Strategy")
+				for strategy, stats := range strategyStats {
+					wr := 0.0
+					if stats.trades > 0 {
+						wr = float64(stats.wins) / float64(stats.trades) * 100
+					}
+					output.Printf("  %-12s %d trades  %s  %.0f%% win\n",
+						strategy, stats.trades, output.FormatPnL(stats.pnl), wr)
+				}
 			}
-
-			for _, s := range strategies {
-				output.Printf("  %-12s %d trades  %s  %.0f%% win\n",
-					s.name, s.trades, output.FormatPnL(s.pnl), s.winRate)
-			}
-			output.Println()
-
-			// Quality scores
-			output.Bold("Average Quality Scores")
-			output.Printf("  Entry Quality:      %s (3.8/5)\n", formatStars(4))
-			output.Printf("  Exit Quality:       %s (3.2/5)\n", formatStars(3))
-			output.Printf("  Risk Management:    %s (4.1/5)\n", formatStars(4))
 
 			return nil
 		},
@@ -304,7 +412,7 @@ func newJournalReportCmd(app *App) *cobra.Command {
 }
 
 func newJournalSearchCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "search <query>",
 		Short: "Search journal entries",
 		Long:  "Search journal entries by symbol, notes, or tags.",
@@ -314,6 +422,9 @@ func newJournalSearchCmd(app *App) *cobra.Command {
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			tag, _ := cmd.Flags().GetString("tag")
 			symbol, _ := cmd.Flags().GetString("symbol")
 
@@ -334,27 +445,66 @@ func newJournalSearchCmd(app *App) *cobra.Command {
 			}
 			output.Println()
 
-			// Sample results
-			results := []struct {
-				date   time.Time
-				symbol string
-				pnl    float64
-				notes  string
-			}{
-				{time.Now().AddDate(0, 0, -1), "RELIANCE", 2500, "Breakout trade, good entry timing"},
-				{time.Now().AddDate(0, 0, -3), "RELIANCE", -1200, "False breakout, should have waited"},
-				{time.Now().AddDate(0, 0, -5), "RELIANCE", 3800, "Strong momentum, held for target"},
+			if app.Store == nil {
+				output.Warning("Store not initialized. No journal data available.")
+				return nil
 			}
 
-			output.Printf("Found %d entries\n\n", len(results))
+			// Build filter
+			filter := store.JournalFilter{
+				Limit: 50,
+			}
+			if tag != "" {
+				filter.Tags = []string{tag}
+			}
 
-			table := NewTable(output, "Date", "Symbol", "P&L", "Notes")
-			for _, r := range results {
+			entries, err := app.Store.GetJournal(ctx, filter)
+			if err != nil {
+				output.Error("Failed to fetch journal entries: %v", err)
+				return err
+			}
+
+			// Filter by query if provided (search in content)
+			var filtered []struct {
+				date    time.Time
+				tradeID string
+				content string
+				mood    string
+			}
+			for _, e := range entries {
+				// If query provided, filter by content
+				if query != "" {
+					if !containsIgnoreCase(e.Content, query) {
+						continue
+					}
+				}
+				filtered = append(filtered, struct {
+					date    time.Time
+					tradeID string
+					content string
+					mood    string
+				}{
+					date:    e.Date,
+					tradeID: e.TradeID,
+					content: e.Content,
+					mood:    e.Mood,
+				})
+			}
+
+			if len(filtered) == 0 {
+				output.Info("No matching journal entries found.")
+				return nil
+			}
+
+			output.Printf("Found %d entries\n\n", len(filtered))
+
+			table := NewTable(output, "Date", "Trade ID", "Mood", "Content")
+			for _, r := range filtered {
 				table.AddRow(
 					FormatDate(r.date),
-					r.symbol,
-					output.FormatPnL(r.pnl),
-					TruncateString(r.notes, 40),
+					TruncateString(r.tradeID, 10),
+					r.mood,
+					TruncateString(r.content, 40),
 				)
 			}
 			table.Render()
@@ -362,4 +512,14 @@ func newJournalSearchCmd(app *App) *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().String("tag", "", "Filter by tag")
+	cmd.Flags().String("symbol", "", "Filter by symbol")
+
+	return cmd
+}
+
+// containsIgnoreCase checks if s contains substr (case-insensitive)
+func containsIgnoreCase(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }

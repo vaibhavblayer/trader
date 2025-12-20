@@ -9,7 +9,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
+	"zerodha-trader/internal/store"
 )
 
 // addPlanningCommands adds planning commands.
@@ -157,7 +159,7 @@ func displayPlanDetails(output *Output, plan *models.TradePlan) {
 }
 
 func newPlanListCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List trade plans",
 		Long:  "Display all trade plans with their current status.",
@@ -172,39 +174,31 @@ func newPlanListCmd(app *App) *cobra.Command {
 			status, _ := cmd.Flags().GetString("status")
 			symbol, _ := cmd.Flags().GetString("symbol")
 
-			// This would fetch from store
-			_ = ctx
-			_ = status
-			_ = symbol
+			var plans []models.TradePlan
 
-			// Sample data
-			plans := []models.TradePlan{
-				{
-					ID:         "PLAN001",
-					Symbol:     "RELIANCE",
-					Side:       models.OrderSideBuy,
-					EntryPrice: 2450,
-					StopLoss:   2400,
-					Target1:    2550,
-					RiskReward: 2.0,
-					Status:     models.PlanPending,
-					CreatedAt:  time.Now().Add(-2 * time.Hour),
-				},
-				{
-					ID:         "PLAN002",
-					Symbol:     "INFY",
-					Side:       models.OrderSideBuy,
-					EntryPrice: 1520,
-					StopLoss:   1480,
-					Target1:    1600,
-					RiskReward: 2.0,
-					Status:     models.PlanActive,
-					CreatedAt:  time.Now().Add(-1 * time.Hour),
-				},
+			if app.Store != nil {
+				filter := store.PlanFilter{
+					Symbol: symbol,
+				}
+				if status != "" {
+					filter.Status = models.PlanStatus(status)
+				}
+				var err error
+				plans, err = app.Store.GetPlans(ctx, filter)
+				if err != nil {
+					output.Error("Failed to get trade plans: %v", err)
+					return err
+				}
 			}
 
 			if output.IsJSON() {
 				return output.JSON(plans)
+			}
+
+			if len(plans) == 0 {
+				output.Info("No trade plans found")
+				output.Dim("Use 'trader plan add <symbol>' to create a plan")
+				return nil
 			}
 
 			output.Bold("Trade Plans")
@@ -236,6 +230,11 @@ func newPlanListCmd(app *App) *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().String("status", "", "Filter by status (PENDING, ACTIVE, EXECUTED, CANCELLED)")
+	cmd.Flags().String("symbol", "", "Filter by symbol")
+
+	return cmd
 }
 
 func newPlanExecuteCmd(app *App) *cobra.Command {
@@ -246,14 +245,77 @@ func newPlanExecuteCmd(app *App) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			planID := args[0]
 
+			if app.Store == nil {
+				output.Error("Store not initialized")
+				return fmt.Errorf("store not initialized")
+			}
+
+			if app.Broker == nil {
+				output.Error("Broker not configured. Run 'trader login' first.")
+				return fmt.Errorf("broker not configured")
+			}
+
+			// Get the plan
+			plans, err := app.Store.GetPlans(ctx, store.PlanFilter{})
+			if err != nil {
+				output.Error("Failed to get plans: %v", err)
+				return err
+			}
+
+			var plan *models.TradePlan
+			for i := range plans {
+				if plans[i].ID == planID {
+					plan = &plans[i]
+					break
+				}
+			}
+
+			if plan == nil {
+				output.Error("Plan not found: %s", planID)
+				return fmt.Errorf("plan not found")
+			}
+
+			if plan.Status != models.PlanPending && plan.Status != models.PlanActive {
+				output.Error("Plan is not in executable state: %s", plan.Status)
+				return fmt.Errorf("plan not executable")
+			}
+
 			output.Info("Executing plan %s...", planID)
+			output.Printf("  Symbol: %s\n", plan.Symbol)
+			output.Printf("  Side:   %s\n", plan.Side)
+			output.Printf("  Entry:  %s\n", FormatPrice(plan.EntryPrice))
 			output.Println()
 
-			// This would fetch plan and place order
+			// Place the order
+			order := &models.Order{
+				Symbol:       plan.Symbol,
+				Exchange:     models.NSE,
+				Side:         plan.Side,
+				Type:         models.OrderTypeLimit,
+				Product:      models.ProductMIS,
+				Quantity:     plan.Quantity,
+				Price:        plan.EntryPrice,
+				TriggerPrice: plan.StopLoss,
+			}
+
+			result, err := app.Broker.PlaceOrder(ctx, order)
+			if err != nil {
+				output.Error("Failed to place order: %v", err)
+				return err
+			}
+
+			// Update plan status
+			if err := app.Store.UpdatePlanStatus(ctx, planID, models.PlanExecuted); err != nil {
+				output.Warning("Failed to update plan status: %v", err)
+			}
+
 			output.Success("✓ Plan executed")
-			output.Printf("  Order ID: ORD123456\n")
+			output.Printf("  Order ID: %s\n", result.OrderID)
 
 			return nil
 		},
@@ -278,7 +340,7 @@ func newPlanCancelCmd(app *App) *cobra.Command {
 }
 
 func newPrepCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "prep",
 		Short: "Next-day trading preparation",
 		Long: `Generate trade setups for the next trading day.
@@ -290,40 +352,149 @@ Can place AMO (After Market Orders) for the setups.`,
   trader prep --amo  # Place AMO orders for setups`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
-			watchlist, _ := cmd.Flags().GetString("watchlist")
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+
+			if app.Broker == nil {
+				output.Error("Broker not configured. Run 'trader login' first.")
+				return fmt.Errorf("broker not configured")
+			}
+
+			watchlistName, _ := cmd.Flags().GetString("watchlist")
 			amo, _ := cmd.Flags().GetBool("amo")
+			exchange, _ := cmd.Flags().GetString("exchange")
+
+			if watchlistName == "" {
+				watchlistName = "default"
+			}
 
 			output.Info("Running next-day preparation...")
-			if watchlist != "" {
-				output.Printf("  Watchlist: %s\n", watchlist)
+			output.Printf("  Watchlist: %s\n", watchlistName)
+
+			// Get symbols from watchlist
+			var symbols []string
+			if app.Store != nil {
+				var err error
+				symbols, err = app.Store.GetWatchlist(ctx, watchlistName)
+				if err != nil || len(symbols) == 0 {
+					symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}
+				}
+			} else {
+				symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}
 			}
+
+			output.Printf("  Analyzing %d symbols...\n", len(symbols))
 			output.Println()
 
-			// This would run actual prep analysis
+			type Setup struct {
+				Symbol     string
+				Setup      string
+				Entry      float64
+				SL         float64
+				Target     float64
+				RR         float64
+				Confidence float64
+			}
+
+			var setups []Setup
+
+			for _, symbol := range symbols {
+				// Fetch historical data
+				candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+					Symbol:    symbol,
+					Exchange:  models.Exchange(exchange),
+					Timeframe: "1day",
+					From:      time.Now().AddDate(0, 0, -60),
+					To:        time.Now(),
+				})
+				if err != nil || len(candles) < 20 {
+					continue
+				}
+
+				// Extract price data
+				closes := make([]float64, len(candles))
+				highs := make([]float64, len(candles))
+				lows := make([]float64, len(candles))
+				for i, c := range candles {
+					closes[i] = c.Close
+					highs[i] = c.High
+					lows[i] = c.Low
+				}
+
+				// Calculate indicators
+				rsi := calculateRSI(closes, 14)
+				ema9 := calculateEMA(closes, 9)
+				ema21 := calculateEMA(closes, 21)
+				atr := calculateATR(highs, lows, closes, 14)
+
+				ltp := closes[len(closes)-1]
+
+				// Determine setup type and generate trade plan
+				var setup Setup
+				setup.Symbol = symbol
+
+				// Check for bullish setup
+				isBullish := len(ema9) > 0 && len(ema21) > 0 && ema9[len(ema9)-1] > ema21[len(ema21)-1]
+
+				if rsi < 35 && isBullish {
+					// Oversold bounce setup
+					setup.Setup = "Oversold bounce - RSI recovery"
+					setup.Entry = ltp * 1.005 // Entry slightly above current
+					setup.SL = ltp - 2*atr
+					setup.Target = ltp + 3*atr
+					setup.Confidence = 70 + (35-rsi)/2
+				} else if rsi > 50 && rsi < 70 && isBullish {
+					// Momentum continuation
+					setup.Setup = "Momentum continuation"
+					setup.Entry = ltp * 1.002
+					setup.SL = ltp - 1.5*atr
+					setup.Target = ltp + 2.5*atr
+					setup.Confidence = 65 + (rsi-50)/4
+				} else if !isBullish && rsi > 65 {
+					// Potential reversal short
+					setup.Setup = "Overbought reversal (SHORT)"
+					setup.Entry = ltp * 0.998
+					setup.SL = ltp + 1.5*atr
+					setup.Target = ltp - 2*atr
+					setup.Confidence = 60 + (rsi-65)/2
+				} else {
+					continue // No clear setup
+				}
+
+				// Calculate R:R
+				risk := setup.Entry - setup.SL
+				if risk < 0 {
+					risk = -risk
+				}
+				reward := setup.Target - setup.Entry
+				if reward < 0 {
+					reward = -reward
+				}
+				if risk > 0 {
+					setup.RR = reward / risk
+				}
+
+				// Only include setups with good R:R
+				if setup.RR >= 1.5 && setup.Confidence >= 60 {
+					setups = append(setups, setup)
+				}
+			}
+
 			output.Bold("Trade Setups for Tomorrow")
 			output.Println()
 
-			setups := []struct {
-				symbol    string
-				setup     string
-				entry     float64
-				sl        float64
-				target    float64
-				rr        float64
-				confidence float64
-			}{
-				{"RELIANCE", "Breakout above resistance", 2480, 2440, 2580, 2.5, 75},
-				{"INFY", "Pullback to support", 1510, 1470, 1590, 2.0, 68},
-				{"TCS", "Flag pattern breakout", 3480, 3420, 3600, 2.0, 72},
+			if len(setups) == 0 {
+				output.Info("No high-confidence setups found")
+				return nil
 			}
 
 			for _, s := range setups {
-				output.Bold("%s - %s", s.symbol, s.setup)
-				output.Printf("  Entry:      %s\n", FormatIndianCurrency(s.entry))
-				output.Printf("  Stop Loss:  %s\n", output.Red(FormatIndianCurrency(s.sl)))
-				output.Printf("  Target:     %s\n", output.Green(FormatIndianCurrency(s.target)))
-				output.Printf("  R:R:        1:%.1f\n", s.rr)
-				output.Printf("  Confidence: %.0f%%\n", s.confidence)
+				output.Bold("%s - %s", s.Symbol, s.Setup)
+				output.Printf("  Entry:      %s\n", FormatIndianCurrency(s.Entry))
+				output.Printf("  Stop Loss:  %s\n", output.Red(FormatIndianCurrency(s.SL)))
+				output.Printf("  Target:     %s\n", output.Green(FormatIndianCurrency(s.Target)))
+				output.Printf("  R:R:        1:%.1f\n", s.RR)
+				output.Printf("  Confidence: %.0f%%\n", s.Confidence)
 				output.Println()
 			}
 
@@ -340,6 +511,12 @@ Can place AMO (After Market Orders) for the setups.`,
 			return nil
 		},
 	}
+
+	cmd.Flags().String("watchlist", "", "Watchlist to analyze (default: 'default')")
+	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
+	cmd.Flags().Bool("amo", false, "Place AMO orders for setups")
+
+	return cmd
 }
 
 func newAlertCmd(app *App) *cobra.Command {
@@ -417,12 +594,25 @@ You'll be notified when the price crosses the specified level.`,
 		Short: "List alerts",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 
-			// Sample alerts
-			alerts := []models.Alert{
-				{ID: "ALT001", Symbol: "RELIANCE", Condition: "above", Price: 2500, Triggered: false},
-				{ID: "ALT002", Symbol: "INFY", Condition: "below", Price: 1450, Triggered: false},
-				{ID: "ALT003", Symbol: "TCS", Condition: "above", Price: 3500, Triggered: true},
+			if app.Store == nil {
+				output.Warning("Store not initialized")
+				return nil
+			}
+
+			alerts, err := app.Store.GetActiveAlerts(ctx)
+			if err != nil {
+				output.Error("Failed to fetch alerts: %v", err)
+				return err
+			}
+
+			if len(alerts) == 0 {
+				output.Info("No active alerts.")
+				output.Println()
+				output.Dim("Tip: Use 'trader alert add <symbol> --above <price>' to create an alert.")
+				return nil
 			}
 
 			if output.IsJSON() {
@@ -470,7 +660,7 @@ You'll be notified when the price crosses the specified level.`,
 }
 
 func newEventsCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "events",
 		Short: "Corporate events calendar",
 		Long: `Display upcoming corporate events including:
@@ -484,6 +674,9 @@ func newEventsCmd(app *App) *cobra.Command {
   trader events --days 30`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			symbol, _ := cmd.Flags().GetString("symbol")
 			days, _ := cmd.Flags().GetInt("days")
 
@@ -493,27 +686,55 @@ func newEventsCmd(app *App) *cobra.Command {
 			}
 			output.Printf("  Next %d days\n\n", days)
 
-			// Sample events
-			events := []struct {
-				date      string
-				symbol    string
-				eventType string
-				details   string
-			}{
-				{"22-Jan-2024", "RELIANCE", "Results", "Q3 FY24 Results"},
-				{"25-Jan-2024", "INFY", "Results", "Q3 FY24 Results"},
-				{"28-Jan-2024", "TCS", "Dividend", "Ex-Date: ₹9 per share"},
-				{"30-Jan-2024", "HDFC", "AGM", "Annual General Meeting"},
-				{"02-Feb-2024", "ICICI", "Results", "Q3 FY24 Results"},
+			if app.Store == nil {
+				output.Warning("Store not initialized")
+				return nil
+			}
+
+			// Get symbols to check
+			var symbols []string
+			if symbol != "" {
+				symbols = []string{symbol}
+			} else {
+				// Get from default watchlist
+				wl, err := app.Store.GetWatchlist(ctx, "default")
+				if err == nil && len(wl) > 0 {
+					symbols = wl
+				} else {
+					symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}
+				}
+			}
+
+			events, err := app.Store.GetUpcomingEvents(ctx, symbols, days)
+			if err != nil {
+				output.Error("Failed to fetch events: %v", err)
+				return err
+			}
+
+			if len(events) == 0 {
+				output.Info("No upcoming events found for the selected symbols.")
+				output.Println()
+				output.Dim("Note: Corporate events data needs to be synced from external sources.")
+				return nil
 			}
 
 			table := NewTable(output, "Date", "Symbol", "Event", "Details")
 			for _, e := range events {
-				table.AddRow(e.date, e.symbol, e.eventType, e.details)
+				table.AddRow(
+					FormatDate(e.Date),
+					e.Symbol,
+					e.EventType,
+					e.Description,
+				)
 			}
 			table.Render()
 
 			return nil
 		},
 	}
+
+	cmd.Flags().String("symbol", "", "Filter by symbol")
+	cmd.Flags().Int("days", 14, "Number of days to look ahead")
+
+	return cmd
 }

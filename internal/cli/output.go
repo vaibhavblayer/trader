@@ -163,6 +163,47 @@ func (o *Output) DimText(text string) string {
 	return o.ColoredString(ColorDim, text)
 }
 
+// Source indicator constants
+const (
+	SourceZerodha = "ZERODHA"
+	SourceAI      = "AI"
+	SourceLocal   = "LOCAL"
+	SourceCalc    = "CALC"
+)
+
+// SourceTag returns a formatted source indicator tag.
+func (o *Output) SourceTag(source string) string {
+	var color string
+	var icon string
+	switch source {
+	case SourceZerodha:
+		color = ColorCyan
+		icon = "📡"
+	case SourceAI:
+		color = ColorMagenta
+		icon = "🤖"
+	case SourceLocal:
+		color = ColorBlue
+		icon = "💾"
+	case SourceCalc:
+		color = ColorYellow
+		icon = "📊"
+	default:
+		color = ColorDim
+		icon = "•"
+	}
+	if o.colorEnabled {
+		return fmt.Sprintf("%s[%s%s%s]", icon, color, source, ColorReset)
+	}
+	return fmt.Sprintf("[%s]", source)
+}
+
+// SourceLine prints a line with source indicator.
+func (o *Output) SourceLine(source, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintf(o.writer, "  %s %s\n", o.SourceTag(source), msg)
+}
+
 // PnLColor returns the appropriate color for P&L.
 func (o *Output) PnLColor(pnl float64) string {
 	if pnl > 0 {

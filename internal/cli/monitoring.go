@@ -18,7 +18,7 @@ func addMonitoringCommands(rootCmd *cobra.Command, app *App) {
 }
 
 func newWatchCmd(app *App) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "watch",
 		Short: "Interactive watch mode",
 		Long: `Start interactive watch mode with live prices and trade plans.
@@ -37,59 +37,85 @@ Keyboard shortcuts:
   trader watch RELIANCE INFY TCS`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
-			watchlist, _ := cmd.Flags().GetString("watchlist")
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 
-			output.Bold("Watch Mode")
-			output.Println()
+			watchlistName, _ := cmd.Flags().GetString("watchlist")
 
-			if watchlist != "" {
-				output.Printf("  Watchlist: %s\n", watchlist)
+			// Check broker
+			if app.Broker == nil {
+				output.Error("Broker not configured. Run 'trader auth login' first.")
+				return fmt.Errorf("broker not configured")
 			}
+
+			if !app.Broker.IsAuthenticated() {
+				output.Error("Not authenticated. Run 'trader auth login' first.")
+				return fmt.Errorf("not authenticated")
+			}
+
+			// Get symbols to watch
+			var symbols []string
 			if len(args) > 0 {
-				output.Printf("  Symbols: %s\n", strings.Join(args, ", "))
+				symbols = args
+			} else if watchlistName != "" && app.Store != nil {
+				var err error
+				symbols, err = app.Store.GetWatchlist(ctx, watchlistName)
+				if err != nil || len(symbols) == 0 {
+					output.Warning("Watchlist '%s' is empty or not found, using defaults", watchlistName)
+					symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}
+				}
+			} else if app.Store != nil {
+				var err error
+				symbols, err = app.Store.GetWatchlist(ctx, "default")
+				if err != nil || len(symbols) == 0 {
+					symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}
+				}
+			} else {
+				symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}
 			}
+
+			output.Bold("Watch Mode %s", output.SourceTag(SourceZerodha))
 			output.Println()
 
-			// Display sample watch view
-			output.Printf("%-12s %10s %10s %10s %10s %10s\n",
-				"Symbol", "LTP", "Change", "High", "Low", "Volume")
-			output.Println(strings.Repeat("─", 70))
-
-			symbols := []struct {
-				symbol string
-				ltp    float64
-				change float64
-				high   float64
-				low    float64
-				volume int64
-			}{
-				{"RELIANCE", 2450.50, 1.25, 2465.00, 2430.00, 1250000},
-				{"INFY", 1520.30, -0.85, 1535.00, 1510.00, 850000},
-				{"TCS", 3450.00, 0.45, 3470.00, 3420.00, 650000},
-				{"HDFC", 1680.25, 2.10, 1695.00, 1650.00, 920000},
-				{"ICICI", 985.50, -0.35, 995.00, 980.00, 1100000},
+			if watchlistName != "" {
+				output.Printf("  Watchlist: %s\n", watchlistName)
 			}
+			output.Printf("  Symbols: %d\n", len(symbols))
+			output.Println()
 
-			for _, s := range symbols {
-				changeColor := output.PnLColor(s.change)
-				output.Printf("%-12s %10s %10s %10s %10s %10s\n",
-					s.symbol,
-					FormatPrice(s.ltp),
-					output.ColoredString(changeColor, FormatPercent(s.change)),
-					FormatPrice(s.high),
-					FormatPrice(s.low),
-					FormatVolume(s.volume),
+			// Create table for proper alignment
+			table := NewTable(output, "Symbol", "LTP", "Change", "High", "Low", "Volume")
+
+			// Fetch real quotes for each symbol
+			for _, symbol := range symbols {
+				quote, err := app.Broker.GetQuote(ctx, "NSE:"+symbol)
+				if err != nil {
+					table.AddRow(symbol, "-", "-", "-", "-", "-")
+					continue
+				}
+
+				changeColor := output.PnLColor(quote.ChangePercent)
+				changeStr := fmt.Sprintf("%+.2f%%", quote.ChangePercent)
+				table.AddRow(
+					symbol,
+					fmt.Sprintf("%.2f", quote.LTP),
+					output.ColoredString(changeColor, changeStr),
+					fmt.Sprintf("%.2f", quote.High),
+					fmt.Sprintf("%.2f", quote.Low),
+					FormatVolume(quote.Volume),
 				)
 			}
+			table.Render()
 
 			output.Println()
-			output.Dim("Press 'q' to quit, '?' for help")
-			output.Println()
-			output.Warning("Interactive mode requires terminal. Use 'trader live' for streaming.")
+			output.Dim("Use 'trader live %s' for real-time streaming", strings.Join(symbols, " "))
 
 			return nil
 		},
 	}
+
+	cmd.Flags().StringP("watchlist", "w", "", "Watchlist to monitor")
+	return cmd
 }
 
 func newWatchlistCmd(app *App) *cobra.Command {

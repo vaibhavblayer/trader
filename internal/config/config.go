@@ -115,8 +115,6 @@ type TavilyCredentials struct {
 // AgentConfig holds AI agent configuration.
 type AgentConfig struct {
 	Model                string             `mapstructure:"model"`
-	Temperature          float64            `mapstructure:"temperature"`
-	MaxTokens            int                `mapstructure:"max_tokens"`
 	AutonomousMode       string             `mapstructure:"autonomous_mode"` // FULL_AUTO, SEMI_AUTO, NOTIFY_ONLY, MANUAL
 	AutoExecuteThreshold float64            `mapstructure:"auto_execute_threshold"`
 	MaxDailyTrades       int                `mapstructure:"max_daily_trades"`
@@ -212,9 +210,7 @@ func loadAgentConfig(configDir string, agents *AgentConfig) error {
 	v.AddConfigPath(configDir)
 
 	// Set defaults
-	v.SetDefault("model", "gpt-4o")
-	v.SetDefault("temperature", 0.7)
-	v.SetDefault("max_tokens", 4096)
+	v.SetDefault("model", "gpt-5.2")
 	v.SetDefault("autonomous_mode", "MANUAL")
 	v.SetDefault("auto_execute_threshold", 80.0)
 	v.SetDefault("max_daily_trades", 10)

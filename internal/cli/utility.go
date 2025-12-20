@@ -6,9 +6,14 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"zerodha-trader/internal/broker"
+	"zerodha-trader/internal/models"
+	"zerodha-trader/internal/store"
 )
 
 // addUtilityCommands adds utility commands.
@@ -35,10 +40,19 @@ Calculates metrics including:
   trader backtest --strategy breakout --watchlist nifty50 --days 180`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+
 			strategy, _ := cmd.Flags().GetString("strategy")
 			symbol, _ := cmd.Flags().GetString("symbol")
 			days, _ := cmd.Flags().GetInt("days")
 			capital, _ := cmd.Flags().GetFloat64("capital")
+			exchange, _ := cmd.Flags().GetString("exchange")
+
+			if symbol == "" {
+				output.Error("Symbol is required. Use --symbol flag.")
+				return fmt.Errorf("symbol required")
+			}
 
 			output.Bold("Backtesting: %s Strategy", strategy)
 			output.Printf("  Symbol:  %s\n", symbol)
@@ -46,30 +60,36 @@ Calculates metrics including:
 			output.Printf("  Capital: %s\n", FormatIndianCurrency(capital))
 			output.Println()
 
-			output.Info("Running backtest...")
+			if app.Broker == nil {
+				output.Error("Broker not configured. Run 'trader login' first.")
+				return fmt.Errorf("broker not configured")
+			}
+
+			output.Info("Fetching historical data...")
+
+			// Fetch historical data
+			candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+				Symbol:    symbol,
+				Exchange:  models.Exchange(exchange),
+				Timeframe: "1day",
+				From:      time.Now().AddDate(0, 0, -days),
+				To:        time.Now(),
+			})
+			if err != nil {
+				output.Error("Failed to fetch historical data: %v", err)
+				return err
+			}
+
+			if len(candles) < 30 {
+				output.Error("Insufficient data for backtest (need at least 30 candles, got %d)", len(candles))
+				return fmt.Errorf("insufficient data")
+			}
+
+			output.Info("Running backtest on %d candles...", len(candles))
 			output.Println()
 
-			// Sample backtest results
-			results := BacktestResults{
-				TotalTrades:    125,
-				WinningTrades:  78,
-				LosingTrades:   47,
-				WinRate:        62.4,
-				GrossProfit:    285000,
-				GrossLoss:      -125000,
-				NetProfit:      160000,
-				TotalReturn:    16.0,
-				MaxDrawdown:    8.5,
-				SharpeRatio:    1.85,
-				ProfitFactor:   2.28,
-				AvgWin:         3654,
-				AvgLoss:        -2660,
-				LargestWin:     15000,
-				LargestLoss:    -8500,
-				AvgHoldTime:    "2h 15m",
-				StartCapital:   capital,
-				EndCapital:     capital + 160000,
-			}
+			// Run simple momentum backtest
+			results := runMomentumBacktest(candles, capital, strategy)
 
 			if output.IsJSON() {
 				return output.JSON(results)
@@ -86,8 +106,174 @@ Calculates metrics including:
 	cmd.Flags().Float64("capital", 1000000, "Starting capital")
 	cmd.Flags().Float64("slippage", 0.1, "Slippage percentage")
 	cmd.Flags().Float64("commission", 0.03, "Commission percentage")
+	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 
 	return cmd
+}
+
+// runMomentumBacktest runs a simple momentum-based backtest
+func runMomentumBacktest(candles []models.Candle, capital float64, strategy string) BacktestResults {
+	// Extract closes
+	closes := make([]float64, len(candles))
+	for i, c := range candles {
+		closes[i] = c.Close
+	}
+
+	// Calculate EMAs for signals
+	ema9 := calculateEMA(closes, 9)
+	ema21 := calculateEMA(closes, 21)
+
+	// Simulate trades
+	var trades []backtestTrade
+	inPosition := false
+	entryPrice := 0.0
+	entryIdx := 0
+	currentCapital := capital
+	maxCapital := capital
+	maxDrawdown := 0.0
+
+	// Track equity curve
+	equityCurve := make([]float64, 0, len(candles))
+	equityCurve = append(equityCurve, capital) // Starting point
+
+	for i := 21; i < len(candles); i++ {
+		if len(ema9) <= i || len(ema21) <= i {
+			continue
+		}
+
+		// Track equity at each point
+		equity := currentCapital
+		if inPosition {
+			// Mark-to-market: calculate unrealized P&L
+			unrealizedPnL := ((candles[i].Close - entryPrice) / entryPrice) * currentCapital
+			equity = currentCapital + unrealizedPnL
+		}
+		equityCurve = append(equityCurve, equity)
+
+		// Entry signal: EMA9 crosses above EMA21
+		if !inPosition && ema9[i] > ema21[i] && ema9[i-1] <= ema21[i-1] {
+			inPosition = true
+			entryPrice = candles[i].Close
+			entryIdx = i
+		}
+
+		// Exit signal: EMA9 crosses below EMA21 or stop loss
+		if inPosition {
+			exitSignal := ema9[i] < ema21[i] && ema9[i-1] >= ema21[i-1]
+			stopLoss := candles[i].Close < entryPrice*0.97 // 3% stop loss
+
+			if exitSignal || stopLoss {
+				exitPrice := candles[i].Close
+				pnlPercent := ((exitPrice - entryPrice) / entryPrice) * 100
+				pnl := (currentCapital * (pnlPercent / 100))
+				currentCapital += pnl
+
+				trades = append(trades, backtestTrade{
+					entryPrice: entryPrice,
+					exitPrice:  exitPrice,
+					pnl:        pnl,
+					pnlPercent: pnlPercent,
+					holdDays:   i - entryIdx,
+				})
+
+				// Track max drawdown
+				if currentCapital > maxCapital {
+					maxCapital = currentCapital
+				}
+				drawdown := ((maxCapital - currentCapital) / maxCapital) * 100
+				if drawdown > maxDrawdown {
+					maxDrawdown = drawdown
+				}
+
+				inPosition = false
+			}
+		}
+	}
+
+	// Calculate results
+	totalTrades := len(trades)
+	winningTrades := 0
+	grossProfit := 0.0
+	grossLoss := 0.0
+	totalHoldDays := 0
+	largestWin := 0.0
+	largestLoss := 0.0
+
+	for _, t := range trades {
+		if t.pnl > 0 {
+			winningTrades++
+			grossProfit += t.pnl
+			if t.pnl > largestWin {
+				largestWin = t.pnl
+			}
+		} else {
+			grossLoss += t.pnl
+			if t.pnl < largestLoss {
+				largestLoss = t.pnl
+			}
+		}
+		totalHoldDays += t.holdDays
+	}
+
+	winRate := 0.0
+	avgWin := 0.0
+	avgLoss := 0.0
+	profitFactor := 0.0
+	avgHoldDays := 0
+
+	if totalTrades > 0 {
+		winRate = float64(winningTrades) / float64(totalTrades) * 100
+		avgHoldDays = totalHoldDays / totalTrades
+	}
+	if winningTrades > 0 {
+		avgWin = grossProfit / float64(winningTrades)
+	}
+	losingTrades := totalTrades - winningTrades
+	if losingTrades > 0 {
+		avgLoss = grossLoss / float64(losingTrades)
+	}
+	if grossLoss != 0 {
+		profitFactor = grossProfit / (-grossLoss)
+	}
+
+	netProfit := grossProfit + grossLoss
+	totalReturn := (netProfit / capital) * 100
+
+	// Simplified Sharpe ratio (annualized)
+	sharpeRatio := 0.0
+	if maxDrawdown > 0 {
+		sharpeRatio = totalReturn / maxDrawdown
+	}
+
+	return BacktestResults{
+		TotalTrades:   totalTrades,
+		WinningTrades: winningTrades,
+		LosingTrades:  losingTrades,
+		WinRate:       winRate,
+		GrossProfit:   grossProfit,
+		GrossLoss:     grossLoss,
+		NetProfit:     netProfit,
+		TotalReturn:   totalReturn,
+		MaxDrawdown:   maxDrawdown,
+		SharpeRatio:   sharpeRatio,
+		ProfitFactor:  profitFactor,
+		AvgWin:        avgWin,
+		AvgLoss:       avgLoss,
+		LargestWin:    largestWin,
+		LargestLoss:   largestLoss,
+		AvgHoldTime:   fmt.Sprintf("%dd", avgHoldDays),
+		StartCapital:  capital,
+		EndCapital:    currentCapital,
+		EquityCurve:   equityCurve,
+	}
+}
+
+type backtestTrade struct {
+	entryPrice float64
+	exitPrice  float64
+	pnl        float64
+	pnlPercent float64
+	holdDays   int
 }
 
 type BacktestResults struct {
@@ -109,6 +295,7 @@ type BacktestResults struct {
 	AvgHoldTime   string
 	StartCapital  float64
 	EndCapital    float64
+	EquityCurve   []float64 // Track equity over time
 }
 
 func displayBacktestResults(output *Output, r BacktestResults) error {
@@ -156,29 +343,72 @@ func displayBacktestResults(output *Output, r BacktestResults) error {
 
 	// Equity curve (ASCII)
 	output.Bold("Equity Curve")
-	drawEquityCurve(output)
+	drawEquityCurve(output, r.EquityCurve, r.StartCapital)
 
 	return nil
 }
 
-func drawEquityCurve(output *Output) {
-	// Simple ASCII equity curve
-	curve := []string{
-		"  1.16M │                                    ╱",
-		"        │                               ╱──╱",
-		"        │                          ╱───╱",
-		"        │                     ╱───╱",
-		"        │                ╱───╱",
-		"        │           ╱───╱",
-		"        │      ╱───╱",
-		"  1.00M │─────╱",
-		"        └────────────────────────────────────",
-		"         Jan   Mar   May   Jul   Sep   Nov",
+func drawEquityCurve(output *Output, equityCurve []float64, startCapital float64) {
+	if len(equityCurve) < 2 {
+		output.Println("  Insufficient data for equity curve")
+		return
 	}
 
-	for _, line := range curve {
-		output.Println(line)
+	// Find min/max for scaling
+	minEquity := equityCurve[0]
+	maxEquity := equityCurve[0]
+	for _, e := range equityCurve {
+		if e < minEquity {
+			minEquity = e
+		}
+		if e > maxEquity {
+			maxEquity = e
+		}
 	}
+
+	// Add some padding
+	padding := (maxEquity - minEquity) * 0.1
+	if padding == 0 {
+		padding = startCapital * 0.05
+	}
+	minEquity -= padding
+	maxEquity += padding
+
+	// Chart dimensions
+	width := 40
+	height := 8
+
+	// Create chart grid
+	chart := make([][]rune, height)
+	for i := range chart {
+		chart[i] = make([]rune, width)
+		for j := range chart[i] {
+			chart[i][j] = ' '
+		}
+	}
+
+	// Plot equity curve
+	for i := 0; i < len(equityCurve)-1; i++ {
+		x := i * width / len(equityCurve)
+		y := int((equityCurve[i] - minEquity) / (maxEquity - minEquity) * float64(height-1))
+		if y >= 0 && y < height && x >= 0 && x < width {
+			chart[height-1-y][x] = '█'
+		}
+	}
+
+	// Print chart
+	for i := 0; i < height; i++ {
+		label := ""
+		if i == 0 {
+			label = fmt.Sprintf("%7.0f", maxEquity/100000) + "L"
+		} else if i == height-1 {
+			label = fmt.Sprintf("%7.0f", minEquity/100000) + "L"
+		} else {
+			label = "        "
+		}
+		output.Printf("  %s │%s\n", label, string(chart[i]))
+	}
+	output.Printf("          └%s\n", strings.Repeat("─", width))
 }
 
 func newExportCmd(app *App) *cobra.Command {
@@ -196,12 +426,12 @@ func newExportCmd(app *App) *cobra.Command {
 			output := NewOutput(cmd)
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
-			_ = ctx
 
 			symbol := args[0]
 			format, _ := cmd.Flags().GetString("format")
 			outFile, _ := cmd.Flags().GetString("output")
 			days, _ := cmd.Flags().GetInt("days")
+			exchange, _ := cmd.Flags().GetString("exchange")
 
 			if outFile == "" {
 				outFile = fmt.Sprintf("%s_candles.%s", symbol, format)
@@ -209,7 +439,30 @@ func newExportCmd(app *App) *cobra.Command {
 
 			output.Info("Exporting %s candles to %s...", symbol, outFile)
 
-			// Create sample CSV
+			// Fetch real data from broker
+			if app.Broker == nil {
+				output.Error("Broker not configured. Run 'trader login' first.")
+				return fmt.Errorf("broker not configured")
+			}
+
+			candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+				Symbol:    symbol,
+				Exchange:  models.Exchange(exchange),
+				Timeframe: "1day",
+				From:      time.Now().AddDate(0, 0, -days),
+				To:        time.Now(),
+			})
+			if err != nil {
+				output.Error("Failed to fetch candles: %v", err)
+				return err
+			}
+
+			if len(candles) == 0 {
+				output.Warning("No candle data available for %s", symbol)
+				return nil
+			}
+
+			// Create CSV
 			if format == "csv" {
 				file, err := os.Create(outFile)
 				if err != nil {
@@ -224,22 +477,20 @@ func newExportCmd(app *App) *cobra.Command {
 				// Header
 				writer.Write([]string{"timestamp", "open", "high", "low", "close", "volume"})
 
-				// Sample data
-				now := time.Now()
-				for i := days; i > 0; i-- {
-					t := now.AddDate(0, 0, -i)
+				// Real data
+				for _, c := range candles {
 					writer.Write([]string{
-						t.Format(time.RFC3339),
-						"2450.00",
-						"2465.00",
-						"2430.00",
-						"2455.00",
-						"1250000",
+						c.Timestamp.Format(time.RFC3339),
+						fmt.Sprintf("%.2f", c.Open),
+						fmt.Sprintf("%.2f", c.High),
+						fmt.Sprintf("%.2f", c.Low),
+						fmt.Sprintf("%.2f", c.Close),
+						fmt.Sprintf("%d", c.Volume),
 					})
 				}
 			}
 
-			output.Success("✓ Exported %d candles to %s", days, outFile)
+			output.Success("✓ Exported %d candles to %s", len(candles), outFile)
 			return nil
 		},
 	})
@@ -249,6 +500,9 @@ func newExportCmd(app *App) *cobra.Command {
 		Short: "Export trade history",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
 			format, _ := cmd.Flags().GetString("format")
 			outFile, _ := cmd.Flags().GetString("output")
 
@@ -257,7 +511,58 @@ func newExportCmd(app *App) *cobra.Command {
 			}
 
 			output.Info("Exporting trades to %s...", outFile)
-			output.Success("✓ Exported 125 trades to %s", outFile)
+
+			// Fetch real trades from store
+			if app.Store == nil {
+				output.Error("Store not initialized")
+				return fmt.Errorf("store not initialized")
+			}
+
+			trades, err := app.Store.GetTrades(ctx, store.TradeFilter{Limit: 1000})
+			if err != nil {
+				output.Error("Failed to fetch trades: %v", err)
+				return err
+			}
+
+			if len(trades) == 0 {
+				output.Warning("No trades found")
+				return nil
+			}
+
+			if format == "csv" {
+				file, err := os.Create(outFile)
+				if err != nil {
+					output.Error("Failed to create file: %v", err)
+					return err
+				}
+				defer file.Close()
+
+				writer := csv.NewWriter(file)
+				defer writer.Flush()
+
+				// Header
+				writer.Write([]string{"id", "timestamp", "symbol", "exchange", "side", "product", "quantity", "entry_price", "exit_price", "pnl", "pnl_percent", "strategy"})
+
+				// Real data
+				for _, t := range trades {
+					writer.Write([]string{
+						t.ID,
+						t.Timestamp.Format(time.RFC3339),
+						t.Symbol,
+						string(t.Exchange),
+						string(t.Side),
+						string(t.Product),
+						fmt.Sprintf("%d", t.Quantity),
+						fmt.Sprintf("%.2f", t.EntryPrice),
+						fmt.Sprintf("%.2f", t.ExitPrice),
+						fmt.Sprintf("%.2f", t.PnL),
+						fmt.Sprintf("%.2f", t.PnLPercent),
+						t.Strategy,
+					})
+				}
+			}
+
+			output.Success("✓ Exported %d trades to %s", len(trades), outFile)
 			return nil
 		},
 	})
@@ -267,6 +572,9 @@ func newExportCmd(app *App) *cobra.Command {
 		Short: "Export journal entries",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
 			format, _ := cmd.Flags().GetString("format")
 			outFile, _ := cmd.Flags().GetString("output")
 
@@ -275,7 +583,61 @@ func newExportCmd(app *App) *cobra.Command {
 			}
 
 			output.Info("Exporting journal to %s...", outFile)
-			output.Success("✓ Exported 45 journal entries to %s", outFile)
+
+			// Fetch real journal entries from store
+			if app.Store == nil {
+				output.Error("Store not initialized")
+				return fmt.Errorf("store not initialized")
+			}
+
+			entries, err := app.Store.GetJournal(ctx, store.JournalFilter{Limit: 1000})
+			if err != nil {
+				output.Error("Failed to fetch journal entries: %v", err)
+				return err
+			}
+
+			if len(entries) == 0 {
+				output.Warning("No journal entries found")
+				return nil
+			}
+
+			if format == "csv" {
+				file, err := os.Create(outFile)
+				if err != nil {
+					output.Error("Failed to create file: %v", err)
+					return err
+				}
+				defer file.Close()
+
+				writer := csv.NewWriter(file)
+				defer writer.Flush()
+
+				// Header
+				writer.Write([]string{"id", "trade_id", "date", "content", "mood", "tags"})
+
+				// Real data
+				for _, e := range entries {
+					tags := ""
+					if len(e.Tags) > 0 {
+						for i, t := range e.Tags {
+							if i > 0 {
+								tags += ";"
+							}
+							tags += t
+						}
+					}
+					writer.Write([]string{
+						e.ID,
+						e.TradeID,
+						e.Date.Format("2006-01-02"),
+						e.Content,
+						e.Mood,
+						tags,
+					})
+				}
+			}
+
+			output.Success("✓ Exported %d journal entries to %s", len(entries), outFile)
 			return nil
 		},
 	})
@@ -283,6 +645,7 @@ func newExportCmd(app *App) *cobra.Command {
 	cmd.PersistentFlags().String("format", "csv", "Output format (csv, json)")
 	cmd.PersistentFlags().StringP("output", "o", "", "Output file path")
 	cmd.PersistentFlags().Int("days", 30, "Number of days to export")
+	cmd.PersistentFlags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 
 	return cmd
 }

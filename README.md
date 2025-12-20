@@ -231,6 +231,139 @@ go test -v ./internal/... -run Property
 - Full audit trail of all decisions
 - Read-only mode option
 
+
+zerodha-trader/
+├── cmd/trader/
+│   └── main.go                 # Entry point - initializes config, logger, runs CLI
+│
+├── internal/
+│   ├── agents/                 # AI Trading Agents
+│   │   ├── agent.go            # Agent interface, base types, AnalysisRequest/Result
+│   │   ├── llm.go              # OpenAI client for GPT integration
+│   │   ├── orchestrator.go     # Coordinates all agents, consensus, auto-execution
+│   │   ├── technical.go        # Technical analysis agent (EMA, patterns, levels)
+│   │   ├── research.go         # Fundamental research agent (PE, growth, targets)
+│   │   ├── news.go             # News sentiment agent
+│   │   ├── risk.go             # Risk assessment agent
+│   │   └── trader.go           # Final decision maker, synthesizes all agents
+│   │
+│   ├── analysis/               # Technical Analysis Engine
+│   │   ├── analysis.go         # Core analysis types
+│   │   ├── indicators/         # Technical indicators
+│   │   │   ├── engine.go       # Indicator calculation engine
+│   │   │   ├── trend.go        # EMA, SMA, MACD, ADX
+│   │   │   ├── momentum.go     # RSI, Stochastic, CCI
+│   │   │   ├── volatility.go   # ATR, Bollinger Bands
+│   │   │   ├── volume.go       # OBV, VWAP, Volume Profile
+│   │   │   └── levels.go       # Support/Resistance detection
+│   │   ├── patterns/           # Chart pattern detection
+│   │   │   ├── candlestick.go  # Doji, Hammer, Engulfing, etc.
+│   │   │   ├── chart.go        # Head & Shoulders, Triangles
+│   │   │   ├── trend.go        # Trend lines, channels
+│   │   │   ├── levels.go       # S/R zones
+│   │   │   ├── volume.go       # Volume patterns
+│   │   │   ├── divergence.go   # RSI/MACD divergence
+│   │   │   └── priceaction.go  # Price action patterns
+│   │   ├── mtf/                # Multi-timeframe analysis
+│   │   │   └── mtf.go          # Combines signals across timeframes
+│   │   └── scoring/            # Signal scoring
+│   │       ├── scorer.go       # Composite signal scoring
+│   │       └── screener.go     # Stock screening
+│   │
+│   ├── broker/                 # Broker Integration
+│   │   ├── broker.go           # Broker interface (orders, quotes, positions)
+│   │   ├── zerodha.go          # Zerodha Kite Connect implementation
+│   │   ├── ticker.go           # WebSocket live streaming
+│   │   ├── paper.go            # Paper trading simulator
+│   │   └── segment.go          # Market segments (NSE, BSE, NFO)
+│   │
+│   ├── cli/                    # Command Line Interface
+│   │   ├── root.go             # App struct, command registration
+│   │   ├── auth.go             # login, logout, status commands
+│   │   ├── data.go             # candles, quote, breadth commands
+│   │   ├── analyze.go          # analyze, signal, scan, research commands
+│   │   ├── trade.go            # buy, sell, bracket, gtt commands
+│   │   ├── trader.go           # Autonomous trading daemon
+│   │   ├── planning.go         # plan create/execute, prep commands
+│   │   ├── derivatives.go      # options chain, futures chain
+│   │   ├── monitoring.go       # watch, watchlist, live commands
+│   │   ├── journal.go          # Trading journal commands
+│   │   ├── utility.go          # backtest, export commands
+│   │   ├── output.go           # Output formatting, colors, tables
+│   │   ├── format.go           # Price/currency formatting
+│   │   └── help.go             # Help and examples
+│   │
+│   ├── config/                 # Configuration
+│   │   ├── config.go           # Config structs, loading, validation
+│   │   └── templates.go        # Default config file templates
+│   │
+│   ├── models/                 # Domain Models
+│   │   ├── models.go           # Exchange, OrderType, Candle, Quote, Tick
+│   │   ├── order.go            # Order, GTTOrder, Position, Holding
+│   │   ├── trade.go            # Trade execution records
+│   │   ├── decision.go         # AI Decision, Consensus, RiskCheck
+│   │   └── options.go          # Options chain models
+│   │
+│   ├── store/                  # Data Persistence
+│   │   ├── store.go            # DataStore interface
+│   │   ├── sqlite.go           # SQLite implementation
+│   │   ├── sync.go             # Data synchronization
+│   │   └── indian_market.go    # Indian market specific data
+│   │
+│   ├── trading/                # Trading Logic
+│   │   ├── trading.go          # Core trading types
+│   │   ├── execution.go        # Order execution, auto-execute checks
+│   │   ├── backtest.go         # Backtesting engine
+│   │   ├── portfolio.go        # Portfolio management
+│   │   ├── position.go         # Position sizing
+│   │   ├── exit.go             # Exit strategies
+│   │   ├── prep.go             # Pre-market preparation
+│   │   ├── pipeline.go         # Trading pipeline
+│   │   ├── basket.go           # Basket orders
+│   │   ├── margin.go           # Margin calculations
+│   │   └── ...                 # Other trading utilities
+│   │
+│   ├── stream/                 # Real-time Streaming
+│   │   ├── hub.go              # WebSocket hub, subscriptions
+│   │   ├── alerts.go           # Price alerts
+│   │   └── plans.go            # Trade plan monitoring
+│   │
+│   ├── notify/                 # Notifications
+│   │   ├── notify.go           # Notifier interface
+│   │   └── terminal.go         # Terminal notifications
+│   │
+│   ├── resilience/             # System Resilience
+│   │   ├── circuitbreaker.go   # Circuit breaker pattern
+│   │   ├── health.go           # Health checks
+│   │   └── ...                 # Other resilience utilities
+│   │
+│   ├── security/               # Security
+│   │   ├── security.go         # Security utilities
+│   │   ├── validation.go       # Input validation
+│   │   ├── audit.go            # Audit logging
+│   │   └── readonly.go         # Read-only mode
+│   │
+│   ├── logging/                # Logging
+│   │   └── logging.go          # Zerolog setup
+│   │
+│   └── errors/                 # Error Handling
+│       └── errors.go           # Custom error types
+│
+├── pkg/utils/                  # Shared Utilities
+│   ├── format.go               # Formatting helpers
+│   ├── market.go               # Market hours, holidays
+│   └── retry.go                # Retry logic
+│
+└── Config files at ~/.config/zerodha-trader/
+    ├── config.toml             # Main config (trading mode, risk)
+    ├── credentials.toml        # API keys (Zerodha, OpenAI)
+    ├── agents.toml             # AI agent config (model, thresholds)
+    └── trader.db               # SQLite database
+
+
+
+
+
 ## Disclaimer
 
 This software is for educational purposes only. Trading in financial markets involves substantial risk of loss. Past performance is not indicative of future results. Always do your own research and consider consulting a financial advisor before making investment decisions.

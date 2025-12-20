@@ -8,6 +8,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 
+	"zerodha-trader/internal/agents"
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/config"
 	"zerodha-trader/internal/logging"
@@ -22,11 +23,12 @@ const (
 
 // App holds the application dependencies.
 type App struct {
-	Config *config.Config
-	Logger zerolog.Logger
-	Broker broker.Broker
-	Ticker broker.Ticker
-	Store  store.DataStore
+	Config    *config.Config
+	Logger    zerolog.Logger
+	Broker    broker.Broker
+	Ticker    broker.Ticker
+	Store     store.DataStore
+	LLMClient agents.LLMClient
 }
 
 // NewRootCmd creates the root command for the CLI.
@@ -39,12 +41,24 @@ func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 
 	// Initialize broker if credentials are available
 	if cfg.Credentials.Zerodha.APIKey != "" {
-		app.Broker = broker.NewZerodhaBroker(broker.ZerodhaConfig{
+		zerodhaBroker := broker.NewZerodhaBroker(broker.ZerodhaConfig{
 			APIKey:    cfg.Credentials.Zerodha.APIKey,
 			APISecret: cfg.Credentials.Zerodha.APISecret,
 			UserID:    cfg.Credentials.Zerodha.UserID,
 		})
+		app.Broker = zerodhaBroker
 		logger.Debug().Msg("Zerodha broker initialized")
+
+		// Initialize ticker if broker is authenticated
+		if zerodhaBroker.IsAuthenticated() {
+			ticker, err := zerodhaBroker.CreateTicker()
+			if err != nil {
+				logger.Warn().Err(err).Msg("Failed to create ticker")
+			} else {
+				app.Ticker = ticker
+				logger.Debug().Msg("Zerodha ticker initialized")
+			}
+		}
 	}
 
 	// Initialize SQLite store
@@ -55,6 +69,12 @@ func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 	} else {
 		app.Store = dataStore
 		logger.Debug().Msg("SQLite store initialized")
+	}
+
+	// Initialize LLM client if OpenAI API key is available
+	if cfg.Credentials.OpenAI.APIKey != "" {
+		app.LLMClient = agents.NewOpenAIClient(cfg.Credentials.OpenAI.APIKey, cfg.Agents.Model)
+		logger.Debug().Str("model", cfg.Agents.Model).Msg("OpenAI LLM client initialized")
 	}
 
 	rootCmd := &cobra.Command{

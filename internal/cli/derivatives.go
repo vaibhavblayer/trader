@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+
+	"zerodha-trader/internal/models"
 )
 
 // addDerivativesCommands adds derivatives trading commands.
@@ -91,50 +93,66 @@ Shows calls and puts with strike prices, LTP, OI, IV, and Greeks.`,
 }
 
 func displayOptionChain(output *Output, chain interface{}, strikes int) error {
-	// This would display actual option chain data
-	output.Bold("Option Chain - NIFTY")
-	output.Printf("  Spot: 19,500.50  Expiry: 25-Jan-2024\n\n")
-
-	// Header
-	output.Printf("%-8s %-8s %-8s %-6s │ %-8s │ %-8s %-8s %-8s %-6s\n",
-		"Call OI", "Call IV", "Call LTP", "Δ", "Strike", "Put LTP", "Put IV", "Put OI", "Δ")
-	output.Println(strings.Repeat("─", 90))
-
-	// Sample data
-	strikesData := []struct {
-		strike                                float64
-		callOI, callLTP, callIV, callDelta    float64
-		putOI, putLTP, putIV, putDelta        float64
-		isATM                                 bool
-	}{
-		{19400, 125000, 180.50, 15.2, 0.65, 85000, 45.30, 14.8, -0.35, false},
-		{19450, 145000, 145.20, 14.8, 0.58, 95000, 58.40, 14.5, -0.42, false},
-		{19500, 180000, 112.80, 14.5, 0.50, 175000, 78.60, 14.2, -0.50, true},
-		{19550, 135000, 85.40, 14.2, 0.42, 125000, 102.30, 14.0, -0.58, false},
-		{19600, 110000, 62.50, 13.9, 0.35, 105000, 132.40, 13.8, -0.65, false},
+	// Try to cast to models.OptionChain
+	oc, ok := chain.(*models.OptionChain)
+	if !ok || oc == nil || len(oc.Strikes) == 0 {
+		output.Warning("Option chain data not available or empty")
+		output.Dim("Note: Option chain requires NFO segment access")
+		return nil
 	}
 
-	for _, s := range strikesData {
-		strikeStr := fmt.Sprintf("%.0f", s.strike)
-		if s.isATM {
+	output.Bold("Option Chain - %s", oc.Symbol)
+	output.Printf("  Spot: %s  Expiry: %s\n\n", FormatPrice(oc.SpotPrice), FormatDate(oc.Expiry))
+
+	// Header
+	output.Printf("%-10s %-10s │ %-10s │ %-10s %-10s\n",
+		"Call LTP", "Call Vol", "Strike", "Put LTP", "Put Vol")
+	output.Println(strings.Repeat("─", 60))
+
+	// Find ATM strike
+	atmStrike := oc.SpotPrice
+	for _, s := range oc.Strikes {
+		if s.Strike >= oc.SpotPrice {
+			atmStrike = s.Strike
+			break
+		}
+	}
+
+	// Display strikes around ATM
+	displayed := 0
+	for _, s := range oc.Strikes {
+		// Only show strikes around ATM
+		if s.Strike < atmStrike-float64(strikes)*50 || s.Strike > atmStrike+float64(strikes)*50 {
+			continue
+		}
+
+		strikeStr := FormatPrice(s.Strike)
+		if s.Strike == atmStrike {
 			strikeStr = output.BoldText(strikeStr)
 		}
 
-		output.Printf("%-8s %-8s %-8s %-6s │ %-8s │ %-8s %-8s %-8s %-6s\n",
-			FormatVolume(int64(s.callOI)),
-			fmt.Sprintf("%.1f%%", s.callIV),
-			FormatPrice(s.callLTP),
-			fmt.Sprintf("%.2f", s.callDelta),
-			strikeStr,
-			FormatPrice(s.putLTP),
-			fmt.Sprintf("%.1f%%", s.putIV),
-			FormatVolume(int64(s.putOI)),
-			fmt.Sprintf("%.2f", s.putDelta),
-		)
-	}
+		callLTP := "-"
+		callVol := "-"
+		if s.Call != nil {
+			callLTP = FormatPrice(s.Call.LTP)
+			callVol = FormatVolume(s.Call.Volume)
+		}
 
-	output.Println()
-	output.Printf("  PCR (OI): %.2f  Max Pain: 19,500\n", 0.95)
+		putLTP := "-"
+		putVol := "-"
+		if s.Put != nil {
+			putLTP = FormatPrice(s.Put.LTP)
+			putVol = FormatVolume(s.Put.Volume)
+		}
+
+		output.Printf("%-10s %-10s │ %-10s │ %-10s %-10s\n",
+			callLTP, callVol, strikeStr, putLTP, putVol)
+
+		displayed++
+		if displayed >= strikes*2 {
+			break
+		}
+	}
 
 	return nil
 }
@@ -333,33 +351,24 @@ func newFuturesChainCmd(app *App) *cobra.Command {
 				return output.JSON(chain)
 			}
 
-			output.Bold("Futures Chain - %s", symbol)
-			output.Printf("  Spot: 19,500.50\n\n")
-
-			table := NewTable(output, "Expiry", "LTP", "Basis", "Basis %", "OI", "Volume")
-			
-			// Sample data
-			expiries := []struct {
-				expiry     string
-				ltp        float64
-				basis      float64
-				basisPct   float64
-				oi         int64
-				volume     int64
-			}{
-				{"25-Jan-2024", 19525.50, 25.00, 0.13, 12500000, 850000},
-				{"29-Feb-2024", 19580.25, 79.75, 0.41, 8500000, 450000},
-				{"28-Mar-2024", 19645.00, 144.50, 0.74, 5200000, 250000},
+			if chain == nil || len(chain.Expiries) == 0 {
+				output.Warning("Futures chain data not available or empty")
+				output.Dim("Note: Futures chain requires NFO segment access")
+				return nil
 			}
 
-			for _, e := range expiries {
+			output.Bold("Futures Chain - %s", chain.Symbol)
+			output.Printf("  Spot: %s\n\n", FormatPrice(chain.SpotPrice))
+
+			table := NewTable(output, "Expiry", "LTP", "Basis", "Basis %", "Volume")
+
+			for _, e := range chain.Expiries {
 				table.AddRow(
-					e.expiry,
-					FormatPrice(e.ltp),
-					fmt.Sprintf("%.2f", e.basis),
-					FormatPercent(e.basisPct),
-					FormatVolume(e.oi),
-					FormatVolume(e.volume),
+					FormatDate(e.Expiry),
+					FormatPrice(e.LTP),
+					fmt.Sprintf("%.2f", e.Basis),
+					FormatPercent(e.BasisPercent),
+					FormatVolume(e.Volume),
 				)
 			}
 
