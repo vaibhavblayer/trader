@@ -187,51 +187,6 @@ auto_execute_threshold = 85
 ## Project Structure
 
 ```
-├── cmd/trader/          # CLI entry point
-├── internal/
-│   ├── agents/          # AI trading agents
-│   ├── analysis/        # Technical analysis
-│   │   ├── indicators/  # RSI, MACD, BB, etc.
-│   │   ├── patterns/    # Candlestick & chart patterns
-│   │   ├── scoring/     # Signal scoring
-│   │   └── mtf/         # Multi-timeframe
-│   ├── broker/          # Zerodha & paper trading
-│   ├── cli/             # Command implementations
-│   ├── config/          # Configuration management
-│   ├── models/          # Data models
-│   ├── store/           # SQLite persistence
-│   ├── stream/          # Real-time data hub
-│   ├── trading/         # Order execution & Indian market
-│   ├── resilience/      # Circuit breakers & health
-│   ├── security/        # Audit & validation
-│   └── notify/          # Notifications
-└── pkg/utils/           # Shared utilities
-```
-
-## Testing
-
-```bash
-# Run all tests
-go test ./...
-
-# Run with coverage
-go test -cover ./...
-
-# Run property-based tests
-go test -v ./internal/... -run Property
-```
-
-## Safety Features
-
-- Paper trading mode for testing
-- Daily loss limits
-- Position size limits
-- Consecutive loss circuit breaker
-- Cooldown between trades
-- Full audit trail of all decisions
-- Read-only mode option
-
-
 zerodha-trader/
 ├── cmd/trader/
 │   └── main.go                 # Entry point - initializes config, logger, runs CLI
@@ -320,8 +275,7 @@ zerodha-trader/
 │   │   ├── prep.go             # Pre-market preparation
 │   │   ├── pipeline.go         # Trading pipeline
 │   │   ├── basket.go           # Basket orders
-│   │   ├── margin.go           # Margin calculations
-│   │   └── ...                 # Other trading utilities
+│   │   └── margin.go           # Margin calculations
 │   │
 │   ├── stream/                 # Real-time Streaming
 │   │   ├── hub.go              # WebSocket hub, subscriptions
@@ -334,8 +288,7 @@ zerodha-trader/
 │   │
 │   ├── resilience/             # System Resilience
 │   │   ├── circuitbreaker.go   # Circuit breaker pattern
-│   │   ├── health.go           # Health checks
-│   │   └── ...                 # Other resilience utilities
+│   │   └── health.go           # Health checks
 │   │
 │   ├── security/               # Security
 │   │   ├── security.go         # Security utilities
@@ -359,10 +312,30 @@ zerodha-trader/
     ├── credentials.toml        # API keys (Zerodha, OpenAI)
     ├── agents.toml             # AI agent config (model, thresholds)
     └── trader.db               # SQLite database
+```
 
+## Testing
 
+```bash
+# Run all tests
+go test ./...
 
+# Run with coverage
+go test -cover ./...
 
+# Run property-based tests
+go test -v ./internal/... -run Property
+```
+
+## Safety Features
+
+- Paper trading mode for testing
+- Daily loss limits
+- Position size limits
+- Consecutive loss circuit breaker
+- Cooldown between trades
+- Full audit trail of all decisions
+- Read-only mode option
 
 ## Disclaimer
 
