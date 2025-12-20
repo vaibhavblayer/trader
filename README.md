@@ -86,102 +86,154 @@ autonomous_mode = "NOTIFY_ONLY"  # MANUAL, NOTIFY_ONLY, SEMI_AUTO, FULL_AUTO
 auto_execute_threshold = 85
 ```
 
-## Usage
+## Commands
 
-### Authentication
-```bash
-# Login (opens browser for OAuth)
-./trader login
-
-# Check login status
-./trader balance
 ```
+AUTHENTICATION
+  login                     Login to Zerodha (OAuth flow)
+  login --token <token>     Complete login with request token
+  logout                    Logout and clear session
+  balance                   View account balance and margins
 
-### Market Data
-```bash
-# Get quote
-./trader quote RELIANCE
+MARKET DATA
+  quote <symbol>            Get real-time quote
+  data <symbol>             Get historical OHLCV data
+    -t, --timeframe         Timeframe (1min, 5min, 15min, 30min, 1hour, 1day)
+    -d, --days              Number of days of history
+    -l, --limit             Limit number of candles (0 for all)
+  live <symbols...>         Stream live prices (WebSocket)
+  breadth                   Market breadth indicators (A/D, VIX, PCR)
 
-# Historical data
-./trader data TCS -d 100 -t 1day
+ANALYSIS
+  analyze <symbol>          Full technical analysis
+    -t, --timeframe         Timeframe for analysis
+    --detailed              Show detailed breakdown
+  signal <symbol>           Composite signal score (-100 to +100)
+  mtf <symbol>              Multi-timeframe analysis
+  scan                      Scan stocks based on criteria
+    --preset                Preset screener (momentum, oversold, breakout)
+    --rsi-below/above       RSI filter
+    --volume-above          Volume filter (multiplier of avg)
+  research <symbol>         AI-powered research report
 
-# Live streaming
-./trader live RELIANCE INFY TCS
-```
+TRADING
+  buy <symbol> <qty>        Place buy order
+    -p, --price             Limit price (0 for market)
+    --sl                    Stop-loss price
+    --target                Target price
+    --product               Product type (MIS, CNC, NRML)
+  sell <symbol> <qty>       Place sell order
+  positions                 View open positions
+  holdings                  View delivery holdings
+  orders                    View today's orders
+  exit <symbol>             Exit a position
+  exit-all                  Exit all positions (--force to confirm)
 
-### Analysis
-```bash
-# Full technical analysis
-./trader analyze RELIANCE
+DERIVATIVES
+  options chain <symbol>    Display option chain
+    --expiry                Expiry date (YYYY-MM-DD)
+    --strikes               Number of strikes around ATM
+  options greeks            Calculate option Greeks
+  options strategy          Option strategy builder
+  options payoff            Display payoff diagram
+  futures chain <symbol>    Display futures chain
+  futures rollover          Roll futures to next expiry
+  gtt create                Create GTT order
+  gtt list                  List GTT orders
+  gtt cancel <id>           Cancel GTT order
+  bracket create            Create bracket order with SL and target
 
-# Signal score
-./trader signal TCS
+PLANNING
+  plan add <symbol>         Create trade plan
+    --entry                 Entry price
+    --sl                    Stop-loss price
+    --target/--t1/--t2/--t3 Target prices
+    --qty                   Quantity
+  plan list                 List trade plans
+  plan execute <id>         Execute a trade plan
+  plan cancel <id>          Cancel a trade plan
+  prep                      Next-day trading preparation
+    --watchlist             Watchlist to analyze
+    --amo                   Place AMO orders for setups
+  alert add <symbol>        Create price alert
+    --above/--below         Price level
+    --change                Percent change
+  alert list                List active alerts
+  events                    Corporate events calendar
 
-# Multi-timeframe analysis
-./trader mtf INFY
+MONITORING
+  watch                     Interactive watch mode
+    -w, --watchlist         Watchlist to monitor
+  watchlist add <symbol>    Add to watchlist
+  watchlist remove <symbol> Remove from watchlist
+  watchlist list            List all watchlists
+  watchlist create <name>   Create new watchlist
 
-# AI research report
-./trader research HDFC
+AI TRADING
+  trader start              Start autonomous trading daemon
+    --dry-run               Run without executing trades
+    --watchlist             Watchlist to monitor
+    --interval              Scan interval in seconds
+  trader stop               Stop the daemon
+  trader status             Show daemon status
+  trader pause              Pause trading (analysis continues)
+  trader resume             Resume trading
+  trader config             View trader configuration
+  trader health             System health diagnostics
+  decisions list            List recent AI decisions
+    --limit                 Max decisions to show
+    --symbol                Filter by symbol
+    --executed              Show only executed
+    --days                  Filter by days
+  decisions show <id>       Show decision details
+  decisions stats           AI performance statistics
 
-# Scan for setups
-./trader scan --preset momentum
-./trader scan --rsi-below 30 --volume-above 2
-```
+JOURNAL
+  journal today             Show today's trades and notes
+  journal add <trade-id>    Add analysis to a trade
+  journal report            Generate performance report
+    --period                daily, weekly, monthly
+  journal search            Search journal entries
 
-### Trading
-```bash
-# Place orders
-./trader buy RELIANCE --qty 10 --price 2450
-./trader sell INFY --qty 5 --type MARKET
+UTILITY
+  backtest                  Backtest trading strategies
+    --strategy              Strategy to test (momentum, breakout)
+    --symbol                Symbol to backtest
+    --days                  Number of days
+    --capital               Starting capital
+  export candles <symbol>   Export candle data to CSV
+  export trades             Export trade history
+  export journal            Export journal entries
+  api start                 Start REST API server
 
-# View positions
-./trader positions
-./trader holdings
+INDIAN MARKET
+  margin                    Margin utilization
+  margin calc <symbol>      Calculate margin for order
+  circuit <symbol>          Circuit limits and status
+  settlement                T+1 settlement status
+  surveillance <symbol>     ASM/GSM/T2T status
+  expiry                    F&O expiry positions
+  funds                     Fund summary
+  pledge list               List pledgeable holdings
+  pledge create             Create pledge request
+  basket create <name>      Create basket
+  basket order              Place basket order
+  delivery <symbol>         Delivery analysis
+  promoter <symbol>         Promoter holdings
+  mf-holdings <symbol>      Mutual fund holdings
+  bulk-deals                Bulk and block deals
+  corporate-actions         Corporate actions calendar
 
-# Exit positions
-./trader exit RELIANCE
-./trader exit-all
-```
+CONFIG
+  config show               Show current configuration
+  config path               Show config directory
+  config validate           Validate config files
+  version                   Print version info
 
-### Planning
-```bash
-# Next-day preparation
-./trader prep
-
-# Trade plans
-./trader plan add RELIANCE --entry 2450 --sl 2400 --target 2550
-./trader plan list
-./trader plan execute PLAN001
-```
-
-### AI Decisions
-```bash
-# View AI decisions
-./trader decisions list
-./trader decisions stats --days 30
-
-# Autonomous trader daemon
-./trader trader start
-./trader trader status
-./trader trader stop
-```
-
-### Indian Market
-```bash
-# Margin calculator
-./trader margin RELIANCE --qty 100 --product MIS
-
-# Circuit limits
-./trader circuit RELIANCE
-
-# F&O expiry
-./trader expiry --index NIFTY
-
-# Settlement info
-./trader settlement RELIANCE
-
-# Surveillance status
-./trader surveillance RELIANCE
+GLOBAL FLAGS
+  --json                    Output in JSON format
+  --debug                   Enable debug logging
+  -e, --exchange            Exchange (NSE, BSE, NFO)
 ```
 
 ## Project Structure
