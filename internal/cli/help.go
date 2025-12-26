@@ -51,7 +51,8 @@ func newCommandsCmd(app *App) *cobra.Command {
 					}{
 						{"quote <symbol>", "Get real-time quote"},
 						{"data <symbol>", "Get historical OHLCV data"},
-						{"live <symbols...>", "Stream live prices"},
+						{"live <symbols...>", "Stream live prices (WebSocket)"},
+						{"live -w nifty50", "Stream predefined watchlist"},
 						{"breadth", "Market breadth indicators"},
 					},
 				},
@@ -119,6 +120,8 @@ func newCommandsCmd(app *App) *cobra.Command {
 						desc string
 					}{
 						{"watch", "Interactive watch mode"},
+						{"live <symbols...>", "Real-time streaming"},
+						{"live -w nifty50/banknifty/it", "Stream sector watchlist"},
 						{"watchlist add/remove/list", "Watchlist management"},
 					},
 				},
@@ -212,6 +215,17 @@ func newExamplesCmd(app *App) *cobra.Command {
 						"trader scan --preset momentum   # Find momentum stocks",
 						"trader analyze RELIANCE         # Analyze a stock",
 						"trader signal RELIANCE          # Get signal score",
+					},
+				},
+				{
+					title: "Live Streaming",
+					commands: []string{
+						"trader live RELIANCE INFY TCS   # Stream multiple symbols",
+						"trader live -w nifty50          # Stream NIFTY 50 stocks",
+						"trader live -w banknifty        # Stream Bank NIFTY stocks",
+						"trader live -w it               # Stream IT sector",
+						"trader live -w pharma           # Stream Pharma sector",
+						"trader live RELIANCE --mode full # Full tick data with depth",
 					},
 				},
 				{

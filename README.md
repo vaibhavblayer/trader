@@ -5,9 +5,12 @@ An AI-powered autonomous day trading CLI for the Indian stock market (NSE/BSE), 
 ## Features
 
 ### Market Data
-- Real-time quotes and live streaming
+- Real-time quotes and live WebSocket streaming
+- Multi-symbol live streaming with table display
+- Predefined sector watchlists (NIFTY 50, Bank NIFTY, IT, Auto, Pharma, FMCG)
 - Historical OHLCV data with multiple timeframes
 - Market breadth indicators (A/D ratio, VIX, PCR)
+- Voice notifications for price alerts (macOS)
 
 ### Technical Analysis
 - 20+ indicators (RSI, MACD, Bollinger Bands, SuperTrend, ADX, etc.)
@@ -101,8 +104,22 @@ MARKET DATA
     -t, --timeframe         Timeframe (1min, 5min, 15min, 30min, 1hour, 1day)
     -d, --days              Number of days of history
     -l, --limit             Limit number of candles (0 for all)
-  live <symbols...>         Stream live prices (WebSocket)
+  live [symbols...]         Stream live prices (WebSocket)
+    -w, --watchlist         Use predefined or custom watchlist
+    -m, --mode              Tick mode (quote, full)
+    -e, --exchange          Exchange (NSE, BSE, NFO)
   breadth                   Market breadth indicators (A/D, VIX, PCR)
+
+LIVE STREAMING WATCHLISTS
+  trader live RELIANCE INFY TCS           # Multiple symbols
+  trader live --watchlist nifty50         # NIFTY 50 constituents (50 stocks)
+  trader live --watchlist banknifty       # Bank NIFTY stocks (12 stocks)
+  trader live --watchlist it              # IT sector (10 stocks)
+  trader live --watchlist auto            # Auto sector (10 stocks)
+  trader live --watchlist pharma          # Pharma sector (10 stocks)
+  trader live --watchlist fmcg            # FMCG sector (10 stocks)
+  trader live --watchlist default         # Your custom default watchlist
+  trader live -w nifty50 --mode full      # Full tick data with market depth
 
 ANALYSIS
   analyze <symbol>          Full technical analysis
