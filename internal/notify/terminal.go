@@ -4,6 +4,7 @@ package notify
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -93,6 +94,7 @@ type TerminalNotifier struct {
 	enabled       bool
 	bellEnabled   bool
 	colorEnabled  bool
+	voiceEnabled  bool
 }
 
 // TerminalNotificationHandler is a function that handles terminal notifications.
@@ -109,6 +111,7 @@ func NewTerminalNotifier(bufferSize int) *TerminalNotifier {
 		enabled:       true,
 		bellEnabled:   true,
 		colorEnabled:  true,
+		voiceEnabled:  true,
 	}
 }
 
@@ -124,6 +127,13 @@ func (tn *TerminalNotifier) SetColorEnabled(enabled bool) {
 	tn.mu.Lock()
 	defer tn.mu.Unlock()
 	tn.colorEnabled = enabled
+}
+
+// SetVoiceEnabled enables or disables voice notifications.
+func (tn *TerminalNotifier) SetVoiceEnabled(enabled bool) {
+	tn.mu.Lock()
+	defer tn.mu.Unlock()
+	tn.voiceEnabled = enabled
 }
 
 // SetEnabled enables or disables the notifier.
@@ -185,6 +195,7 @@ func (tn *TerminalNotifier) processNotification(n TerminalNotification) {
 	tn.mu.RLock()
 	handlers := tn.handlers
 	bellEnabled := tn.bellEnabled
+	voiceEnabled := tn.voiceEnabled
 	tn.mu.RUnlock()
 
 	// Ring bell for important notifications
@@ -192,10 +203,37 @@ func (tn *TerminalNotifier) processNotification(n TerminalNotification) {
 		fmt.Print("\a") // Terminal bell
 	}
 
+	// Voice notification for important alerts (macOS)
+	if voiceEnabled && n.Priority >= 2 {
+		go speakNotification(n)
+	}
+
 	// Call all registered handlers
 	for _, handler := range handlers {
 		handler(n)
 	}
+}
+
+// speakNotification uses macOS 'say' command for voice notifications (non-blocking).
+func speakNotification(n TerminalNotification) {
+	var text string
+	switch n.Type {
+	case TerminalNotifyEntry:
+		text = fmt.Sprintf("%s approaching entry at %.0f", n.Symbol, n.TriggerPrice)
+	case TerminalNotifyStopLoss:
+		text = fmt.Sprintf("Warning! %s approaching stop loss at %.0f", n.Symbol, n.TriggerPrice)
+	case TerminalNotifyTarget:
+		text = fmt.Sprintf("%s approaching target at %.0f. Consider booking profits", n.Symbol, n.TriggerPrice)
+	case TerminalNotifyAlert:
+		text = fmt.Sprintf("Alert! %s", n.Message)
+	case TerminalNotifyTrade:
+		text = fmt.Sprintf("Trade executed. %s", n.Message)
+	case TerminalNotifyError:
+		text = fmt.Sprintf("Error! %s", n.Message)
+	default:
+		return // Don't speak info notifications
+	}
+	exec.Command("say", text).Start() // Non-blocking, uses default Siri voice
 }
 
 // GetNotificationChannel returns the notification channel for custom processing.

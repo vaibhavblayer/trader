@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -212,37 +213,88 @@ func displayCandles(output *Output, symbol, timeframe string, candles []models.C
 
 func newLiveCmd(app *App) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "live <symbols...>",
+		Use:   "live [symbols...]",
 		Short: "Stream live prices for symbols",
-		Long: `Stream real-time price updates for one or more symbols.
+		Long: `Stream real-time price updates for symbols or watchlists.
+
+Supports multiple symbols, predefined watchlists, or custom watchlists.
+
+Predefined watchlists:
+  nifty50     - NIFTY 50 index constituents
+  banknifty   - Bank NIFTY constituents  
+  it          - IT sector stocks
+  auto        - Auto sector stocks
+  pharma      - Pharma sector stocks
 
 Press Ctrl+C to stop streaming.`,
 		Example: `  trader live RELIANCE
   trader live RELIANCE INFY TCS
-  trader live NIFTY50 BANKNIFTY --mode full`,
-		Args: cobra.MinimumNArgs(1),
+  trader live --watchlist nifty50
+  trader live --watchlist default
+  trader live RELIANCE INFY --mode full`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
-
-			symbols := make([]string, len(args))
-			for i, s := range args {
-				symbols[i] = strings.ToUpper(s)
-			}
+			ctx := context.Background()
 
 			mode, _ := cmd.Flags().GetString("mode")
+			exchange, _ := cmd.Flags().GetString("exchange")
+			watchlistName, _ := cmd.Flags().GetString("watchlist")
+
+			if app.Broker == nil {
+				output.Error("Broker not configured. Run 'trader login' first.")
+				return fmt.Errorf("broker not configured")
+			}
 
 			if app.Ticker == nil {
 				output.Error("Ticker not configured. Run 'trader login' first.")
 				return fmt.Errorf("ticker not configured")
 			}
 
-			output.Info("Streaming live prices for: %s", strings.Join(symbols, ", "))
+			// Get symbols from args or watchlist
+			var symbols []string
+			if watchlistName != "" {
+				symbols = getPredefinedWatchlist(watchlistName, app, ctx)
+				if len(symbols) == 0 {
+					output.Error("Watchlist '%s' not found or empty", watchlistName)
+					return fmt.Errorf("watchlist not found")
+				}
+				output.Info("Using watchlist: %s (%d symbols)", watchlistName, len(symbols))
+			} else if len(args) > 0 {
+				symbols = make([]string, len(args))
+				for i, s := range args {
+					symbols[i] = strings.ToUpper(s)
+				}
+			} else {
+				// Default watchlist
+				symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"}
+				output.Info("Using default watchlist")
+			}
+
+			// Fetch and register instrument tokens
+			output.Info("Fetching instrument tokens...")
+			validSymbols := make([]string, 0, len(symbols))
+			for _, symbol := range symbols {
+				token, err := app.Broker.GetInstrumentToken(ctx, symbol, models.Exchange(exchange))
+				if err != nil {
+					output.Warning("Symbol %s not found", symbol)
+					continue
+				}
+				app.Ticker.RegisterSymbol(symbol, token)
+				validSymbols = append(validSymbols, symbol)
+			}
+
+			if len(validSymbols) == 0 {
+				output.Error("No valid symbols found")
+				return fmt.Errorf("no valid symbols")
+			}
+
+			output.Info("Streaming %d symbols", len(validSymbols))
 			output.Dim("Press Ctrl+C to stop")
 			output.Println()
 
-			// Create header
-			table := NewTable(output, "Symbol", "LTP", "Change", "Volume", "Bid", "Ask", "Time")
-			table.Render()
+			// Track latest ticks for each symbol
+			latestTicks := make(map[string]models.Tick)
+			var tickMu sync.Mutex
 
 			// Subscribe to symbols
 			tickMode := broker.TickModeQuote
@@ -250,46 +302,159 @@ Press Ctrl+C to stop streaming.`,
 				tickMode = broker.TickModeFull
 			}
 
-			ctx := context.Background()
-			if err := app.Ticker.Connect(ctx); err != nil {
-				output.Error("Failed to connect: %v", err)
-				return err
-			}
-			defer app.Ticker.Disconnect()
-
-			if err := app.Ticker.Subscribe(symbols, tickMode); err != nil {
-				output.Error("Failed to subscribe: %v", err)
-				return err
-			}
-
-			// Handle ticks
+			// Set up handlers before connecting
 			app.Ticker.OnTick(func(tick models.Tick) {
-				change := ((tick.LTP - tick.Close) / tick.Close) * 100
-				changeStr := output.ColoredString(output.PnLColor(change), FormatPercent(change))
-
-				output.Printf("\r%-12s %10s %10s %10s %10s %10s %s",
-					tick.Symbol,
-					FormatPrice(tick.LTP),
-					changeStr,
-					FormatVolume(tick.Volume),
-					FormatPrice(tick.BidPrice),
-					FormatPrice(tick.AskPrice),
-					FormatTime(tick.Timestamp),
-				)
+				tickMu.Lock()
+				latestTicks[tick.Symbol] = tick
+				tickMu.Unlock()
 			})
 
 			app.Ticker.OnError(func(err error) {
 				output.Error("Ticker error: %v", err)
 			})
 
-			// Wait for interrupt
-			select {}
+			app.Ticker.OnConnect(func() {
+				output.Success("Connected to ticker")
+				if err := app.Ticker.Subscribe(validSymbols, tickMode); err != nil {
+					output.Error("Failed to subscribe: %v", err)
+				}
+			})
+
+			app.Ticker.OnDisconnect(func() {
+				output.Warning("Disconnected from ticker")
+			})
+
+			if err := app.Ticker.Connect(ctx); err != nil {
+				output.Error("Failed to connect: %v", err)
+				return err
+			}
+			defer app.Ticker.Disconnect()
+
+			// Refresh display periodically
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ticker.C:
+					tickMu.Lock()
+					displayLiveTicks(output, validSymbols, latestTicks)
+					tickMu.Unlock()
+				}
+			}
 		},
 	}
 
 	cmd.Flags().StringP("mode", "m", "quote", "Tick mode (quote, full)")
+	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE, NFO)")
+	cmd.Flags().StringP("watchlist", "w", "", "Watchlist name (nifty50, banknifty, it, auto, pharma, or custom)")
 
 	return cmd
+}
+
+// getPredefinedWatchlist returns symbols for predefined or custom watchlists
+func getPredefinedWatchlist(name string, app *App, ctx context.Context) []string {
+	// Predefined watchlists
+	predefined := map[string][]string{
+		"nifty50": {
+			"RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK",
+			"HINDUNILVR", "SBIN", "BHARTIARTL", "ITC", "KOTAKBANK",
+			"LT", "HCLTECH", "AXISBANK", "ASIANPAINT", "MARUTI",
+			"SUNPHARMA", "TITAN", "BAJFINANCE", "DMART", "ULTRACEMCO",
+			"NTPC", "WIPRO", "M&M", "ONGC", "JSWSTEEL",
+			"POWERGRID", "TATAMOTORS", "ADANIENT", "ADANIPORTS", "COALINDIA",
+			"TATASTEEL", "HINDALCO", "BAJAJFINSV", "TECHM", "INDUSINDBK",
+			"NESTLEIND", "GRASIM", "DIVISLAB", "DRREDDY", "CIPLA",
+			"BRITANNIA", "EICHERMOT", "APOLLOHOSP", "TATACONSUM", "SBILIFE",
+			"BPCL", "HEROMOTOCO", "BAJAJ-AUTO", "UPL", "HDFCLIFE",
+		},
+		"banknifty": {
+			"HDFCBANK", "ICICIBANK", "KOTAKBANK", "AXISBANK", "SBIN",
+			"INDUSINDBK", "BANDHANBNK", "FEDERALBNK", "IDFCFIRSTB", "PNB",
+			"BANKBARODA", "AUBANK",
+		},
+		"it": {
+			"TCS", "INFY", "HCLTECH", "WIPRO", "TECHM",
+			"LTIM", "MPHASIS", "COFORGE", "PERSISTENT", "LTTS",
+		},
+		"auto": {
+			"TATAMOTORS", "M&M", "MARUTI", "BAJAJ-AUTO", "HEROMOTOCO",
+			"EICHERMOT", "ASHOKLEY", "TVSMOTOR", "BHARATFORG", "MOTHERSON",
+		},
+		"pharma": {
+			"SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB", "APOLLOHOSP",
+			"BIOCON", "TORNTPHARM", "LUPIN", "AUROPHARMA", "ALKEM",
+		},
+		"fmcg": {
+			"HINDUNILVR", "ITC", "NESTLEIND", "BRITANNIA", "TATACONSUM",
+			"DABUR", "MARICO", "GODREJCP", "COLPAL", "VBL",
+		},
+	}
+
+	// Check predefined
+	if symbols, ok := predefined[strings.ToLower(name)]; ok {
+		return symbols
+	}
+
+	// Check custom watchlist from store
+	if app.Store != nil {
+		symbols, err := app.Store.GetWatchlist(ctx, name)
+		if err == nil && len(symbols) > 0 {
+			return symbols
+		}
+	}
+
+	return nil
+}
+
+// displayLiveTicks displays live ticks in a table format
+func displayLiveTicks(output *Output, symbols []string, ticks map[string]models.Tick) {
+	// Clear screen and move cursor to top
+	fmt.Print("\033[H\033[2J")
+	
+	output.Bold("Live Market Data")
+	output.Printf("  %s | %d symbols\n\n", time.Now().Format("15:04:05"), len(symbols))
+
+	// Header
+	fmt.Printf("%-12s %12s %10s %12s %12s %12s %10s\n",
+		"Symbol", "LTP", "Change", "Volume", "Bid", "Ask", "Time")
+	fmt.Println(strings.Repeat("─", 85))
+
+	// Data rows
+	for _, symbol := range symbols {
+		tick, ok := ticks[symbol]
+		if !ok {
+			fmt.Printf("%-12s %12s %10s %12s %12s %12s %10s\n",
+				symbol, "-", "-", "-", "-", "-", "-")
+			continue
+		}
+
+		change := 0.0
+		if tick.Close > 0 {
+			change = ((tick.LTP - tick.Close) / tick.Close) * 100
+		}
+		
+		changeColor := "\033[0m" // Reset
+		if change > 0 {
+			changeColor = "\033[32m" // Green
+		} else if change < 0 {
+			changeColor = "\033[31m" // Red
+		}
+
+		fmt.Printf("%-12s %12s %s%10s\033[0m %12s %12s %12s %10s\n",
+			symbol,
+			FormatPrice(tick.LTP),
+			changeColor,
+			FormatPercent(change),
+			FormatVolume(tick.Volume),
+			FormatPrice(tick.BidPrice),
+			FormatPrice(tick.AskPrice),
+			tick.Timestamp.Format("15:04:05"),
+		)
+	}
+
+	fmt.Println()
+	output.Dim("Press Ctrl+C to stop")
 }
 
 func newBreadthCmd(app *App) *cobra.Command {

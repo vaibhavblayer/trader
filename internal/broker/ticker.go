@@ -75,14 +75,16 @@ func NewZerodhaTicker(cfg ZerodhaTickerConfig) *ZerodhaTicker {
 // Connect establishes WebSocket connection with Kite Connect.
 func (t *ZerodhaTicker) Connect(ctx context.Context) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	
 	if t.connected {
+		t.mu.Unlock()
 		return nil
 	}
 	
 	// Create ticker instance
 	t.ticker = kiteticker.New(t.apiKey, t.accessToken)
+	
+	// Channel to signal connection
+	connectedCh := make(chan struct{})
 	
 	// Set up callbacks
 	t.ticker.OnConnect(func() {
@@ -90,6 +92,12 @@ func (t *ZerodhaTicker) Connect(ctx context.Context) error {
 		t.connected = true
 		t.reconnecting = false
 		t.mu.Unlock()
+		
+		// Signal connection
+		select {
+		case connectedCh <- struct{}{}:
+		default:
+		}
 		
 		// Resubscribe to previously subscribed symbols
 		t.resubscribe()
@@ -132,6 +140,8 @@ func (t *ZerodhaTicker) Connect(ctx context.Context) error {
 		t.mu.Unlock()
 	})
 	
+	t.mu.Unlock() // Release lock before starting connection
+	
 	// Start connection in goroutine
 	go t.ticker.Serve()
 	
@@ -139,13 +149,17 @@ func (t *ZerodhaTicker) Connect(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-time.After(10 * time.Second):
-		if !t.connected {
+	case <-connectedCh:
+		return nil
+	case <-time.After(30 * time.Second):
+		t.mu.RLock()
+		connected := t.connected
+		t.mu.RUnlock()
+		if !connected {
 			return fmt.Errorf("connection timeout")
 		}
+		return nil
 	}
-	
-	return nil
 }
 
 // Disconnect closes the WebSocket connection.

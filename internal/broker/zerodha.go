@@ -305,21 +305,14 @@ func (z *ZerodhaBroker) GetInstruments(ctx context.Context, exchange models.Exch
 		return nil, fmt.Errorf("not authenticated")
 	}
 	
-	instruments, err := z.client.GetInstruments()
+	// Use exchange-specific endpoint for faster response
+	instruments, err := z.client.GetInstrumentsByExchange(string(exchange))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get instruments: %w", err)
 	}
 	
-	// Filter by exchange
-	var filtered []kiteconnect.Instrument
-	for _, inst := range instruments {
-		if inst.Exchange == string(exchange) {
-			filtered = append(filtered, inst)
-		}
-	}
-	
-	result := make([]models.Instrument, len(filtered))
-	for i, inst := range filtered {
+	result := make([]models.Instrument, len(instruments))
+	for i, inst := range instruments {
 		result[i] = models.Instrument{
 			Token:     uint32(inst.InstrumentToken),
 			Symbol:    inst.Tradingsymbol,
@@ -368,6 +361,11 @@ func (z *ZerodhaBroker) getInstrumentToken(symbol string, exchange models.Exchan
 	}
 	
 	return inst.Token, nil
+}
+
+// GetInstrumentToken returns the instrument token for a symbol (public method).
+func (z *ZerodhaBroker) GetInstrumentToken(ctx context.Context, symbol string, exchange models.Exchange) (uint32, error) {
+	return z.getInstrumentToken(symbol, exchange)
 }
 
 func mapTimeframeToInterval(tf string) string {

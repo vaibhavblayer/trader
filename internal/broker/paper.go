@@ -113,6 +113,14 @@ func (p *PaperBroker) GetInstruments(ctx context.Context, exchange models.Exchan
 	return nil, fmt.Errorf("no data broker configured")
 }
 
+// GetInstrumentToken returns the instrument token for a symbol.
+func (p *PaperBroker) GetInstrumentToken(ctx context.Context, symbol string, exchange models.Exchange) (uint32, error) {
+	if p.dataBroker != nil {
+		return p.dataBroker.GetInstrumentToken(ctx, symbol, exchange)
+	}
+	return 0, fmt.Errorf("no data broker configured")
+}
+
 // PlaceOrder simulates order placement.
 func (p *PaperBroker) PlaceOrder(ctx context.Context, order *models.Order) (*OrderResult, error) {
 	p.mu.Lock()

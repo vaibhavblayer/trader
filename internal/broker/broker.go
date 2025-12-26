@@ -20,6 +20,7 @@ type Broker interface {
 	GetQuote(ctx context.Context, symbol string) (*models.Quote, error)
 	GetHistorical(ctx context.Context, req HistoricalRequest) ([]models.Candle, error)
 	GetInstruments(ctx context.Context, exchange models.Exchange) ([]models.Instrument, error)
+	GetInstrumentToken(ctx context.Context, symbol string, exchange models.Exchange) (uint32, error)
 
 	// Orders
 	PlaceOrder(ctx context.Context, order *models.Order) (*OrderResult, error)
@@ -55,6 +56,7 @@ type Ticker interface {
 	Disconnect() error
 	Subscribe(symbols []string, mode TickMode) error
 	Unsubscribe(symbols []string) error
+	RegisterSymbol(symbol string, token uint32)
 	OnTick(handler func(models.Tick))
 	OnError(handler func(error))
 	OnConnect(handler func())

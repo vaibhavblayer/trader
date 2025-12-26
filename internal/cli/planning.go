@@ -526,7 +526,8 @@ func newAlertCmd(app *App) *cobra.Command {
 		Long:  "Create, list, and delete price alerts.",
 	}
 
-	cmd.AddCommand(&cobra.Command{
+	// Create add subcommand with flags
+	addCmd := &cobra.Command{
 		Use:   "add <symbol>",
 		Short: "Add a price alert",
 		Long: `Create a price alert for a symbol.
@@ -587,7 +588,11 @@ You'll be notified when the price crosses the specified level.`,
 
 			return nil
 		},
-	})
+	}
+	addCmd.Flags().Float64("above", 0, "Alert when price goes above this level")
+	addCmd.Flags().Float64("below", 0, "Alert when price goes below this level")
+	addCmd.Flags().Float64("change", 0, "Alert on percent change")
+	cmd.AddCommand(addCmd)
 
 	cmd.AddCommand(&cobra.Command{
 		Use:   "list",

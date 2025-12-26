@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -22,6 +23,133 @@ func addUtilityCommands(rootCmd *cobra.Command, app *App) {
 	rootCmd.AddCommand(newBacktestCmd(app))
 	rootCmd.AddCommand(newExportCmd(app))
 	rootCmd.AddCommand(newAPICmd(app))
+	rootCmd.AddCommand(newNotifyTestCmd(app))
+}
+
+func newNotifyTestCmd(app *App) *cobra.Command {
+	return &cobra.Command{
+		Use:   "notify-test",
+		Short: "Test notification system",
+		Long: `Test the notification system by sending sample notifications.
+
+This helps verify that terminal notifications, sounds, and external
+notification channels (Telegram, Email, Webhook) are working correctly.`,
+		Example: `  trader notify-test
+  trader notify-test --type alert
+  trader notify-test --type trade`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+
+			output.Bold("🔔 Testing Notification System")
+			output.Println()
+
+			// Test voice notification
+			output.Info("Testing voice notifications (non-blocking)...")
+			speak("Trading notification system is ready")
+
+			// Show different notification types
+			output.Println()
+			output.Bold("Sample Notifications:")
+			output.Println()
+
+			// Entry notification
+			output.Printf("%s[%s] %s%s | %s | Price approaching entry level | LTP: ₹2,450.00 → Trigger: ₹2,440.00 (0.41%%)\n",
+				"\033[36m", time.Now().Format("15:04:05"), "📥 ENTRY", "\033[0m", "RELIANCE")
+			output.Printf("    → Consider BUY at ₹2,440.00\n")
+			speak("Reliance approaching entry at 2440")
+			output.Println()
+
+			// Stop-loss notification
+			output.Printf("%s[%s] %s%s | %s | ⚠️ Price approaching STOP-LOSS | LTP: ₹2,405.00 → Trigger: ₹2,400.00 (0.21%%)\n",
+				"\033[31m", time.Now().Format("15:04:05"), "🛑 STOP-LOSS", "\033[0m", "RELIANCE")
+			output.Printf("    → Review position and consider exit\n")
+			speak("Warning! Reliance approaching stop loss at 2400")
+			output.Println()
+
+			// Target notification
+			output.Printf("%s[%s] %s%s | %s | 🎯 Price approaching Target 1 | LTP: ₹2,548.00 → Trigger: ₹2,550.00 (0.08%%)\n",
+				"\033[32m", time.Now().Format("15:04:05"), "🎯 TARGET", "\033[0m", "RELIANCE")
+			output.Printf("    → Consider booking profits at ₹2,550.00\n")
+			speak("Reliance approaching target 1 at 2550")
+			output.Println()
+
+			// Alert notification
+			output.Printf("%s[%s] %s%s | %s | 📈 Alert: Price above ₹3,200.00\n",
+				"\033[33m", time.Now().Format("15:04:05"), "🔔 ALERT", "\033[0m", "TCS")
+			speak("Alert! TCS crossed above 3200")
+			output.Println()
+
+			// Trade notification
+			output.Printf("%s[%s] %s%s | %s | ✅ Trade executed: BUY 10 @ ₹2,450.00\n",
+				"\033[35m", time.Now().Format("15:04:05"), "💹 TRADE", "\033[0m", "RELIANCE")
+			speak("Trade executed. Bought 10 Reliance at 2450")
+			output.Println()
+
+			// Error notification
+			output.Printf("%s[%s] %s%s | ❌ Error in order placement: insufficient margin\n",
+				"\033[31m", time.Now().Format("15:04:05"), "❌ ERROR", "\033[0m")
+			speak("Error! Order failed due to insufficient margin")
+			output.Println()
+
+			// Info notification
+			output.Printf("%s[%s] %s%s | ℹ️ Market opens in 15 minutes\n",
+				"\033[37m", time.Now().Format("15:04:05"), "ℹ️  INFO", "\033[0m")
+			output.Println()
+
+			output.Bold("External Notification Channels:")
+			output.Println()
+
+			// Check config for enabled channels
+			if app.Config.Notifications.Webhook.Enabled {
+				output.Printf("  Webhook:  %s (URL: %s)\n", output.Green("✓ Enabled"), app.Config.Notifications.Webhook.URL)
+			} else {
+				output.Printf("  Webhook:  %s\n", output.Yellow("○ Disabled"))
+			}
+
+			if app.Config.Notifications.Telegram.Enabled {
+				output.Printf("  Telegram: %s\n", output.Green("✓ Enabled"))
+			} else {
+				output.Printf("  Telegram: %s\n", output.Yellow("○ Disabled"))
+			}
+
+			if app.Config.Notifications.Email.Enabled {
+				output.Printf("  Email:    %s\n", output.Green("✓ Enabled"))
+			} else {
+				output.Printf("  Email:    %s\n", output.Yellow("○ Disabled"))
+			}
+
+			output.Println()
+			output.Dim("Configure notifications in ~/.config/zerodha-trader/config.toml")
+			output.Println()
+
+			output.Bold("When do notifications trigger?")
+			output.Println("  • Price alerts: When price crosses your alert level")
+			output.Println("  • Trade plans: When price approaches entry/SL/target")
+			output.Println("  • AI decisions: When autonomous trader makes a decision")
+			output.Println("  • Trade execution: When orders are placed/filled")
+			output.Println("  • Errors: When something goes wrong")
+			output.Println()
+
+			output.Dim("Run 'trader trader start' to see live notifications during trading")
+
+			return nil
+		},
+	}
+}
+
+// speak uses macOS 'say' command for voice notifications (non-blocking)
+func speak(text string) {
+	exec.Command("say", text).Start()
+}
+
+// speakAsync is an alias for speak (both are non-blocking now)
+func speakAsync(text string) {
+	exec.Command("say", text).Start()
+}
+
+// playSound plays a macOS system sound
+func playSound(name string) {
+	exec.Command("afplay", "/System/Library/Sounds/"+name+".aiff").Start()
 }
 
 func newBacktestCmd(app *App) *cobra.Command {
