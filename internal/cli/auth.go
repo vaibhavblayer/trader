@@ -20,7 +20,9 @@ import (
 // Requirements: 1.1, 1.3
 func addAuthCommands(rootCmd *cobra.Command, app *App) {
 	rootCmd.AddCommand(newLoginCmd(app))
+	rootCmd.AddCommand(newAutoLoginCmd(app))
 	rootCmd.AddCommand(newLogoutCmd(app))
+	rootCmd.AddCommand(newAuthStatusCmd(app))
 }
 
 func newLoginCmd(app *App) *cobra.Command {
@@ -213,4 +215,155 @@ You will need to login again to use trading features.`,
 			return nil
 		},
 	}
+}
+
+func newAutoLoginCmd(app *App) *cobra.Command {
+	return &cobra.Command{
+		Use:   "autologin",
+		Short: "Auto-login using TOTP (no browser required)",
+		Long: `Automatically login to Zerodha using stored password and TOTP secret.
+
+This requires password and totp_secret to be configured in credentials.toml:
+
+[zerodha]
+api_key = "your_api_key"
+api_secret = "your_api_secret"
+user_id = "your_user_id"
+password = "your_kite_password"
+totp_secret = "your_totp_secret"
+
+To get your TOTP secret:
+1. Go to Zerodha Console > My Profile > Password & Security
+2. Enable TOTP if not already enabled
+3. When setting up, copy the secret key (not the QR code)
+4. Add it to credentials.toml`,
+		Example: `  trader autologin`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			if app.Broker == nil {
+				output.Error("Broker not configured. Check credentials.toml")
+				return fmt.Errorf("broker not configured")
+			}
+
+			// Check if already authenticated
+			if app.Broker.IsAuthenticated() {
+				output.Success("✓ Already logged in!")
+				return nil
+			}
+
+			// Get credentials
+			password := app.Config.Credentials.Zerodha.Password
+			totpSecret := app.Config.Credentials.Zerodha.TOTPSecret
+
+			if password == "" || totpSecret == "" {
+				output.Error("Auto-login requires password and totp_secret in credentials.toml")
+				output.Println()
+				output.Info("Add these to ~/.config/zerodha-trader/credentials.toml:")
+				output.Println()
+				output.Dim("[zerodha]")
+				output.Dim("password = \"your_kite_password\"")
+				output.Dim("totp_secret = \"your_totp_secret\"")
+				output.Println()
+				output.Info("To get TOTP secret: Zerodha Console > My Profile > Password & Security > TOTP")
+				return fmt.Errorf("credentials not configured for auto-login")
+			}
+
+			output.Info("Performing auto-login...")
+
+			zb, ok := app.Broker.(*broker.ZerodhaBroker)
+			if !ok {
+				output.Error("Auto-login only works with Zerodha broker")
+				return fmt.Errorf("invalid broker type")
+			}
+
+			if err := zb.AutoLogin(ctx, password, totpSecret); err != nil {
+				output.Error("Auto-login failed: %v", err)
+				output.Println()
+				output.Info("Try manual login: trader login")
+				return err
+			}
+
+			output.Success("✓ Auto-login successful!")
+			output.Println()
+			output.Info("Session will expire at 6:00 AM tomorrow.")
+			output.Dim("Run 'trader autologin' again tomorrow to re-authenticate.")
+
+			return nil
+		},
+	}
+}
+
+func newAuthStatusCmd(app *App) *cobra.Command {
+	return &cobra.Command{
+		Use:   "auth-status",
+		Short: "Check authentication status",
+		Long:  "Display current authentication status and session expiry.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+
+			if app.Broker == nil {
+				output.Error("Broker not configured")
+				return nil
+			}
+
+			if !app.Broker.IsAuthenticated() {
+				output.Warning("Not authenticated")
+				output.Println()
+				output.Info("Run 'trader login' or 'trader autologin' to authenticate")
+				return nil
+			}
+
+			output.Success("✓ Authenticated")
+			output.Println()
+
+			// Try to get user profile
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			balance, err := app.Broker.GetBalance(ctx)
+			if err != nil {
+				output.Warning("Session may be expired: %v", err)
+				output.Info("Run 'trader login' or 'trader autologin' to re-authenticate")
+				return nil
+			}
+
+			output.Printf("  User ID:    %s\n", app.Config.Credentials.Zerodha.UserID)
+			output.Printf("  Balance:    %s\n", FormatIndianCurrency(balance.AvailableCash))
+			output.Println()
+
+			// Session expiry info
+			now := time.Now()
+			loc, _ := time.LoadLocation("Asia/Kolkata")
+			expiry := time.Date(now.Year(), now.Month(), now.Day()+1, 6, 0, 0, 0, loc)
+			if now.Hour() < 6 {
+				expiry = time.Date(now.Year(), now.Month(), now.Day(), 6, 0, 0, 0, loc)
+			}
+			remaining := expiry.Sub(now)
+
+			output.Printf("  Session expires: %s (%s remaining)\n", 
+				expiry.Format("02 Jan 15:04"), 
+				formatDuration(remaining))
+
+			// Check if auto-login is configured
+			if app.Config.Credentials.Zerodha.Password != "" && app.Config.Credentials.Zerodha.TOTPSecret != "" {
+				output.Println()
+				output.Success("✓ Auto-login configured")
+				output.Dim("Run 'trader autologin' to re-authenticate when session expires")
+			}
+
+			return nil
+		},
+	}
+}
+
+func formatDuration(d time.Duration) string {
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dm", minutes)
 }

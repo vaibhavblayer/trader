@@ -5,11 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/pquerna/otp/totp"
 	kiteconnect "github.com/zerodha/gokiteconnect/v4"
 
 	"zerodha-trader/internal/models"
@@ -106,6 +112,182 @@ func (z *ZerodhaBroker) CompleteLogin(ctx context.Context, requestToken string) 
 	}
 	
 	return nil
+}
+
+// AutoLogin performs automated login using password and TOTP.
+// This bypasses the browser-based OAuth flow using HTTP requests.
+func (z *ZerodhaBroker) AutoLogin(ctx context.Context, password, totpSecret string) error {
+	// Try existing session first
+	if err := z.loadSession(); err == nil && z.authenticated {
+		if _, err := z.client.GetUserProfile(); err == nil {
+			return nil // Already authenticated
+		}
+	}
+
+	// Perform automated login via HTTP
+	requestToken, err := z.performAutoLogin(ctx, password, totpSecret)
+	if err != nil {
+		return fmt.Errorf("auto-login failed: %w", err)
+	}
+
+	// Complete login with the obtained request token
+	return z.CompleteLogin(ctx, requestToken)
+}
+
+// performAutoLogin automates the Kite login flow via HTTP requests
+func (z *ZerodhaBroker) performAutoLogin(ctx context.Context, password, totpSecret string) (string, error) {
+	// Generate TOTP code
+	totpCode, err := generateTOTP(totpSecret)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate TOTP: %w", err)
+	}
+
+	// Create HTTP client with cookie jar
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar:     jar,
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Don't follow redirects
+		},
+	}
+
+	// Step 1: Get login page to establish session
+	loginURL := z.client.GetLoginURL()
+	resp, err := client.Get(loginURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to get login page: %w", err)
+	}
+	resp.Body.Close()
+
+	// Step 2: Submit user_id and password to Kite login API
+	loginData := url.Values{
+		"user_id":  {z.userID},
+		"password": {password},
+	}
+	
+	req, _ := http.NewRequest("POST", "https://kite.zerodha.com/api/login", strings.NewReader(loginData.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Kite-Version", "3")
+	
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to submit credentials: %w", err)
+	}
+	
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	
+	var loginResp struct {
+		Status string `json:"status"`
+		Data   struct {
+			RequestID string `json:"request_id"`
+			TwofaType string `json:"twofa_type"`
+		} `json:"data"`
+		Message   string `json:"message"`
+		ErrorType string `json:"error_type"`
+	}
+	if err := json.Unmarshal(body, &loginResp); err != nil {
+		return "", fmt.Errorf("failed to parse login response: %w (body: %s)", err, string(body))
+	}
+
+	if loginResp.Status != "success" {
+		return "", fmt.Errorf("login failed: %s (type: %s)", loginResp.Message, loginResp.ErrorType)
+	}
+
+	// Step 3: Submit TOTP
+	totpData := url.Values{
+		"user_id":     {z.userID},
+		"request_id":  {loginResp.Data.RequestID},
+		"twofa_value": {totpCode},
+		"twofa_type":  {"totp"},
+	}
+	
+	req, _ = http.NewRequest("POST", "https://kite.zerodha.com/api/twofa", strings.NewReader(totpData.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Kite-Version", "3")
+	
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to submit TOTP: %w", err)
+	}
+	
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	
+	var totpResp struct {
+		Status    string `json:"status"`
+		Message   string `json:"message"`
+		ErrorType string `json:"error_type"`
+	}
+	if err := json.Unmarshal(body, &totpResp); err != nil {
+		return "", fmt.Errorf("failed to parse TOTP response: %w (body: %s)", err, string(body))
+	}
+	
+	if totpResp.Status != "success" {
+		return "", fmt.Errorf("TOTP verification failed: %s", totpResp.Message)
+	}
+
+	// Step 4: Get the request token from the login URL redirect
+	resp, err = client.Get(loginURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to get redirect: %w", err)
+	}
+	
+	// Check for redirect
+	location := resp.Header.Get("Location")
+	resp.Body.Close()
+	
+	if location == "" {
+		return "", fmt.Errorf("no redirect received after TOTP (status: %d)", resp.StatusCode)
+	}
+
+	// The first redirect goes to /connect/finish with sess_id
+	// We need to follow it to get the final redirect with request_token
+	if strings.Contains(location, "sess_id") {
+		// Follow the finish URL
+		resp, err = client.Get(location)
+		if err != nil {
+			return "", fmt.Errorf("failed to follow finish URL: %w", err)
+		}
+		location = resp.Header.Get("Location")
+		resp.Body.Close()
+		
+		if location == "" {
+			return "", fmt.Errorf("no redirect from finish URL")
+		}
+	}
+
+	parsedURL, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse redirect URL: %w", err)
+	}
+
+	requestToken := parsedURL.Query().Get("request_token")
+	if requestToken == "" {
+		return "", fmt.Errorf("request_token not found in redirect URL: %s", location)
+	}
+
+	return requestToken, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// generateTOTP generates a TOTP code from the secret
+func generateTOTP(secret string) (string, error) {
+	// Remove spaces and convert to uppercase
+	secret = strings.ReplaceAll(strings.ToUpper(secret), " ", "")
+	
+	code, err := totp.GenerateCode(secret, time.Now())
+	if err != nil {
+		return "", err
+	}
+	return code, nil
 }
 
 // Logout invalidates the session and clears stored credentials.

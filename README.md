@@ -59,6 +59,32 @@ go build -o trader ./cmd/trader
 go install ./cmd/trader
 ```
 
+### Shell Completion (Tab Completion)
+
+Enable tab completion for commands, flags, and arguments:
+
+```bash
+# Zsh (macOS default / Oh My Zsh)
+mkdir -p ~/.oh-my-zsh/completions
+trader completion zsh > ~/.oh-my-zsh/completions/_trader
+source ~/.zshrc
+
+# Bash (Linux)
+trader completion bash > /etc/bash_completion.d/trader
+
+# Bash (macOS with Homebrew)
+trader completion bash > $(brew --prefix)/etc/bash_completion.d/trader
+
+# Fish
+trader completion fish > ~/.config/fish/completions/trader.fish
+```
+
+After setup, press Tab to autocomplete commands and flags:
+```bash
+trader li<Tab>        # completes to 'trader live'
+trader live --<Tab>   # shows available flags
+```
+
 ## Configuration
 
 On first run, config templates are created at `~/.config/zerodha-trader/`:
@@ -69,6 +95,26 @@ On first run, config templates are created at `~/.config/zerodha-trader/`:
 api_key = "your_api_key"
 api_secret = "your_api_secret"
 user_id = "your_user_id"
+# Optional: For auto-login (no browser required)
+password = "your_kite_password"
+totp_secret = "your_totp_secret"  # From Zerodha Console > TOTP setup
+```
+
+### Auto-Login Setup (Recommended)
+
+Zerodha requires daily authentication. To automate this:
+
+1. Enable TOTP in Zerodha Console > My Profile > Password & Security
+2. When setting up TOTP, copy the **secret key** (not the QR code)
+3. Add `password` and `totp_secret` to credentials.toml
+4. Run `trader autologin` instead of `trader login`
+
+```bash
+# Daily login (no browser needed)
+trader autologin
+
+# Check auth status
+trader auth-status
 ```
 
 ### config.toml

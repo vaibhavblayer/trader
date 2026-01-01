@@ -97,9 +97,11 @@ type Credentials struct {
 
 // ZerodhaCredentials holds Zerodha API credentials.
 type ZerodhaCredentials struct {
-	APIKey    string `mapstructure:"api_key"`
-	APISecret string `mapstructure:"api_secret"`
-	UserID    string `mapstructure:"user_id"`
+	APIKey     string `mapstructure:"api_key"`
+	APISecret  string `mapstructure:"api_secret"`
+	UserID     string `mapstructure:"user_id"`
+	Password   string `mapstructure:"password"`    // For auto-login
+	TOTPSecret string `mapstructure:"totp_secret"` // For auto-login with 2FA
 }
 
 // OpenAICredentials holds OpenAI API credentials.

@@ -126,6 +126,66 @@ Use 'trader examples' to see common workflows.`,
 func addCoreCommands(rootCmd *cobra.Command, app *App) {
 	rootCmd.AddCommand(newVersionCmd())
 	rootCmd.AddCommand(newConfigCmd(app))
+	rootCmd.AddCommand(newCompletionCmd())
+}
+
+func newCompletionCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "completion [bash|zsh|fish|powershell]",
+		Short: "Generate shell completion scripts",
+		Long: `Generate shell completion scripts for trader.
+
+To load completions:
+
+Bash:
+  $ source <(trader completion bash)
+  # To load completions for each session, execute once:
+  # Linux:
+  $ trader completion bash > /etc/bash_completion.d/trader
+  # macOS:
+  $ trader completion bash > $(brew --prefix)/etc/bash_completion.d/trader
+
+Zsh:
+  # If shell completion is not already enabled in your environment,
+  # you will need to enable it. You can execute the following once:
+  $ echo "autoload -U compinit; compinit" >> ~/.zshrc
+
+  # To load completions for each session, execute once:
+  $ trader completion zsh > "${fpath[1]}/_trader"
+  # Or for Oh My Zsh:
+  $ trader completion zsh > ~/.oh-my-zsh/completions/_trader
+
+  # You will need to start a new shell for this setup to take effect.
+
+Fish:
+  $ trader completion fish | source
+  # To load completions for each session, execute once:
+  $ trader completion fish > ~/.config/fish/completions/trader.fish
+
+PowerShell:
+  PS> trader completion powershell | Out-String | Invoke-Expression
+  # To load completions for every new session, run:
+  PS> trader completion powershell > trader.ps1
+  # and source this file from your PowerShell profile.
+`,
+		DisableFlagsInUseLine: true,
+		ValidArgs:             []string{"bash", "zsh", "fish", "powershell"},
+		Args:                  cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch args[0] {
+			case "bash":
+				return cmd.Root().GenBashCompletion(cmd.OutOrStdout())
+			case "zsh":
+				return cmd.Root().GenZshCompletion(cmd.OutOrStdout())
+			case "fish":
+				return cmd.Root().GenFishCompletion(cmd.OutOrStdout(), true)
+			case "powershell":
+				return cmd.Root().GenPowerShellCompletionWithDesc(cmd.OutOrStdout())
+			}
+			return nil
+		},
+	}
+	return cmd
 }
 
 func newVersionCmd() *cobra.Command {
