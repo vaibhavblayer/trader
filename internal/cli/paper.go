@@ -272,6 +272,12 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
   trader paper RELIANCE --window 5m
   trader paper HDFCBANK --threshold 70`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Skip validation if help flag is set
+			helpFlag, _ := cmd.Flags().GetBool("help")
+			if helpFlag {
+				return cmd.Help()
+			}
+
 			output := NewOutput(cmd)
 			ctx := context.Background()
 
@@ -281,6 +287,12 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			windowStr, _ := cmd.Flags().GetString("window")
 			threshold, _ := cmd.Flags().GetFloat64("threshold")
 			interval, _ := cmd.Flags().GetInt("interval")
+
+			// Check if user accidentally passed --help as flag value
+			if watchlistName == "--help" || watchlistName == "-h" ||
+				windowStr == "--help" || windowStr == "-h" {
+				return cmd.Help()
+			}
 
 			// Parse time window
 			timeWindow, err := time.ParseDuration(windowStr)

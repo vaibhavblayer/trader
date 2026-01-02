@@ -9,11 +9,13 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"zerodha-trader/internal/broker"
+	"zerodha-trader/internal/models"
 )
 
 // addAuthCommands adds authentication commands.
@@ -29,12 +31,15 @@ func newLoginCmd(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "login",
 		Short: "Login to Zerodha Kite Connect",
-		Long: `Initiate OAuth flow with Zerodha Kite Connect.
+		Long: `Login to Zerodha Kite Connect.
 
-This will open a browser window for authentication. After successful login,
-you'll need to paste the request_token from the redirect URL.`,
+If password and TOTP secret are configured in credentials.toml, this will
+automatically use auto-login (no browser required).
+
+Otherwise, it will open a browser window for OAuth authentication.`,
 		Example: `  trader login
-  trader login --token=<request_token>  # Complete login with token`,
+  trader login --browser        # Force browser OAuth flow
+  trader login --token=<token>  # Complete login with token`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -46,16 +51,43 @@ you'll need to paste the request_token from the redirect URL.`,
 				return fmt.Errorf("broker not configured")
 			}
 
+			// Check if already authenticated
+			if app.Broker.IsAuthenticated() {
+				return showLoginStatus(ctx, app, output)
+			}
+
 			// Check if token is provided directly
 			token, _ := cmd.Flags().GetString("token")
 			if token != "" {
 				return completeLogin(ctx, app, output, token)
 			}
 
-			// Try to login (will fail with URL if not authenticated)
+			// Check if --browser flag is explicitly set to force browser flow
+			forceBrowser, _ := cmd.Flags().GetBool("browser")
+			
+			// Try auto-login first if credentials are configured and not forcing browser
+			password := app.Config.Credentials.Zerodha.Password
+			totpSecret := app.Config.Credentials.Zerodha.TOTPSecret
+			
+			if !forceBrowser && password != "" && totpSecret != "" {
+				output.Info("Auto-login credentials found, attempting auto-login...")
+				
+				zb, ok := app.Broker.(*broker.ZerodhaBroker)
+				if ok {
+					if err := zb.AutoLogin(ctx, password, totpSecret); err == nil {
+						output.Success("✓ Login successful!")
+						return showLoginStatus(ctx, app, output)
+					} else {
+						output.Warning("Auto-login failed: %v", err)
+						output.Info("Falling back to browser login...")
+						output.Println()
+					}
+				}
+			}
+
+			// Fall back to browser OAuth flow
 			err := app.Broker.Login(ctx)
 			if err == nil {
-				// Already authenticated
 				output.Success("✓ Already logged in!")
 				return nil
 			}
@@ -83,11 +115,8 @@ you'll need to paste the request_token from the redirect URL.`,
 			output.Println()
 
 			// Try to open browser
-			openBrowser, _ := cmd.Flags().GetBool("browser")
-			if openBrowser {
-				if err := openURL(loginURL); err != nil {
-					output.Warning("Could not open browser automatically")
-				}
+			if err := openURL(loginURL); err != nil {
+				output.Warning("Could not open browser automatically")
 			}
 
 			output.Info("After logging in, you'll be redirected to a URL like:")
@@ -110,7 +139,7 @@ you'll need to paste the request_token from the redirect URL.`,
 		},
 	}
 
-	cmd.Flags().Bool("browser", true, "Open browser for OAuth")
+	cmd.Flags().Bool("browser", false, "Force browser OAuth flow (skip auto-login)")
 	cmd.Flags().String("token", "", "Request token from redirect URL")
 
 	return cmd
@@ -131,24 +160,89 @@ func completeLogin(ctx context.Context, app *App, output *Output, token string) 
 		return err
 	}
 
-	if output.IsJSON() {
-		return output.JSON(map[string]interface{}{
-			"success":   true,
-			"message":   "Login successful",
-			"timestamp": time.Now().Format(time.RFC3339),
-		})
-	}
-
 	output.Success("✓ Login successful!")
-	output.Println()
-	output.Info("Session tokens have been stored securely.")
-	output.Dim("Tokens will be automatically refreshed when needed.")
-	output.Println()
-	output.Bold("Next steps:")
-	output.Println("  • Run 'trader balance' to check your account")
-	output.Println("  • Run 'trader quote RELIANCE' to get a quote")
-	output.Println("  • Run 'trader positions' to view positions")
+	return showLoginStatus(ctx, app, output)
+}
 
+// showLoginStatus displays profile, balance, and session info after login
+func showLoginStatus(ctx context.Context, app *App, output *Output) error {
+	output.Println()
+	output.Bold("Account Info")
+	output.Printf("  User ID:    %s\n", app.Config.Credentials.Zerodha.UserID)
+	
+	// Fetch balance, positions, holdings in parallel
+	type result struct {
+		balance   *models.Balance
+		positions []models.Position
+		holdings  []models.Holding
+	}
+	
+	res := result{}
+	var wg sync.WaitGroup
+	wg.Add(3)
+	
+	go func() {
+		defer wg.Done()
+		if b, err := app.Broker.GetBalance(ctx); err == nil {
+			res.balance = b
+		}
+	}()
+	
+	go func() {
+		defer wg.Done()
+		if p, err := app.Broker.GetPositions(ctx); err == nil {
+			res.positions = p
+		}
+	}()
+	
+	go func() {
+		defer wg.Done()
+		if h, err := app.Broker.GetHoldings(ctx); err == nil {
+			res.holdings = h
+		}
+	}()
+	
+	wg.Wait()
+	
+	// Display results
+	if res.balance != nil {
+		output.Printf("  Balance:    %s\n", FormatIndianCurrency(res.balance.AvailableCash))
+		if res.balance.UsedMargin > 0 {
+			output.Printf("  Used Margin: %s\n", FormatIndianCurrency(res.balance.UsedMargin))
+		}
+	}
+	
+	if len(res.positions) > 0 {
+		output.Printf("  Positions:  %d open\n", len(res.positions))
+	}
+	
+	if len(res.holdings) > 0 {
+		output.Printf("  Holdings:   %d stocks\n", len(res.holdings))
+	}
+	
+	output.Println()
+	
+	// Session expiry info
+	now := time.Now()
+	loc, _ := time.LoadLocation("Asia/Kolkata")
+	expiry := time.Date(now.Year(), now.Month(), now.Day()+1, 6, 0, 0, 0, loc)
+	if now.Hour() < 6 {
+		expiry = time.Date(now.Year(), now.Month(), now.Day(), 6, 0, 0, 0, loc)
+	}
+	remaining := expiry.Sub(now)
+	
+	output.Bold("Session")
+	output.Printf("  Expires:    %s (%s remaining)\n", 
+		expiry.Format("02 Jan 2006, 03:04 PM"), 
+		formatDuration(remaining))
+	
+	// Auto-login status
+	if app.Config.Credentials.Zerodha.Password != "" && app.Config.Credentials.Zerodha.TOTPSecret != "" {
+		output.Printf("  Auto-login: %s\n", output.Green("configured"))
+	} else {
+		output.Printf("  Auto-login: %s\n", output.Yellow("not configured"))
+	}
+	
 	return nil
 }
 
@@ -250,8 +344,7 @@ To get your TOTP secret:
 
 			// Check if already authenticated
 			if app.Broker.IsAuthenticated() {
-				output.Success("✓ Already logged in!")
-				return nil
+				return showLoginStatus(ctx, app, output)
 			}
 
 			// Get credentials
@@ -286,12 +379,8 @@ To get your TOTP secret:
 				return err
 			}
 
-			output.Success("✓ Auto-login successful!")
-			output.Println()
-			output.Info("Session will expire at 6:00 AM tomorrow.")
-			output.Dim("Run 'trader autologin' again tomorrow to re-authenticate.")
-
-			return nil
+			output.Success("✓ Login successful!")
+			return showLoginStatus(ctx, app, output)
 		},
 	}
 }

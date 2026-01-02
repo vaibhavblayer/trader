@@ -233,12 +233,23 @@ Press Ctrl+C to stop streaming.`,
   trader live --watchlist default
   trader live RELIANCE INFY --mode full`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Skip validation if help flag is set
+			helpFlag, _ := cmd.Flags().GetBool("help")
+			if helpFlag {
+				return cmd.Help()
+			}
+
 			output := NewOutput(cmd)
 			ctx := context.Background()
 
 			mode, _ := cmd.Flags().GetString("mode")
 			exchange, _ := cmd.Flags().GetString("exchange")
 			watchlistName, _ := cmd.Flags().GetString("watchlist")
+
+			// Check if user accidentally passed --help as watchlist name
+			if watchlistName == "--help" || watchlistName == "-h" {
+				return cmd.Help()
+			}
 
 			if app.Broker == nil {
 				output.Error("Broker not configured. Run 'trader login' first.")
