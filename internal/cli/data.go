@@ -417,7 +417,7 @@ func displayLiveTicks(output *Output, symbols []string, ticks map[string]models.
 
 	// Header
 	fmt.Printf("%-12s %12s %10s %12s %12s %12s %10s\n",
-		"Symbol", "LTP", "Change", "Volume", "Bid", "Ask", "Time")
+		"Symbol", "LTP", "Change", "Volume", "Bid", "Ask", "Updated")
 	fmt.Println(strings.Repeat("─", 85))
 
 	// Data rows
@@ -441,20 +441,36 @@ func displayLiveTicks(output *Output, symbols []string, ticks map[string]models.
 			changeColor = "\033[31m" // Red
 		}
 
+		// Format bid/ask - show "-" if zero (quote mode doesn't have depth)
+		bidStr := "-"
+		askStr := "-"
+		if tick.BidPrice > 0 {
+			bidStr = FormatPrice(tick.BidPrice)
+		}
+		if tick.AskPrice > 0 {
+			askStr = FormatPrice(tick.AskPrice)
+		}
+
+		// Format timestamp - use current time if tick timestamp is zero
+		timeStr := time.Now().Format("15:04:05")
+		if !tick.Timestamp.IsZero() {
+			timeStr = tick.Timestamp.Format("15:04:05")
+		}
+
 		fmt.Printf("%-12s %12s %s%10s\033[0m %12s %12s %12s %10s\n",
 			symbol,
 			FormatPrice(tick.LTP),
 			changeColor,
 			FormatPercent(change),
 			FormatVolume(tick.Volume),
-			FormatPrice(tick.BidPrice),
-			FormatPrice(tick.AskPrice),
-			tick.Timestamp.Format("15:04:05"),
+			bidStr,
+			askStr,
+			timeStr,
 		)
 	}
 
 	fmt.Println()
-	output.Dim("Press Ctrl+C to stop")
+	output.Dim("Press Ctrl+C to stop | Use --mode full for bid/ask data")
 }
 
 func newBreadthCmd(app *App) *cobra.Command {

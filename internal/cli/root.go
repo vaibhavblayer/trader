@@ -115,6 +115,7 @@ Use 'trader examples' to see common workflows.`,
 	addPlanningCommands(rootCmd, app)
 	addMonitoringCommands(rootCmd, app)
 	addTraderCommands(rootCmd, app)
+	addPaperCommands(rootCmd, app)
 	addJournalCommands(rootCmd, app)
 	addUtilityCommands(rootCmd, app)
 	addHelpCommands(rootCmd, app)

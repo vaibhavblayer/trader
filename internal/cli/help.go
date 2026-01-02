@@ -229,6 +229,16 @@ func newExamplesCmd(app *App) *cobra.Command {
 					},
 				},
 				{
+					title: "AI Paper Trading",
+					commands: []string{
+						"trader paper RELIANCE INFY TCS  # Track AI predictions",
+						"trader paper -w nifty50         # Paper trade NIFTY 50",
+						"trader paper RELIANCE -t 15m    # 15-minute prediction window",
+						"trader paper -c 70              # Only show 70%+ confidence",
+						"trader paper -i 30              # Analyze every 30 seconds",
+					},
+				},
+				{
 					title: "Place a Trade with Stop-Loss",
 					commands: []string{
 						"trader quote RELIANCE           # Check current price",

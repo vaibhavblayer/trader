@@ -251,6 +251,19 @@ AI TRADING
   decisions show <id>       Show decision details
   decisions stats           AI performance statistics
 
+AI PAPER TRADING
+  paper [symbols...]        Track AI predictions without real trades
+    -w, --watchlist         Use predefined watchlist
+    -t, --window            Prediction time window (e.g., 5m, 15m, 1h)
+    -c, --threshold         Minimum confidence threshold (default 60%)
+    -i, --interval          Analysis interval in seconds (default 60)
+  
+  Examples:
+    trader paper RELIANCE INFY TCS    # Track predictions for symbols
+    trader paper -w nifty50           # Paper trade NIFTY 50 stocks
+    trader paper RELIANCE -t 15m      # 15-minute prediction window
+    trader paper -c 70 -i 30          # 70% confidence, 30s interval
+
 JOURNAL
   journal today             Show today's trades and notes
   journal add <trade-id>    Add analysis to a trade
