@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sashabaranov/go-openai"
+
 	"zerodha-trader/internal/analysis"
 )
 
@@ -23,6 +25,10 @@ type LLMClient interface {
 	Complete(ctx context.Context, prompt string) (string, error)
 	// CompleteWithSystem sends a prompt with a system message.
 	CompleteWithSystem(ctx context.Context, system, prompt string) (string, error)
+	// CompleteWithTools sends a prompt with tools and handles tool calls.
+	CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *ToolExecutor) (string, error)
+	// CompleteWithToolsVerbose sends a prompt with tools and returns the full chain of thought.
+	CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *ToolExecutor) (*ChainOfThought, error)
 }
 
 // NewTechnicalAgent creates a new technical analysis agent.

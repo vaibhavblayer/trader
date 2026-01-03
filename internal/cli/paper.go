@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"zerodha-trader/internal/agents"
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
 )
@@ -263,14 +264,33 @@ The AI will analyze symbols and make BUY/SELL predictions with:
 - Target price and stop loss
 - Time window for the prediction
 
+AI TOOLS MODE (default):
+The AI uses function calling to access real analysis tools:
+- RSI, Bollinger Bands, Stochastic indicators
+- Fibonacci retracement levels
+- Support/Resistance (pivot points)
+- Candlestick pattern detection
+- Chart pattern detection
+- ATR for volatility analysis
+- Multi-timeframe analysis
+
+BACKTEST MODE:
+Use --backtest to replay historical data and test AI predictions.
+Works on weekends/holidays when market is closed.
+
 After the time window expires, the prediction is evaluated as RIGHT or WRONG
 based on whether the price moved in the predicted direction.
 
 No actual trades are executed - this is for tracking AI accuracy only.`,
-		Example: `  trader paper RELIANCE INFY TCS
+		Example: `  # Live mode (requires market open)
+  trader paper RELIANCE INFY TCS
   trader paper --watchlist nifty50
-  trader paper RELIANCE --window 5m
-  trader paper HDFCBANK --threshold 70`,
+  
+  # Backtest mode (works anytime)
+  trader paper RELIANCE --backtest              # Last 1 day
+  trader paper RELIANCE --backtest --days 5     # Last 5 days
+  trader paper TCS --backtest --from 2026-01-02 # Specific date
+  trader paper INFY --backtest --from 2026-01-01 --to 2026-01-03`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Skip validation if help flag is set
 			helpFlag, _ := cmd.Flags().GetBool("help")
@@ -287,6 +307,17 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			windowStr, _ := cmd.Flags().GetString("window")
 			threshold, _ := cmd.Flags().GetFloat64("threshold")
 			interval, _ := cmd.Flags().GetInt("interval")
+			useTools, _ := cmd.Flags().GetBool("tools")
+			simpleMode, _ := cmd.Flags().GetBool("simple")
+			backtestMode, _ := cmd.Flags().GetBool("backtest")
+			backtestDays, _ := cmd.Flags().GetInt("days")
+			fromDate, _ := cmd.Flags().GetString("from")
+			toDate, _ := cmd.Flags().GetString("to")
+			
+			// Simple mode overrides tools
+			if simpleMode {
+				useTools = false
+			}
 
 			// Check if user accidentally passed --help as flag value
 			if watchlistName == "--help" || watchlistName == "-h" ||
@@ -303,11 +334,6 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			if app.Broker == nil {
 				output.Error("Broker not configured. Run 'trader login' first.")
 				return fmt.Errorf("broker not configured")
-			}
-
-			if app.Ticker == nil {
-				output.Error("Ticker not configured. Run 'trader login' first.")
-				return fmt.Errorf("ticker not configured")
 			}
 
 			if app.LLMClient == nil {
@@ -334,6 +360,18 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 				output.Info("Using default symbols")
 			}
 
+			// BACKTEST MODE
+			if backtestMode {
+				return runBacktestMode(ctx, app, output, symbols, exchange, timeWindow, threshold, useTools, backtestDays, fromDate, toDate)
+			}
+
+			// LIVE MODE - requires ticker
+			if app.Ticker == nil {
+				output.Error("Ticker not configured. Run 'trader login' first.")
+				output.Info("Tip: Use --backtest flag to test with historical data")
+				return fmt.Errorf("ticker not configured")
+			}
+
 			// Fetch and register instrument tokens
 			output.Info("Fetching instrument tokens...")
 			validSymbols := make([]string, 0, len(symbols))
@@ -357,6 +395,11 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			output.Printf("  Window:     %s\n", timeWindow)
 			output.Printf("  Threshold:  %.0f%%\n", threshold)
 			output.Printf("  Interval:   %ds\n", interval)
+			if useTools {
+				output.Printf("  AI Mode:    Tools (function calling)\n")
+			} else {
+				output.Printf("  AI Mode:    Simple (no tools)\n")
+			}
 			output.Println()
 			output.Dim("Press Ctrl+C to stop")
 			output.Println()
@@ -470,7 +513,7 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 						lastAIStatusMu.Unlock()
 
 						// Get AI prediction
-						prediction, err := getAIPrediction(ctx, app, symbol, tick.LTP, timeWindow, threshold, tracker)
+						prediction, err := getAIPrediction(ctx, app, symbol, tick.LTP, timeWindow, threshold, tracker, useTools)
 						lastAnalysis[symbol] = time.Now()
 						
 						if err != nil {
@@ -505,18 +548,114 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	cmd.Flags().StringP("window", "t", "5m", "Prediction time window (e.g., 5m, 15m, 1h)")
 	cmd.Flags().Float64P("threshold", "c", 60.0, "Minimum confidence threshold for predictions")
 	cmd.Flags().IntP("interval", "i", 60, "Analysis interval in seconds")
+	cmd.Flags().Bool("tools", true, "Enable AI tools/function calling for analysis (default: true)")
+	cmd.Flags().Bool("simple", false, "Use simple mode without tools (faster but less accurate)")
+	
+	// Backtest flags
+	cmd.Flags().Bool("backtest", false, "Run in backtest mode using historical data")
+	cmd.Flags().Int("days", 1, "Number of days to backtest (default: 1)")
+	cmd.Flags().String("from", "", "Start date for backtest (YYYY-MM-DD)")
+	cmd.Flags().String("to", "", "End date for backtest (YYYY-MM-DD)")
+	cmd.Flags().BoolP("verbose", "v", false, "Show AI reasoning and tool calls (chain of thought)")
 
 	return cmd
 }
 
 
 // getAIPrediction gets an AI prediction for a symbol.
-func getAIPrediction(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker) (*Prediction, error) {
+func getAIPrediction(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker, useTools bool) (*Prediction, error) {
+	if useTools {
+		return getAIPredictionWithTools(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker)
+	}
+	return getAIPredictionSimple(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker)
+}
+
+// getAIPredictionWithTools uses OpenAI function calling for AI predictions.
+func getAIPredictionWithTools(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker) (*Prediction, error) {
+	// Create tool executor
+	toolExecutor := agents.NewToolExecutor(app.Broker)
+	
+	// Get recent prediction history for this symbol
+	recentHistory := tracker.GetRecentHistory(10)
+	var symbolHistory []*Prediction
+	for _, p := range recentHistory {
+		if p.Symbol == symbol {
+			symbolHistory = append(symbolHistory, p)
+		}
+	}
+
+	// Build prompt for AI with history context
+	prompt := buildToolBasedPrompt(symbol, currentPrice, timeWindow, symbolHistory, tracker.GetStats())
+
+	systemPrompt := `You are an aggressive intraday trader analyzing Indian stock market (NSE).
+You have access to powerful analysis tools. USE THEM to make informed decisions!
+
+AVAILABLE TOOLS:
+- get_historical_data: Fetch OHLCV candle data
+- calculate_rsi: Calculate RSI indicator  
+- calculate_bollinger_bands: Calculate Bollinger Bands
+- calculate_fibonacci_levels: Calculate Fibonacci retracement levels
+- get_support_resistance: Get pivot points and S/R levels
+- detect_candlestick_patterns: Detect patterns like Doji, Hammer, Engulfing
+- detect_chart_patterns: Detect patterns like Head & Shoulders, Triangles
+- calculate_atr: Calculate ATR for volatility and stop loss
+- calculate_stochastic: Calculate Stochastic Oscillator
+- get_mtf_analysis: Multi-timeframe trend analysis
+
+WORKFLOW:
+1. First, use 2-3 tools to gather data (RSI, Bollinger, patterns, etc.)
+2. Analyze the tool results
+3. Make your BUY or SELL prediction based on REAL DATA from tools
+
+IMPORTANT: You MUST make a BUY or SELL prediction. Do NOT say HOLD.
+- If RSI > 50 or price above middle Bollinger band, lean BUY
+- If RSI < 50 or price below middle Bollinger band, lean SELL
+- Always provide a prediction!
+
+After using tools, respond with valid JSON:
+{
+  "action": "BUY" or "SELL",
+  "confidence": 0-100,
+  "target_price": number,
+  "stop_loss": number,
+  "reasoning": "brief explanation including which tools/indicators you used"
+}
+
+Rules:
+- ALWAYS choose BUY or SELL, never HOLD
+- USE AT LEAST 2 TOOLS before making a prediction
+- Target should be 0.3-1% from entry for short windows
+- Stop loss should be 0.3-0.5% from entry
+- Be decisive!`
+
+	// Get AI response with tools
+	tools := agents.GetToolDefinitions()
+	response, err := app.LLMClient.CompleteWithTools(ctx, systemPrompt, prompt, tools, toolExecutor)
+	if err != nil {
+		return nil, fmt.Errorf("AI analysis failed: %w", err)
+	}
+
+	// Parse response
+	prediction, err := parsePredictionResponse(response, symbol, currentPrice, timeWindow)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse AI response: %w", err)
+	}
+
+	// Filter by threshold
+	if prediction == nil || prediction.Confidence < threshold {
+		return nil, nil
+	}
+
+	return prediction, nil
+}
+
+// getAIPredictionSimple uses simple prompts without tools (fallback).
+func getAIPredictionSimple(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker) (*Prediction, error) {
 	// Get historical data for context
 	candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
 		Symbol:    symbol,
 		Exchange:  models.NSE,
-		Timeframe: "15minute",
+		Timeframe: "15min",
 		From:      time.Now().Add(-24 * time.Hour),
 		To:        time.Now(),
 	})
@@ -537,17 +676,20 @@ func getAIPrediction(ctx context.Context, app *App, symbol string, currentPrice 
 	prompt := buildPredictionPromptWithHistory(symbol, currentPrice, candles, timeWindow, symbolHistory, tracker.GetStats())
 
 	// Get AI response
-	systemPrompt := `You are an expert intraday trader analyzing Indian stock market (NSE).
+	systemPrompt := `You are an aggressive intraday trader analyzing Indian stock market (NSE).
 Analyze the given stock data and provide a trading prediction.
 
-CRITICAL: You will see your PREVIOUS PREDICTIONS and their OUTCOMES. Learn from them!
-- If your recent predictions were WRONG, adjust your strategy
-- If a pattern led to losses before, avoid repeating it
-- Use the feedback to improve your accuracy
+IMPORTANT: You MUST make a BUY or SELL prediction. Do NOT say HOLD.
+- Look at the recent price movement and momentum
+- If price went up in recent candles, predict BUY
+- If price went down in recent candles, predict SELL
+- Always provide a prediction with confidence level
 
-IMPORTANT: Respond ONLY with valid JSON in this exact format:
+CRITICAL: You will see your PREVIOUS PREDICTIONS and their OUTCOMES. Learn from them!
+
+Respond ONLY with valid JSON in this exact format:
 {
-  "action": "BUY" or "SELL" or "HOLD",
+  "action": "BUY" or "SELL",
   "confidence": 0-100,
   "target_price": number,
   "stop_loss": number,
@@ -555,14 +697,10 @@ IMPORTANT: Respond ONLY with valid JSON in this exact format:
 }
 
 Rules:
-- Analyze momentum, trend, and price action
-- If price is trending up with good momentum, suggest BUY
-- If price is trending down, suggest SELL
-- Only suggest HOLD if there's truly no clear direction
-- Target should be realistic for the time window (0.3-1% for short windows)
-- Stop loss should limit risk to 0.3-0.5%
-- Be decisive - traders need clear signals
-- LEARN FROM YOUR MISTAKES - check previous predictions!`
+- ALWAYS choose BUY or SELL, never HOLD
+- Target should be 0.3-1% from entry for short windows
+- Stop loss should be 0.3-0.5% from entry
+- Be decisive!`
 
 	response, err := app.LLMClient.CompleteWithSystem(ctx, systemPrompt, prompt)
 	if err != nil {
@@ -581,6 +719,56 @@ Rules:
 	}
 
 	return prediction, nil
+}
+
+// buildToolBasedPrompt builds the prompt for tool-based AI prediction.
+func buildToolBasedPrompt(symbol string, currentPrice float64, timeWindow time.Duration, history []*Prediction, stats PaperStats) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("Analyze %s for a trading decision.\n\n", symbol))
+	sb.WriteString(fmt.Sprintf("Current Price: %.2f\n", currentPrice))
+	sb.WriteString(fmt.Sprintf("Time Window: %s\n", timeWindow))
+	sb.WriteString(fmt.Sprintf("Current Time: %s IST\n\n", time.Now().Format("15:04:05")))
+
+	// Add previous predictions and outcomes for learning
+	if len(history) > 0 {
+		sb.WriteString("=== YOUR PREVIOUS PREDICTIONS (Learn from these!) ===\n")
+		rightCount := 0
+		wrongCount := 0
+		for _, p := range history {
+			outcomeEmoji := "❌"
+			if p.Outcome == "RIGHT" {
+				outcomeEmoji = "✅"
+				rightCount++
+			} else {
+				wrongCount++
+			}
+			sb.WriteString(fmt.Sprintf("  %s %s @ %.2f → %s (P&L: %.2f%%) - %s\n",
+				outcomeEmoji, p.Action, p.EntryPrice, p.Outcome, p.PnLPercent, p.Reasoning))
+		}
+		sb.WriteString(fmt.Sprintf("\nYour recent accuracy: %d RIGHT, %d WRONG\n", rightCount, wrongCount))
+		
+		// Add learning hints based on patterns
+		if wrongCount > rightCount && len(history) >= 3 {
+			sb.WriteString("⚠️ IMPORTANT: Your recent predictions have been mostly WRONG. Consider:\n")
+			sb.WriteString("  - Being more conservative with confidence levels\n")
+			sb.WriteString("  - Setting tighter stop losses\n")
+			sb.WriteString("  - Waiting for clearer signals before predicting BUY/SELL\n")
+		}
+		if stats.WinRate > 0 && stats.WinRate < 45 {
+			sb.WriteString(fmt.Sprintf("⚠️ Overall win rate is low (%.1f%%). Adjust your strategy!\n", stats.WinRate))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("INSTRUCTIONS:\n")
+	sb.WriteString("1. Use the available tools to analyze the stock\n")
+	sb.WriteString("2. Check RSI, Bollinger Bands, and candlestick patterns\n")
+	sb.WriteString("3. Look at support/resistance levels\n")
+	sb.WriteString("4. Make your prediction based on the tool results\n\n")
+	sb.WriteString("Start by calling some analysis tools, then provide your prediction.")
+
+	return sb.String()
 }
 
 // buildPredictionPrompt builds the prompt for AI prediction.
@@ -876,4 +1064,209 @@ func speakPredictionResult(p *Prediction) {
 		msg = fmt.Sprintf("%s prediction for %s was wrong. Loss %.1f percent", p.Action, p.Symbol, -p.PnLPercent)
 	}
 	speak(msg)
+}
+
+// runBacktestMode runs the paper trading in backtest mode using historical data.
+func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []string, exchange string, timeWindow time.Duration, threshold float64, useTools bool, days int, fromDate, toDate string) error {
+	// Parse date range
+	var from, to time.Time
+	var err error
+	
+	if fromDate != "" {
+		from, err = time.Parse("2006-01-02", fromDate)
+		if err != nil {
+			output.Error("Invalid from date format. Use YYYY-MM-DD")
+			return err
+		}
+	} else {
+		from = time.Now().AddDate(0, 0, -days)
+	}
+	
+	if toDate != "" {
+		to, err = time.Parse("2006-01-02", toDate)
+		if err != nil {
+			output.Error("Invalid to date format. Use YYYY-MM-DD")
+			return err
+		}
+		// Set to end of day
+		to = to.Add(23*time.Hour + 59*time.Minute + 59*time.Second)
+	} else {
+		to = time.Now()
+	}
+
+	output.Info("🔄 AI Paper Trading - Backtest Mode")
+	output.Printf("  Symbols:    %v\n", symbols)
+	output.Printf("  Period:     %s to %s\n", from.Format("2006-01-02"), to.Format("2006-01-02"))
+	output.Printf("  Window:     %s\n", timeWindow)
+	output.Printf("  Threshold:  %.0f%%\n", threshold)
+	if useTools {
+		output.Printf("  AI Mode:    Tools (function calling)\n")
+	} else {
+		output.Printf("  AI Mode:    Simple\n")
+	}
+	output.Println()
+
+	tracker := NewPaperTracker()
+
+	for _, symbol := range symbols {
+		output.Bold("📊 Analyzing %s", symbol)
+		output.Println()
+
+		// Fetch historical data
+		output.Dim("Fetching historical data...")
+		candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+			Symbol:    symbol,
+			Exchange:  models.Exchange(exchange),
+			Timeframe: "15min",
+			From:      from,
+			To:        to,
+		})
+		if err != nil {
+			output.Error("Failed to fetch data for %s: %v", symbol, err)
+			continue
+		}
+
+		if len(candles) < 20 {
+			output.Warning("Insufficient data for %s (%d candles)", symbol, len(candles))
+			continue
+		}
+
+		output.Success("Got %d candles from %s to %s", 
+			len(candles), 
+			candles[0].Timestamp.Format("Jan 02 15:04"),
+			candles[len(candles)-1].Timestamp.Format("Jan 02 15:04"))
+
+		// Simulate predictions at different points
+		// We'll make predictions every N candles and check if they would have been right
+		step := 4 // Every 4 candles (1 hour for 15min candles)
+		if len(candles) < 50 {
+			step = 2
+		}
+
+		output.Println()
+		output.Info("Running AI analysis at %d points...", (len(candles)-20)/step)
+		output.Println()
+
+		for i := 20; i < len(candles)-int(timeWindow.Minutes()/15); i += step {
+			currentCandle := candles[i]
+			currentPrice := currentCandle.Close
+
+			// Get AI prediction
+			prediction, err := getAIPrediction(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker, useTools)
+			if err != nil {
+				output.Dim("  %s: AI error - %v", currentCandle.Timestamp.Format("Jan 02 15:04"), err)
+				continue
+			}
+
+			if prediction == nil {
+				output.Dim("  %s @ ₹%.2f: HOLD (no signal)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
+				continue
+			}
+
+			// Find the candle at expiry time
+			candlesForExpiry := int(timeWindow.Minutes() / 15)
+			if candlesForExpiry < 1 {
+				candlesForExpiry = 1 // At least 1 candle forward
+			}
+			expiryIdx := i + candlesForExpiry
+			if expiryIdx >= len(candles) {
+				expiryIdx = len(candles) - 1
+			}
+			expiryCandle := candles[expiryIdx]
+			exitPrice := expiryCandle.Close
+
+			// Calculate actual P&L
+			var actualPnL float64
+			if prediction.Action == "BUY" {
+				actualPnL = ((exitPrice - currentPrice) / currentPrice) * 100
+			} else {
+				actualPnL = ((currentPrice - exitPrice) / currentPrice) * 100
+			}
+
+			// Determine outcome
+			outcome := "WRONG"
+			outcomeEmoji := "❌"
+			if actualPnL > 0 {
+				outcome = "RIGHT"
+				outcomeEmoji = "✅"
+			}
+
+			// Update prediction with actual results
+			prediction.ExitPrice = exitPrice
+			prediction.PnLPercent = actualPnL
+			prediction.Outcome = outcome
+			prediction.Evaluated = true
+
+			// Update tracker stats manually
+			tracker.mu.Lock()
+			tracker.stats.TotalPredictions++
+			if outcome == "RIGHT" {
+				tracker.stats.RightPredictions++
+			} else {
+				tracker.stats.WrongPredictions++
+			}
+			evaluated := tracker.stats.RightPredictions + tracker.stats.WrongPredictions
+			tracker.stats.AvgPnLPercent = ((tracker.stats.AvgPnLPercent * float64(evaluated-1)) + actualPnL) / float64(evaluated)
+			if actualPnL > tracker.stats.BestPrediction {
+				tracker.stats.BestPrediction = actualPnL
+			}
+			if actualPnL < tracker.stats.WorstPrediction {
+				tracker.stats.WorstPrediction = actualPnL
+			}
+			tracker.stats.WinRate = float64(tracker.stats.RightPredictions) / float64(evaluated) * 100
+			tracker.history = append(tracker.history, prediction)
+			tracker.mu.Unlock()
+
+			// Print result
+			output.Printf("  %s %s @ ₹%.2f → %s @ ₹%.2f = %s %.2f%% (Conf: %.0f%%)\n",
+				outcomeEmoji,
+				prediction.Action,
+				currentPrice,
+				expiryCandle.Timestamp.Format("15:04"),
+				exitPrice,
+				outcome,
+				actualPnL,
+				prediction.Confidence)
+		}
+
+		output.Println()
+	}
+
+	// Print final stats
+	stats := tracker.GetStats()
+	output.Println()
+	output.Bold("📈 Backtest Results")
+	output.Println()
+	
+	winRateColor := ""
+	if stats.WinRate >= 60 {
+		winRateColor = "\033[32m" // Green
+	} else if stats.WinRate < 50 {
+		winRateColor = "\033[31m" // Red
+	}
+	
+	output.Printf("  Total Predictions: %d\n", stats.TotalPredictions)
+	output.Printf("  Right: %d | Wrong: %d\n", stats.RightPredictions, stats.WrongPredictions)
+	fmt.Printf("  Win Rate: %s%.1f%%\033[0m\n", winRateColor, stats.WinRate)
+	output.Printf("  Avg P&L: %.2f%%\n", stats.AvgPnLPercent)
+	output.Printf("  Best: +%.2f%% | Worst: %.2f%%\n", stats.BestPrediction, stats.WorstPrediction)
+	output.Println()
+
+	// Show recent predictions
+	if len(tracker.history) > 0 {
+		output.Bold("Recent Predictions:")
+		start := 0
+		if len(tracker.history) > 10 {
+			start = len(tracker.history) - 10
+		}
+		for _, p := range tracker.history[start:] {
+			emoji := "❌"
+			if p.Outcome == "RIGHT" {
+				emoji = "✅"
+			}
+			output.Printf("  %s %s %s: %.2f%% - %s\n", emoji, p.Symbol, p.Action, p.PnLPercent, p.Reasoning)
+		}
+	}
+
+	return nil
 }

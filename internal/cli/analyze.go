@@ -7,8 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sashabaranov/go-openai"
 	"github.com/spf13/cobra"
 
+	"zerodha-trader/internal/agents"
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
 )
@@ -1711,6 +1713,7 @@ func generateRuleBasedInsights(r ResearchResult, sector string) ([]string, []str
 type LLMClient interface {
 	Complete(ctx context.Context, prompt string) (string, error)
 	CompleteWithSystem(ctx context.Context, systemPrompt, userPrompt string) (string, error)
+	CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *agents.ToolExecutor) (string, error)
 }
 
 // calculateSMA calculates Simple Moving Average
