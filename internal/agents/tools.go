@@ -413,6 +413,7 @@ func mapTimeframe(tf string) string {
 // fetchCandles fetches historical candles for a symbol
 func (te *ToolExecutor) fetchCandles(ctx context.Context, symbol, timeframe string, periods int) ([]models.Candle, error) {
 	// Calculate time range based on timeframe and periods
+	// Use a minimum lookback to ensure we have enough data
 	now := time.Now()
 	var from time.Time
 	
@@ -422,15 +423,39 @@ func (te *ToolExecutor) fetchCandles(ctx context.Context, symbol, timeframe stri
 	case "5min":
 		from = now.Add(-time.Duration(periods*5) * time.Minute)
 	case "15min":
-		from = now.Add(-time.Duration(periods*15) * time.Minute)
+		// Ensure at least 10 days of data for 15min candles to get enough for indicators
+		minDays := 10
+		calculatedFrom := now.Add(-time.Duration(periods*15) * time.Minute)
+		minFrom := now.AddDate(0, 0, -minDays)
+		if calculatedFrom.After(minFrom) {
+			from = minFrom
+		} else {
+			from = calculatedFrom
+		}
 	case "30min":
-		from = now.Add(-time.Duration(periods*30) * time.Minute)
+		// Ensure at least 10 days
+		minDays := 10
+		calculatedFrom := now.Add(-time.Duration(periods*30) * time.Minute)
+		minFrom := now.AddDate(0, 0, -minDays)
+		if calculatedFrom.After(minFrom) {
+			from = minFrom
+		} else {
+			from = calculatedFrom
+		}
 	case "1hour":
-		from = now.Add(-time.Duration(periods) * time.Hour)
+		// Ensure at least 15 days
+		minDays := 15
+		calculatedFrom := now.Add(-time.Duration(periods) * time.Hour)
+		minFrom := now.AddDate(0, 0, -minDays)
+		if calculatedFrom.After(minFrom) {
+			from = minFrom
+		} else {
+			from = calculatedFrom
+		}
 	case "1day":
 		from = now.AddDate(0, 0, -periods)
 	default:
-		from = now.Add(-time.Duration(periods*15) * time.Minute)
+		from = now.AddDate(0, 0, -10) // Default to 10 days
 	}
 
 	return te.broker.GetHistorical(ctx, broker.HistoricalRequest{

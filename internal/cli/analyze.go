@@ -1714,6 +1714,7 @@ type LLMClient interface {
 	Complete(ctx context.Context, prompt string) (string, error)
 	CompleteWithSystem(ctx context.Context, systemPrompt, userPrompt string) (string, error)
 	CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *agents.ToolExecutor) (string, error)
+	CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *agents.ToolExecutor) (*agents.ChainOfThought, error)
 }
 
 // calculateSMA calculates Simple Moving Average

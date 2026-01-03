@@ -313,6 +313,7 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			backtestDays, _ := cmd.Flags().GetInt("days")
 			fromDate, _ := cmd.Flags().GetString("from")
 			toDate, _ := cmd.Flags().GetString("to")
+			verbose, _ := cmd.Flags().GetBool("verbose")
 			
 			// Simple mode overrides tools
 			if simpleMode {
@@ -362,7 +363,7 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 
 			// BACKTEST MODE
 			if backtestMode {
-				return runBacktestMode(ctx, app, output, symbols, exchange, timeWindow, threshold, useTools, backtestDays, fromDate, toDate)
+				return runBacktestMode(ctx, app, output, symbols, exchange, timeWindow, threshold, useTools, backtestDays, fromDate, toDate, verbose)
 			}
 
 			// LIVE MODE - requires ticker
@@ -561,17 +562,41 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	return cmd
 }
 
+// PredictionResult holds a prediction along with its chain of thought.
+type PredictionResult struct {
+	Prediction   *Prediction
+	ChainOfThought *agents.ChainOfThought
+}
 
 // getAIPrediction gets an AI prediction for a symbol.
 func getAIPrediction(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker, useTools bool) (*Prediction, error) {
-	if useTools {
-		return getAIPredictionWithTools(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker)
+	result, err := getAIPredictionVerbose(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker, useTools)
+	if err != nil {
+		return nil, err
 	}
-	return getAIPredictionSimple(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker)
+	return result.Prediction, nil
+}
+
+// getAIPredictionVerbose gets an AI prediction with full chain of thought.
+func getAIPredictionVerbose(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker, useTools bool) (*PredictionResult, error) {
+	if useTools {
+		return getAIPredictionWithToolsVerbose(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker)
+	}
+	pred, err := getAIPredictionSimple(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker)
+	return &PredictionResult{Prediction: pred}, err
 }
 
 // getAIPredictionWithTools uses OpenAI function calling for AI predictions.
 func getAIPredictionWithTools(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker) (*Prediction, error) {
+	result, err := getAIPredictionWithToolsVerbose(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker)
+	if err != nil {
+		return nil, err
+	}
+	return result.Prediction, nil
+}
+
+// getAIPredictionWithToolsVerbose uses OpenAI function calling and returns chain of thought.
+func getAIPredictionWithToolsVerbose(ctx context.Context, app *App, symbol string, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker) (*PredictionResult, error) {
 	// Create tool executor
 	toolExecutor := agents.NewToolExecutor(app.Broker)
 	
@@ -602,8 +627,10 @@ AVAILABLE TOOLS:
 - calculate_stochastic: Calculate Stochastic Oscillator
 - get_mtf_analysis: Multi-timeframe trend analysis
 
+CRITICAL: ALWAYS use "15min" timeframe for all tools. Do NOT use 5min or 1min - they have insufficient data.
+
 WORKFLOW:
-1. First, use 2-3 tools to gather data (RSI, Bollinger, patterns, etc.)
+1. First, use 2-3 tools to gather data (RSI, Bollinger, patterns, etc.) with timeframe="15min"
 2. Analyze the tool results
 3. Make your BUY or SELL prediction based on REAL DATA from tools
 
@@ -623,30 +650,31 @@ After using tools, respond with valid JSON:
 
 Rules:
 - ALWAYS choose BUY or SELL, never HOLD
+- ALWAYS use timeframe="15min" for all tool calls
 - USE AT LEAST 2 TOOLS before making a prediction
 - Target should be 0.3-1% from entry for short windows
 - Stop loss should be 0.3-0.5% from entry
 - Be decisive!`
 
-	// Get AI response with tools
+	// Get AI response with tools (verbose to capture chain of thought)
 	tools := agents.GetToolDefinitions()
-	response, err := app.LLMClient.CompleteWithTools(ctx, systemPrompt, prompt, tools, toolExecutor)
+	cot, err := app.LLMClient.CompleteWithToolsVerbose(ctx, systemPrompt, prompt, tools, toolExecutor)
 	if err != nil {
 		return nil, fmt.Errorf("AI analysis failed: %w", err)
 	}
 
 	// Parse response
-	prediction, err := parsePredictionResponse(response, symbol, currentPrice, timeWindow)
+	prediction, err := parsePredictionResponse(cot.Response, symbol, currentPrice, timeWindow)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse AI response: %w", err)
 	}
 
 	// Filter by threshold
 	if prediction == nil || prediction.Confidence < threshold {
-		return nil, nil
+		return &PredictionResult{Prediction: nil, ChainOfThought: cot}, nil
 	}
 
-	return prediction, nil
+	return &PredictionResult{Prediction: prediction, ChainOfThought: cot}, nil
 }
 
 // getAIPredictionSimple uses simple prompts without tools (fallback).
@@ -1067,7 +1095,7 @@ func speakPredictionResult(p *Prediction) {
 }
 
 // runBacktestMode runs the paper trading in backtest mode using historical data.
-func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []string, exchange string, timeWindow time.Duration, threshold float64, useTools bool, days int, fromDate, toDate string) error {
+func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []string, exchange string, timeWindow time.Duration, threshold float64, useTools bool, days int, fromDate, toDate string, verbose bool) error {
 	// Parse date range
 	var from, to time.Time
 	var err error
@@ -1151,15 +1179,42 @@ func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []st
 			currentCandle := candles[i]
 			currentPrice := currentCandle.Close
 
-			// Get AI prediction
-			prediction, err := getAIPrediction(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker, useTools)
+			// Get AI prediction with chain of thought
+			result, err := getAIPredictionVerbose(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker, useTools)
 			if err != nil {
 				output.Dim("  %s: AI error - %v", currentCandle.Timestamp.Format("Jan 02 15:04"), err)
 				continue
 			}
 
+			// Show verbose chain of thought if enabled
+			if verbose && result.ChainOfThought != nil && len(result.ChainOfThought.ToolCalls) > 0 {
+				output.Println()
+				output.Bold("  🔍 AI Analysis for %s @ ₹%.2f (%s)", symbol, currentPrice, currentCandle.Timestamp.Format("Jan 02 15:04"))
+				output.Println()
+				for _, tc := range result.ChainOfThought.ToolCalls {
+					output.Printf("  📊 Tool: %s\n", tc.ToolName)
+					// Show truncated result (first 200 chars)
+					resultPreview := tc.Result
+					if len(resultPreview) > 300 {
+						resultPreview = resultPreview[:300] + "..."
+					}
+					// Indent the result
+					lines := strings.Split(resultPreview, "\n")
+					for _, line := range lines {
+						output.Dim("     %s", line)
+					}
+					output.Println()
+				}
+			}
+
+			prediction := result.Prediction
 			if prediction == nil {
-				output.Dim("  %s @ ₹%.2f: HOLD (no signal)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
+				if verbose {
+					output.Dim("  ⏸ Decision: HOLD (confidence below threshold or no clear signal)")
+					output.Println()
+				} else {
+					output.Dim("  %s @ ₹%.2f: HOLD (no signal)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
+				}
 				continue
 			}
 
