@@ -206,7 +206,10 @@ func showLoginStatus(ctx context.Context, app *App, output *Output) error {
 	
 	// Display results
 	if res.balance != nil {
-		output.Printf("  Balance:    %s\n", FormatIndianCurrency(res.balance.AvailableCash))
+		output.Printf("  Cash:       %s\n", FormatIndianCurrency(res.balance.AvailableCash))
+		if res.balance.TotalEquity > res.balance.AvailableCash {
+			output.Printf("  Equity:     %s\n", FormatIndianCurrency(res.balance.TotalEquity))
+		}
 		if res.balance.UsedMargin > 0 {
 			output.Printf("  Used Margin: %s\n", FormatIndianCurrency(res.balance.UsedMargin))
 		}
@@ -420,7 +423,10 @@ func newAuthStatusCmd(app *App) *cobra.Command {
 			}
 
 			output.Printf("  User ID:    %s\n", app.Config.Credentials.Zerodha.UserID)
-			output.Printf("  Balance:    %s\n", FormatIndianCurrency(balance.AvailableCash))
+			output.Printf("  Cash:       %s\n", FormatIndianCurrency(balance.AvailableCash))
+			if balance.TotalEquity > balance.AvailableCash {
+				output.Printf("  Equity:     %s\n", FormatIndianCurrency(balance.TotalEquity))
+			}
 			output.Println()
 
 			// Session expiry info

@@ -4,6 +4,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -1019,15 +1020,36 @@ func displayMTF(output *Output, mtf MTFResult) error {
 func newScanCmd(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "scan",
-		Short: "Scan stocks based on technical criteria",
-		Long: `Scan stocks based on technical filters.
+		Short: "Scan stocks based on technical and price criteria",
+		Long: `Scan stocks based on technical and price filters.
 
-Supports filters for RSI, volume, gaps, and more.
-Can use preset screeners or custom filters.`,
-		Example: `  trader scan --rsi-below 30
+PRICE FILTERS:
+  --min-price, --max-price: Filter by current price range
+  --penny: Show penny stocks (price < ₹50)
+  --midcap: Show mid-cap range (₹100-₹500)
+  --largecap: Show large-cap range (₹500+)
+
+TECHNICAL FILTERS:
+  --rsi-below, --rsi-above: RSI thresholds
+  --volume-above: Volume multiple above average
+  --gap-up, --gap-down: Gap percentages
+
+PRESETS:
+  --preset momentum: RSI > 60, Volume > 1.5x
+  --preset oversold: RSI < 30
+  --preset overbought: RSI > 70
+  --preset breakout: Volume > 2x
+  --preset reversal: RSI < 35, Volume > 1.5x`,
+		Example: `  # Find penny stocks (< ₹50)
+  trader scan --penny
+  
+  # Find stocks between ₹100-₹500
+  trader scan --min-price 100 --max-price 500
+  
+  # Technical scan
+  trader scan --rsi-below 30
   trader scan --volume-above 2 --gap-up 2
-  trader scan --preset momentum
-  trader scan --preset breakout`,
+  trader scan --preset momentum`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -1046,6 +1068,30 @@ Can use preset screeners or custom filters.`,
 			gapDown, _ := cmd.Flags().GetFloat64("gap-down")
 			watchlistName, _ := cmd.Flags().GetString("watchlist")
 			exchange, _ := cmd.Flags().GetString("exchange")
+			
+			// Price filters
+			minPrice, _ := cmd.Flags().GetFloat64("min-price")
+			maxPrice, _ := cmd.Flags().GetFloat64("max-price")
+			penny, _ := cmd.Flags().GetBool("penny")
+			midcap, _ := cmd.Flags().GetBool("midcap")
+			largecap, _ := cmd.Flags().GetBool("largecap")
+			limit, _ := cmd.Flags().GetInt("limit")
+			sortBy, _ := cmd.Flags().GetString("sort")
+			gainers, _ := cmd.Flags().GetBool("gainers")
+			losers, _ := cmd.Flags().GetBool("losers")
+
+			// Apply price presets
+			if penny {
+				maxPrice = 50
+				output.Info("Scanning for penny stocks (< ₹50)")
+			} else if midcap {
+				minPrice = 100
+				maxPrice = 500
+				output.Info("Scanning for mid-cap stocks (₹100-₹500)")
+			} else if largecap {
+				minPrice = 500
+				output.Info("Scanning for large-cap stocks (> ₹500)")
+			}
 
 			// Apply preset filters
 			if preset != "" {
@@ -1082,6 +1128,12 @@ Can use preset screeners or custom filters.`,
 			output.Info("Scanning stocks...")
 			if preset != "" {
 				output.Printf("  Preset: %s\n", preset)
+			}
+			if minPrice > 0 {
+				output.Printf("  Min Price: ₹%.0f\n", minPrice)
+			}
+			if maxPrice > 0 {
+				output.Printf("  Max Price: ₹%.0f\n", maxPrice)
 			}
 			if rsiBelow > 0 {
 				output.Printf("  RSI < %.0f\n", rsiBelow)
@@ -1142,6 +1194,16 @@ Can use preset screeners or custom filters.`,
 					volumes[i] = c.Volume
 				}
 
+				currentPrice := closes[len(closes)-1]
+				
+				// Apply price filters first (fast filter)
+				if minPrice > 0 && currentPrice < minPrice {
+					continue
+				}
+				if maxPrice > 0 && currentPrice > maxPrice {
+					continue
+				}
+
 				// Calculate indicators
 				rsi := calculateRSI(closes, 14)
 				
@@ -1174,7 +1236,7 @@ Can use preset screeners or custom filters.`,
 					}
 				}
 
-				// Apply filters
+				// Apply technical filters
 				if rsiBelow > 0 && rsi >= rsiBelow {
 					continue
 				}
@@ -1188,6 +1250,14 @@ Can use preset screeners or custom filters.`,
 					continue
 				}
 				if gapDown > 0 && gap > -gapDown {
+					continue
+				}
+				
+				// Apply gainers/losers filter
+				if gainers && change <= 0 {
+					continue
+				}
+				if losers && change >= 0 {
 					continue
 				}
 
@@ -1210,6 +1280,31 @@ Can use preset screeners or custom filters.`,
 					Signal: signal,
 				})
 			}
+			
+			// Sort results
+			switch sortBy {
+			case "price":
+				sort.Slice(results, func(i, j int) bool {
+					return results[i].LTP > results[j].LTP
+				})
+			case "change":
+				sort.Slice(results, func(i, j int) bool {
+					return results[i].Change > results[j].Change
+				})
+			case "rsi":
+				sort.Slice(results, func(i, j int) bool {
+					return results[i].RSI < results[j].RSI
+				})
+			case "volume":
+				sort.Slice(results, func(i, j int) bool {
+					return results[i].Volume > results[j].Volume
+				})
+			}
+			
+			// Limit results
+			if limit > 0 && len(results) > limit {
+				results = results[:limit]
+			}
 
 			if output.IsJSON() {
 				return output.JSON(results)
@@ -1219,12 +1314,29 @@ Can use preset screeners or custom filters.`,
 		},
 	}
 
+	// Technical filters
 	cmd.Flags().String("preset", "", "Use preset screener (momentum, oversold, overbought, breakout, reversal)")
 	cmd.Flags().Float64("rsi-below", 0, "RSI below threshold")
 	cmd.Flags().Float64("rsi-above", 0, "RSI above threshold")
 	cmd.Flags().Float64("volume-above", 0, "Volume multiple above average")
 	cmd.Flags().Float64("gap-up", 0, "Gap up percentage")
 	cmd.Flags().Float64("gap-down", 0, "Gap down percentage")
+	
+	// Price filters
+	cmd.Flags().Float64("min-price", 0, "Minimum stock price")
+	cmd.Flags().Float64("max-price", 0, "Maximum stock price")
+	cmd.Flags().Bool("penny", false, "Show penny stocks (< ₹50)")
+	cmd.Flags().Bool("midcap", false, "Show mid-cap stocks (₹100-₹500)")
+	cmd.Flags().Bool("largecap", false, "Show large-cap stocks (> ₹500)")
+	
+	// Change filters
+	cmd.Flags().Bool("gainers", false, "Show only gainers (positive change)")
+	cmd.Flags().Bool("losers", false, "Show only losers (negative change)")
+	
+	// Output options
+	cmd.Flags().Int("limit", 0, "Limit number of results")
+	cmd.Flags().String("sort", "", "Sort by: price, change, rsi, volume")
+	
 	cmd.Flags().String("watchlist", "", "Scan specific watchlist (default: 'default')")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 
@@ -1713,8 +1825,8 @@ func generateRuleBasedInsights(r ResearchResult, sector string) ([]string, []str
 type LLMClient interface {
 	Complete(ctx context.Context, prompt string) (string, error)
 	CompleteWithSystem(ctx context.Context, systemPrompt, userPrompt string) (string, error)
-	CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *agents.ToolExecutor) (string, error)
-	CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *agents.ToolExecutor) (*agents.ChainOfThought, error)
+	CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor agents.ToolExecutorInterface) (string, error)
+	CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor agents.ToolExecutorInterface) (*agents.ChainOfThought, error)
 }
 
 // calculateSMA calculates Simple Moving Average

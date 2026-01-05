@@ -77,9 +77,15 @@ type ChainOfThought struct {
 	Response  string
 }
 
+// ToolExecutorInterface defines the interface for tool executors.
+// Both ToolExecutor (live) and BacktestToolExecutor implement this.
+type ToolExecutorInterface interface {
+	ExecuteTool(ctx context.Context, toolName string, args json.RawMessage) (string, error)
+}
+
 // CompleteWithTools sends a prompt with tools and handles tool calls.
 // It returns the final response after executing any tool calls.
-func (c *OpenAIClient) CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *ToolExecutor) (string, error) {
+func (c *OpenAIClient) CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor ToolExecutorInterface) (string, error) {
 	cot, err := c.CompleteWithToolsVerbose(ctx, systemPrompt, userPrompt, tools, executor)
 	if err != nil {
 		return "", err
@@ -88,7 +94,7 @@ func (c *OpenAIClient) CompleteWithTools(ctx context.Context, systemPrompt, user
 }
 
 // CompleteWithToolsVerbose sends a prompt with tools and returns the full chain of thought.
-func (c *OpenAIClient) CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *ToolExecutor) (*ChainOfThought, error) {
+func (c *OpenAIClient) CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor ToolExecutorInterface) (*ChainOfThought, error) {
 	messages := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},

@@ -547,7 +547,7 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE, NFO)")
 	cmd.Flags().StringP("watchlist", "w", "", "Watchlist name")
 	cmd.Flags().StringP("window", "t", "5m", "Prediction time window (e.g., 5m, 15m, 1h)")
-	cmd.Flags().Float64P("threshold", "c", 60.0, "Minimum confidence threshold for predictions")
+	cmd.Flags().Float64P("threshold", "c", 65.0, "Minimum confidence threshold for predictions")
 	cmd.Flags().IntP("interval", "i", 60, "Analysis interval in seconds")
 	cmd.Flags().Bool("tools", true, "Enable AI tools/function calling for analysis (default: true)")
 	cmd.Flags().Bool("simple", false, "Use simple mode without tools (faster but less accurate)")
@@ -612,32 +612,64 @@ func getAIPredictionWithToolsVerbose(ctx context.Context, app *App, symbol strin
 	// Build prompt for AI with history context
 	prompt := buildToolBasedPrompt(symbol, currentPrice, timeWindow, symbolHistory, tracker.GetStats())
 
-	systemPrompt := `You are an aggressive intraday trader analyzing Indian stock market (NSE).
-You have access to powerful analysis tools. USE THEM to make informed decisions!
+	systemPrompt := `You are a TREND-FOLLOWING intraday trader analyzing Indian stock market (NSE).
+You have access to 15 powerful analysis tools. USE MULTIPLE TOOLS to make well-informed decisions!
 
-AVAILABLE TOOLS:
-- get_historical_data: Fetch OHLCV candle data
-- calculate_rsi: Calculate RSI indicator  
-- calculate_bollinger_bands: Calculate Bollinger Bands
-- calculate_fibonacci_levels: Calculate Fibonacci retracement levels
-- get_support_resistance: Get pivot points and S/R levels
-- detect_candlestick_patterns: Detect patterns like Doji, Hammer, Engulfing
-- detect_chart_patterns: Detect patterns like Head & Shoulders, Triangles
-- calculate_atr: Calculate ATR for volatility and stop loss
-- calculate_stochastic: Calculate Stochastic Oscillator
-- get_mtf_analysis: Multi-timeframe trend analysis
+AVAILABLE TOOLS (use at least 5-6 for best results):
+TREND INDICATORS:
+- calculate_rsi: RSI for trend direction (PRIMARY)
+- calculate_macd: MACD for trend and momentum
+- calculate_ema_crossover: EMA crossover for trend confirmation
+- calculate_adx: ADX for trend strength
 
-CRITICAL: ALWAYS use "15min" timeframe for all tools. Do NOT use 5min or 1min - they have insufficient data.
+VOLATILITY & LEVELS:
+- calculate_bollinger_bands: Bollinger Bands for entry timing
+- calculate_atr: ATR for stop loss placement
+- get_support_resistance: Pivot points and S/R levels
+- calculate_fibonacci_levels: Fibonacci retracement levels
 
-WORKFLOW:
-1. First, use 2-3 tools to gather data (RSI, Bollinger, patterns, etc.) with timeframe="15min"
-2. Analyze the tool results
-3. Make your BUY or SELL prediction based on REAL DATA from tools
+PATTERNS & CONFIRMATION:
+- detect_candlestick_patterns: Candlestick patterns
+- analyze_volume: Volume analysis for confirmation
+- calculate_vwap: VWAP for institutional bias
+- calculate_stochastic: Stochastic for overbought/oversold
 
-IMPORTANT: You MUST make a BUY or SELL prediction. Do NOT say HOLD.
-- If RSI > 50 or price above middle Bollinger band, lean BUY
-- If RSI < 50 or price below middle Bollinger band, lean SELL
-- Always provide a prediction!
+CRITICAL: ALWAYS use "15min" timeframe for all tools.
+
+=== MULTI-INDICATOR DECISION FRAMEWORK ===
+
+STEP 1 - DETERMINE TREND (use 3+ indicators):
+   RSI: > 55 = Bullish, < 45 = Bearish
+   MACD: Above signal = Bullish, Below signal = Bearish
+   EMA Crossover: Fast > Slow = Bullish, Fast < Slow = Bearish
+   ADX: > 25 = Strong trend, < 20 = Weak/ranging
+   
+   RULE: Need 2+ indicators agreeing for valid trend
+
+STEP 2 - CHECK TREND STRENGTH (ADX):
+   ADX > 25 = Strong trend → Trade with confidence
+   ADX 20-25 = Moderate → Reduce position size
+   ADX < 20 = Weak/Ranging → AVOID trading
+
+STEP 3 - CHECK ENTRY TIMING:
+   Bollinger %B: 0.2-0.4 for BUY, 0.6-0.8 for SELL (ideal)
+   VWAP: Price above = Bullish bias, below = Bearish bias
+   Volume: High volume confirms, low volume = caution
+
+STEP 4 - AVOID EXTENDED MOVES:
+   RSI > 70 or < 30 = Extended, reduce confidence
+   %B > 0.85 or < 0.15 = Extended, reduce confidence
+   Stochastic > 80 or < 20 = Extended
+
+STEP 5 - PATTERN CONFIRMATION:
+   Candlestick patterns: Confirming = +5%, Conflicting = -10%
+   Volume spike with move = Strong confirmation
+
+CONFIDENCE SCORING:
+   4+ indicators align + good entry + volume confirm: 75-85%
+   3+ indicators align + good entry: 68-74%
+   2+ indicators align + acceptable entry: 65-70%
+   Mixed signals or poor entry: < 65% (filtered out)
 
 After using tools, respond with valid JSON:
 {
@@ -645,16 +677,131 @@ After using tools, respond with valid JSON:
   "confidence": 0-100,
   "target_price": number,
   "stop_loss": number,
-  "reasoning": "brief explanation including which tools/indicators you used"
+  "reasoning": "brief explanation mentioning key indicators"
 }
 
-Rules:
-- ALWAYS choose BUY or SELL, never HOLD
-- ALWAYS use timeframe="15min" for all tool calls
-- USE AT LEAST 2 TOOLS before making a prediction
-- Target should be 0.3-1% from entry for short windows
-- Stop loss should be 0.3-0.5% from entry
-- Be decisive!`
+CRITICAL RULES:
+- USE AT LEAST 5 TOOLS before deciding
+- Need 2+ trend indicators agreeing
+- ADX < 20 = DO NOT TRADE (ranging market)
+- RSI > 70 or < 30 = Reduce confidence significantly
+- Target: 0.3-0.8% from entry
+- Stop loss: Use ATR-based (1.5x ATR)`
+
+	// Get AI response with tools (verbose to capture chain of thought)
+	tools := agents.GetToolDefinitions()
+	cot, err := app.LLMClient.CompleteWithToolsVerbose(ctx, systemPrompt, prompt, tools, toolExecutor)
+	if err != nil {
+		return nil, fmt.Errorf("AI analysis failed: %w", err)
+	}
+
+	// Parse response
+	prediction, err := parsePredictionResponse(cot.Response, symbol, currentPrice, timeWindow)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse AI response: %w", err)
+	}
+
+	// Filter by threshold
+	if prediction == nil || prediction.Confidence < threshold {
+		return &PredictionResult{Prediction: nil, ChainOfThought: cot}, nil
+	}
+
+	return &PredictionResult{Prediction: prediction, ChainOfThought: cot}, nil
+}
+
+// getAIPredictionBacktest uses BacktestToolExecutor with pre-fetched candles.
+// This ensures the AI sees data as of the simulation time, not current time.
+func getAIPredictionBacktest(ctx context.Context, app *App, symbol string, candles []models.Candle, currentIndex int, currentPrice float64, timeWindow time.Duration, threshold float64, tracker *PaperTracker) (*PredictionResult, error) {
+	// Create backtest tool executor with candles up to current simulation point
+	toolExecutor := agents.NewBacktestToolExecutor(symbol, candles, currentIndex)
+	
+	// Get recent prediction history for this symbol
+	recentHistory := tracker.GetRecentHistory(10)
+	var symbolHistory []*Prediction
+	for _, p := range recentHistory {
+		if p.Symbol == symbol {
+			symbolHistory = append(symbolHistory, p)
+		}
+	}
+
+	// Build prompt for AI with history context
+	prompt := buildToolBasedPrompt(symbol, currentPrice, timeWindow, symbolHistory, tracker.GetStats())
+
+	systemPrompt := `You are a TREND-FOLLOWING intraday trader analyzing Indian stock market (NSE).
+You have access to 15 powerful analysis tools. USE MULTIPLE TOOLS to make well-informed decisions!
+
+AVAILABLE TOOLS (use at least 5-6 for best results):
+TREND INDICATORS:
+- calculate_rsi: RSI for trend direction (PRIMARY)
+- calculate_macd: MACD for trend and momentum
+- calculate_ema_crossover: EMA crossover for trend confirmation
+- calculate_adx: ADX for trend strength
+
+VOLATILITY & LEVELS:
+- calculate_bollinger_bands: Bollinger Bands for entry timing
+- calculate_atr: ATR for stop loss placement
+- get_support_resistance: Pivot points and S/R levels
+- calculate_fibonacci_levels: Fibonacci retracement levels
+
+PATTERNS & CONFIRMATION:
+- detect_candlestick_patterns: Candlestick patterns
+- analyze_volume: Volume analysis for confirmation
+- calculate_vwap: VWAP for institutional bias
+- calculate_stochastic: Stochastic for overbought/oversold
+
+CRITICAL: ALWAYS use "15min" timeframe for all tools.
+
+=== MULTI-INDICATOR DECISION FRAMEWORK ===
+
+STEP 1 - DETERMINE TREND (use 3+ indicators):
+   RSI: > 55 = Bullish, < 45 = Bearish
+   MACD: Above signal = Bullish, Below signal = Bearish
+   EMA Crossover: Fast > Slow = Bullish, Fast < Slow = Bearish
+   ADX: > 25 = Strong trend, < 20 = Weak/ranging
+   
+   RULE: Need 2+ indicators agreeing for valid trend
+
+STEP 2 - CHECK TREND STRENGTH (ADX):
+   ADX > 25 = Strong trend → Trade with confidence
+   ADX 20-25 = Moderate → Reduce position size
+   ADX < 20 = Weak/Ranging → AVOID trading
+
+STEP 3 - CHECK ENTRY TIMING:
+   Bollinger %B: 0.2-0.4 for BUY, 0.6-0.8 for SELL (ideal)
+   VWAP: Price above = Bullish bias, below = Bearish bias
+   Volume: High volume confirms, low volume = caution
+
+STEP 4 - AVOID EXTENDED MOVES:
+   RSI > 70 or < 30 = Extended, reduce confidence
+   %B > 0.85 or < 0.15 = Extended, reduce confidence
+   Stochastic > 80 or < 20 = Extended
+
+STEP 5 - PATTERN CONFIRMATION:
+   Candlestick patterns: Confirming = +5%, Conflicting = -10%
+   Volume spike with move = Strong confirmation
+
+CONFIDENCE SCORING:
+   4+ indicators align + good entry + volume confirm: 75-85%
+   3+ indicators align + good entry: 68-74%
+   2+ indicators align + acceptable entry: 65-70%
+   Mixed signals or poor entry: < 65% (filtered out)
+
+After using tools, respond with valid JSON:
+{
+  "action": "BUY" or "SELL",
+  "confidence": 0-100,
+  "target_price": number,
+  "stop_loss": number,
+  "reasoning": "brief explanation mentioning key indicators"
+}
+
+CRITICAL RULES:
+- USE AT LEAST 5 TOOLS before deciding
+- Need 2+ trend indicators agreeing
+- ADX < 20 = DO NOT TRADE (ranging market)
+- RSI > 70 or < 30 = Reduce confidence significantly
+- Target: 0.3-0.8% from entry
+- Stop loss: Use ATR-based (1.5x ATR)`
 
 	// Get AI response with tools (verbose to capture chain of thought)
 	tools := agents.GetToolDefinitions()
@@ -1180,7 +1327,14 @@ func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []st
 			currentPrice := currentCandle.Close
 
 			// Get AI prediction with chain of thought
-			result, err := getAIPredictionVerbose(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker, useTools)
+			// In backtest mode with tools, use BacktestToolExecutor for accurate historical data
+			var result *PredictionResult
+			var err error
+			if useTools {
+				result, err = getAIPredictionBacktest(ctx, app, symbol, candles, i, currentPrice, timeWindow, threshold, tracker)
+			} else {
+				result, err = getAIPredictionVerbose(ctx, app, symbol, currentPrice, timeWindow, threshold, tracker, useTools)
+			}
 			if err != nil {
 				output.Dim("  %s: AI error - %v", currentCandle.Timestamp.Format("Jan 02 15:04"), err)
 				continue

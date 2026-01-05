@@ -26,9 +26,9 @@ type LLMClient interface {
 	// CompleteWithSystem sends a prompt with a system message.
 	CompleteWithSystem(ctx context.Context, system, prompt string) (string, error)
 	// CompleteWithTools sends a prompt with tools and handles tool calls.
-	CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *ToolExecutor) (string, error)
+	CompleteWithTools(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor ToolExecutorInterface) (string, error)
 	// CompleteWithToolsVerbose sends a prompt with tools and returns the full chain of thought.
-	CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor *ToolExecutor) (*ChainOfThought, error)
+	CompleteWithToolsVerbose(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool, executor ToolExecutorInterface) (*ChainOfThought, error)
 }
 
 // NewTechnicalAgent creates a new technical analysis agent.
