@@ -1129,8 +1129,10 @@ func parsePredictionResponse(response string, symbol string, currentPrice float6
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
 	}
 
-	// Skip HOLD actions
-	if result.Action == "HOLD" || result.Action == "" {
+	// Skip NO_TRADE, HOLD, or empty actions
+	action := strings.ToUpper(strings.TrimSpace(result.Action))
+	if action == "NO_TRADE" || action == "NOTRADE" || action == "NO TRADE" || 
+	   action == "HOLD" || action == "WAIT" || action == "" {
 		return nil, nil
 	}
 
@@ -1211,7 +1213,10 @@ func parsePredictionResponseWithGates(response string, symbol string, currentPri
 	}
 
 	// Skip NO_TRADE, HOLD, or empty actions - these are correct risk avoidance
-	if result.Action == "NO_TRADE" || result.Action == "HOLD" || result.Action == "" {
+	action := strings.ToUpper(strings.TrimSpace(result.Action))
+	
+	// Only allow BUY or SELL - everything else returns nil
+	if action != "BUY" && action != "SELL" {
 		return nil, nil
 	}
 
@@ -1550,6 +1555,18 @@ func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []st
 				// Track avoidance count but don't score as RIGHT/WRONG
 				tracker.mu.Lock()
 				tracker.stats.ExpiredPredictions++ // Reuse this field for "avoided" count
+				tracker.mu.Unlock()
+				continue
+			}
+			
+			// Double-check: if AI returned NO_TRADE action, treat as avoided (safety net)
+			action := strings.ToUpper(strings.TrimSpace(prediction.Action))
+			
+			// Only allow explicit BUY or SELL - everything else is avoided
+			if action != "BUY" && action != "SELL" {
+				output.Dim("  %s @ ₹%.2f: AVOIDED (no trade signal)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
+				tracker.mu.Lock()
+				tracker.stats.ExpiredPredictions++
 				tracker.mu.Unlock()
 				continue
 			}
