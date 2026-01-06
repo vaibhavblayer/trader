@@ -97,6 +97,8 @@ func (pt *PaperTracker) AddPrediction(p *Prediction) {
 }
 
 // EvaluatePrediction evaluates a prediction against current price.
+// Outcomes: RIGHT (target hit), WRONG (stop loss hit), EXPIRED (time ran out)
+// Win rate only counts RIGHT vs WRONG for honest feedback.
 func (pt *PaperTracker) EvaluatePrediction(id string, currentPrice float64) *Prediction {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
@@ -119,14 +121,9 @@ func (pt *PaperTracker) EvaluatePrediction(id string, currentPrice float64) *Pre
 	// Determine outcome
 	now := time.Now()
 	if now.After(p.ExpiresAt) {
-		// Time expired - check if it would have been profitable
-		if p.PnLPercent > 0 {
-			p.Outcome = "RIGHT"
-			pt.stats.RightPredictions++
-		} else {
-			p.Outcome = "EXPIRED"
-			pt.stats.ExpiredPredictions++
-		}
+		// Time expired - always mark as EXPIRED (separate from RIGHT/WRONG)
+		p.Outcome = "EXPIRED"
+		pt.stats.ExpiredPredictions++
 	} else {
 		// Check if target or stop loss hit
 		if p.Action == "BUY" {
@@ -153,7 +150,7 @@ func (pt *PaperTracker) EvaluatePrediction(id string, currentPrice float64) *Pre
 		pt.history = append(pt.history, p)
 		delete(pt.predictions, id)
 		
-		// Update average P&L
+		// Update average P&L (includes all outcomes)
 		evaluated := pt.stats.RightPredictions + pt.stats.WrongPredictions + pt.stats.ExpiredPredictions
 		pt.stats.AvgPnLPercent = ((pt.stats.AvgPnLPercent * float64(evaluated-1)) + p.PnLPercent) / float64(evaluated)
 		
@@ -165,9 +162,11 @@ func (pt *PaperTracker) EvaluatePrediction(id string, currentPrice float64) *Pre
 			pt.stats.WorstPrediction = p.PnLPercent
 		}
 		
-		// Update win rate
-		if evaluated > 0 {
-			pt.stats.WinRate = float64(pt.stats.RightPredictions) / float64(evaluated) * 100
+		// Win rate only counts decisive outcomes (RIGHT vs WRONG)
+		// EXPIRED trades don't count - they indicate signal didn't play out
+		decisiveCount := pt.stats.RightPredictions + pt.stats.WrongPredictions
+		if decisiveCount > 0 {
+			pt.stats.WinRate = float64(pt.stats.RightPredictions) / float64(decisiveCount) * 100
 		}
 	}
 	
@@ -194,6 +193,8 @@ func (pt *PaperTracker) GetStats() PaperStats {
 }
 
 // CheckExpiredPredictions checks and evaluates expired predictions.
+// EXPIRED is now a separate outcome - not counted in win rate calculation.
+// Win rate = RIGHT / (RIGHT + WRONG), EXPIRED trades are tracked separately.
 func (pt *PaperTracker) CheckExpiredPredictions(prices map[string]float64) []*Prediction {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
@@ -218,19 +219,16 @@ func (pt *PaperTracker) CheckExpiredPredictions(prices map[string]float64) []*Pr
 				p.PnLPercent = ((p.EntryPrice - price) / p.EntryPrice) * 100
 			}
 			
-			if p.PnLPercent > 0 {
-				p.Outcome = "RIGHT"
-				pt.stats.RightPredictions++
-			} else {
-				p.Outcome = "WRONG"
-				pt.stats.WrongPredictions++
-			}
+			// EXPIRED is always EXPIRED - separate from RIGHT/WRONG
+			// This prevents inflating win rate with lucky expired trades
+			p.Outcome = "EXPIRED"
+			pt.stats.ExpiredPredictions++
 			
 			pt.history = append(pt.history, p)
 			delete(pt.predictions, id)
 			expired = append(expired, p)
 			
-			// Update stats
+			// Update P&L stats (include expired in P&L tracking)
 			evaluated := pt.stats.RightPredictions + pt.stats.WrongPredictions + pt.stats.ExpiredPredictions
 			pt.stats.AvgPnLPercent = ((pt.stats.AvgPnLPercent * float64(evaluated-1)) + p.PnLPercent) / float64(evaluated)
 			if p.PnLPercent > pt.stats.BestPrediction {
@@ -239,8 +237,12 @@ func (pt *PaperTracker) CheckExpiredPredictions(prices map[string]float64) []*Pr
 			if p.PnLPercent < pt.stats.WorstPrediction {
 				pt.stats.WorstPrediction = p.PnLPercent
 			}
-			if evaluated > 0 {
-				pt.stats.WinRate = float64(pt.stats.RightPredictions) / float64(evaluated) * 100
+			
+			// Win rate only counts RIGHT vs WRONG (not EXPIRED)
+			// This gives honest feedback about prediction quality
+			decisiveCount := pt.stats.RightPredictions + pt.stats.WrongPredictions
+			if decisiveCount > 0 {
+				pt.stats.WinRate = float64(pt.stats.RightPredictions) / float64(decisiveCount) * 100
 			}
 		}
 	}
@@ -528,9 +530,9 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 							tracker.AddPrediction(prediction)
 							speakNewPrediction(prediction)
 							lastAIStatusMu.Lock()
-							lastAIStatus = fmt.Sprintf("🎯 NEW: %s %s @ ₹%.2f (%.0f%% conf) → Target: ₹%.2f, SL: ₹%.2f", 
+							lastAIStatus = fmt.Sprintf("🎯 NEW: %s %s @ ₹%.2f (%.0f%% conf) → Target: ₹%.2f, SL: ₹%.2f\n   📊 Reason: %s", 
 								prediction.Action, symbol, prediction.EntryPrice, prediction.Confidence,
-								prediction.TargetPrice, prediction.StopLoss)
+								prediction.TargetPrice, prediction.StopLoss, prediction.Reasoning)
 							lastAIStatusMu.Unlock()
 						} else {
 							lastAIStatusMu.Lock()
@@ -612,17 +614,81 @@ func getAIPredictionWithToolsVerbose(ctx context.Context, app *App, symbol strin
 	// Build prompt for AI with history context
 	prompt := buildToolBasedPrompt(symbol, currentPrice, timeWindow, symbolHistory, tracker.GetStats())
 
-	// Simplified prompt for gpt-5-mini - concise and direct
-	systemPrompt := `You are an NSE trader. Call these 5 tools (timeframe="15min"), then output JSON.
+	// Execution-grade prompt with HARD GATES and REGIME LOCKS
+	systemPrompt := `You are an expert NSE intraday trader. Analyze the stock and make a trading decision.
 
-TOOLS: calculate_rsi, calculate_ema_crossover, calculate_bollinger_bands, calculate_vwap, detect_candlestick_patterns
+TOOLS TO USE:
+- calculate_rsi: RSI value + direction (current vs previous)
+- analyze_volume: Volume ratio vs 20-period average
+- calculate_ema_crossover: EMA9/EMA21 trend direction
+- calculate_vwap: Price deviation from VWAP
+- calculate_adx: Trend strength
 
-RULES:
-- BUY: RSI>50 + EMA9>EMA21 + Price>VWAP (3+ signals agree)
-- SELL: RSI<50 + EMA9<EMA21 + Price<VWAP (3+ signals agree)
-- NO TRADE: mixed signals
+=== HARD GATES (ALL MUST PASS) ===
 
-OUTPUT JSON: {"action":"BUY/SELL","confidence":65-80,"target_price":<price±0.4%>,"stop_loss":<price∓0.5%>,"reasoning":"X/5 signals"}`
+1. RSI REGIME LOCK (eliminates chop/transition zones):
+   - BUY allowed ONLY if: RSI > 55 AND RSI rising (current > previous)
+   - SELL allowed ONLY if: RSI < 45 AND RSI falling (current < previous)
+   - RSI between 45-55 = CHOP ZONE = NO_TRADE always
+   - RSI rising but below 55 = NO_TRADE (noise bounce, not trend)
+   - RSI falling but above 45 = NO_TRADE (pullback, not reversal)
+
+2. VOLUME EXPANSION GATE:
+   - Volume ratio must be > 1.3x average for any trade
+   - Low volume = low participation = unreliable signal
+
+3. EMA ALIGNMENT (MANDATORY):
+   - BUY: Price must be ABOVE EMA9, EMA9 > EMA21 (bullish structure)
+   - SELL: Price must be BELOW EMA9, EMA9 < EMA21 (bearish structure)
+   - If EMA disagrees with trade direction = NO_TRADE
+
+4. VWAP EXHAUSTION BLOCK:
+   - If price is >0.7% above VWAP = NO BUY (stretched, likely to revert)
+   - If price is >0.7% below VWAP = NO SELL (stretched, likely to bounce)
+   - Exhausted moves have poor risk/reward
+
+5. TREND STRENGTH:
+   - ADX must be > 25 for any trade (was 20, now stricter)
+   - ADX < 25 = weak trend = NO_TRADE
+
+=== CONFIDENCE CALCULATION (mechanized) ===
+Base = 45, add points:
+- RSI slope strong (>5 points move): +10
+- Volume ratio >2x: +15, >1.5x: +10, >1.3x: +5
+- ADX >35: +15, >30: +10, >25: +5
+- EMA cleanly aligned: +10
+- VWAP confirms direction (within 0.3%): +5
+
+=== OUTPUT JSON ===
+{
+  "action": "BUY" or "SELL" or "NO_TRADE",
+  "gates_passed": {
+    "rsi_regime": true/false,
+    "volume_expansion": true/false,
+    "ema_alignment": true/false,
+    "vwap_not_exhausted": true/false,
+    "trend_strength": true/false
+  },
+  "signal_quality": {
+    "rsi_value": 58,
+    "rsi_direction": "rising/falling",
+    "volume_ratio": 1.5,
+    "vwap_deviation_pct": 0.3,
+    "adx_value": 28,
+    "ema_trend": "bullish/bearish"
+  },
+  "confidence": <calculated 45-85>,
+  "hold_duration": "3m" or "5m" or "10m" or "15m" or "30m",
+  "target_price": <price>,
+  "stop_loss": <price>,
+  "reasoning": "brief: which gates passed/failed"
+}
+
+CRITICAL RULES:
+- If ANY gate is false → action MUST be "NO_TRADE"
+- RSI 45-55 = ALWAYS NO_TRADE (chop zone)
+- NO_TRADE is correct risk avoidance, not a failed prediction
+- Only trade in CLEAR regimes with strong momentum + participation`
 
 	// Get AI response with tools (verbose to capture chain of thought)
 	tools := agents.GetToolDefinitions()
@@ -631,8 +697,8 @@ OUTPUT JSON: {"action":"BUY/SELL","confidence":65-80,"target_price":<price±0.4%
 		return nil, fmt.Errorf("AI analysis failed: %w", err)
 	}
 
-	// Parse response
-	prediction, err := parsePredictionResponse(cot.Response, symbol, currentPrice, timeWindow)
+	// Parse response with gate validation
+	prediction, err := parsePredictionResponseWithGates(cot.Response, symbol, currentPrice, timeWindow)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse AI response: %w", err)
 	}
@@ -663,17 +729,81 @@ func getAIPredictionBacktest(ctx context.Context, app *App, symbol string, candl
 	// Build prompt for AI with history context
 	prompt := buildToolBasedPrompt(symbol, currentPrice, timeWindow, symbolHistory, tracker.GetStats())
 
-	// Simplified prompt for gpt-5-mini - concise and direct (same as live trading)
-	systemPrompt := `You are an NSE trader. Call these 5 tools (timeframe="15min"), then output JSON.
+	// Execution-grade prompt with HARD GATES and REGIME LOCKS (same as live)
+	systemPrompt := `You are an expert NSE intraday trader. Analyze the stock and make a trading decision.
 
-TOOLS: calculate_rsi, calculate_ema_crossover, calculate_bollinger_bands, calculate_vwap, detect_candlestick_patterns
+TOOLS TO USE:
+- calculate_rsi: RSI value + direction (current vs previous)
+- analyze_volume: Volume ratio vs 20-period average
+- calculate_ema_crossover: EMA9/EMA21 trend direction
+- calculate_vwap: Price deviation from VWAP
+- calculate_adx: Trend strength
 
-RULES:
-- BUY: RSI>50 + EMA9>EMA21 + Price>VWAP (3+ signals agree)
-- SELL: RSI<50 + EMA9<EMA21 + Price<VWAP (3+ signals agree)
-- NO TRADE: mixed signals
+=== HARD GATES (ALL MUST PASS) ===
 
-OUTPUT JSON: {"action":"BUY/SELL","confidence":65-80,"target_price":<price±0.4%>,"stop_loss":<price∓0.5%>,"reasoning":"X/5 signals"}`
+1. RSI REGIME LOCK (eliminates chop/transition zones):
+   - BUY allowed ONLY if: RSI > 55 AND RSI rising (current > previous)
+   - SELL allowed ONLY if: RSI < 45 AND RSI falling (current < previous)
+   - RSI between 45-55 = CHOP ZONE = NO_TRADE always
+   - RSI rising but below 55 = NO_TRADE (noise bounce, not trend)
+   - RSI falling but above 45 = NO_TRADE (pullback, not reversal)
+
+2. VOLUME EXPANSION GATE:
+   - Volume ratio must be > 1.3x average for any trade
+   - Low volume = low participation = unreliable signal
+
+3. EMA ALIGNMENT (MANDATORY):
+   - BUY: Price must be ABOVE EMA9, EMA9 > EMA21 (bullish structure)
+   - SELL: Price must be BELOW EMA9, EMA9 < EMA21 (bearish structure)
+   - If EMA disagrees with trade direction = NO_TRADE
+
+4. VWAP EXHAUSTION BLOCK:
+   - If price is >0.7% above VWAP = NO BUY (stretched, likely to revert)
+   - If price is >0.7% below VWAP = NO SELL (stretched, likely to bounce)
+   - Exhausted moves have poor risk/reward
+
+5. TREND STRENGTH:
+   - ADX must be > 25 for any trade (was 20, now stricter)
+   - ADX < 25 = weak trend = NO_TRADE
+
+=== CONFIDENCE CALCULATION (mechanized) ===
+Base = 45, add points:
+- RSI slope strong (>5 points move): +10
+- Volume ratio >2x: +15, >1.5x: +10, >1.3x: +5
+- ADX >35: +15, >30: +10, >25: +5
+- EMA cleanly aligned: +10
+- VWAP confirms direction (within 0.3%): +5
+
+=== OUTPUT JSON ===
+{
+  "action": "BUY" or "SELL" or "NO_TRADE",
+  "gates_passed": {
+    "rsi_regime": true/false,
+    "volume_expansion": true/false,
+    "ema_alignment": true/false,
+    "vwap_not_exhausted": true/false,
+    "trend_strength": true/false
+  },
+  "signal_quality": {
+    "rsi_value": 58,
+    "rsi_direction": "rising/falling",
+    "volume_ratio": 1.5,
+    "vwap_deviation_pct": 0.3,
+    "adx_value": 28,
+    "ema_trend": "bullish/bearish"
+  },
+  "confidence": <calculated 45-85>,
+  "hold_duration": "3m" or "5m" or "10m" or "15m" or "30m",
+  "target_price": <price>,
+  "stop_loss": <price>,
+  "reasoning": "brief: which gates passed/failed"
+}
+
+CRITICAL RULES:
+- If ANY gate is false → action MUST be "NO_TRADE"
+- RSI 45-55 = ALWAYS NO_TRADE (chop zone)
+- NO_TRADE is correct risk avoidance, not a failed prediction
+- Only trade in CLEAR regimes with strong momentum + participation`
 
 	// Get AI response with tools (verbose to capture chain of thought)
 	tools := agents.GetToolDefinitions()
@@ -682,8 +812,8 @@ OUTPUT JSON: {"action":"BUY/SELL","confidence":65-80,"target_price":<price±0.4%
 		return nil, fmt.Errorf("AI analysis failed: %w", err)
 	}
 
-	// Parse response
-	prediction, err := parsePredictionResponse(cot.Response, symbol, currentPrice, timeWindow)
+	// Parse response with gate validation
+	prediction, err := parsePredictionResponseWithGates(cot.Response, symbol, currentPrice, timeWindow)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse AI response: %w", err)
 	}
@@ -768,14 +898,67 @@ Rules:
 	return prediction, nil
 }
 
+// getAnalysisTimeframe maps the prediction time window to an appropriate analysis timeframe.
+// For short windows, use shorter timeframes to capture relevant price action.
+// Supported timeframes: 1min, 5min, 15min, 30min, 1hour, 1day
+func getAnalysisTimeframe(timeWindow time.Duration) string {
+	switch {
+	case timeWindow <= 3*time.Minute:
+		return "1min" // For 1-3 min windows, use 1min candles
+	case timeWindow <= 10*time.Minute:
+		return "5min" // For 3-10 min windows, use 5min candles
+	case timeWindow <= 30*time.Minute:
+		return "15min" // For 10-30 min windows, use 15min candles
+	case timeWindow <= 1*time.Hour:
+		return "30min" // For 30-60 min windows, use 30min candles
+	case timeWindow <= 4*time.Hour:
+		return "1hour" // For 1-4 hour windows, use hourly candles
+	default:
+		return "1day" // For longer windows, use daily candles
+	}
+}
+
+// getMarketSession returns the current market session description based on IST time.
+// This helps AI understand market dynamics at different times of day.
+func getMarketSession(t time.Time) string {
+	hour := t.Hour()
+	minute := t.Minute()
+	totalMins := hour*60 + minute
+
+	switch {
+	case totalMins < 9*60+15:
+		return "PRE-MARKET (market closed)"
+	case totalMins < 9*60+45:
+		return "OPENING (9:15-9:45) - HIGH VOLATILITY, avoid new positions, wait for trend"
+	case totalMins < 11*60+30:
+		return "MORNING SESSION (9:45-11:30) - BEST TRADING WINDOW, trends establish, good volume"
+	case totalMins < 13*60:
+		return "LUNCH LULL (11:30-13:00) - LOW VOLUME, choppy, avoid trading"
+	case totalMins < 14*60+30:
+		return "AFTERNOON SESSION (13:00-14:30) - Volume picks up, trend continuation"
+	case totalMins < 15*60+30:
+		return "CLOSING (14:30-15:30) - SQUARE-OFF PRESSURE, high volatility, quick reversals"
+	default:
+		return "AFTER-MARKET (market closed)"
+	}
+}
+
 // buildToolBasedPrompt builds the prompt for tool-based AI prediction.
 func buildToolBasedPrompt(symbol string, currentPrice float64, timeWindow time.Duration, history []*Prediction, stats PaperStats) string {
 	var sb strings.Builder
 
+	// Get IST time
+	ist, _ := time.LoadLocation("Asia/Kolkata")
+	now := time.Now().In(ist)
+	
+	// Determine market session
+	marketSession := getMarketSession(now)
+
 	sb.WriteString(fmt.Sprintf("Analyze %s for a trading decision.\n\n", symbol))
 	sb.WriteString(fmt.Sprintf("Current Price: %.2f\n", currentPrice))
 	sb.WriteString(fmt.Sprintf("Time Window: %s\n", timeWindow))
-	sb.WriteString(fmt.Sprintf("Current Time: %s IST\n\n", time.Now().Format("15:04:05")))
+	sb.WriteString(fmt.Sprintf("Current Time: %s IST\n", now.Format("15:04:05")))
+	sb.WriteString(fmt.Sprintf("Market Session: %s\n\n", marketSession))
 
 	// Add previous predictions and outcomes for learning
 	if len(history) > 0 {
@@ -920,6 +1103,7 @@ func buildPredictionPromptWithHistory(symbol string, currentPrice float64, candl
 }
 
 // parsePredictionResponse parses the AI response into a Prediction.
+// The AI can specify hold_duration (e.g., "3m", "5m", "15m") which overrides the CLI timeWindow.
 func parsePredictionResponse(response string, symbol string, currentPrice float64, timeWindow time.Duration) (*Prediction, error) {
 	// Extract JSON from response
 	response = strings.TrimSpace(response)
@@ -933,11 +1117,12 @@ func parsePredictionResponse(response string, symbol string, currentPrice float6
 	jsonStr := response[start : end+1]
 
 	var result struct {
-		Action      string  `json:"action"`
-		Confidence  float64 `json:"confidence"`
-		TargetPrice float64 `json:"target_price"`
-		StopLoss    float64 `json:"stop_loss"`
-		Reasoning   string  `json:"reasoning"`
+		Action       string  `json:"action"`
+		Confidence   float64 `json:"confidence"`
+		HoldDuration string  `json:"hold_duration"` // AI-specified duration like "3m", "5m", "15m"
+		TargetPrice  float64 `json:"target_price"`
+		StopLoss     float64 `json:"stop_loss"`
+		Reasoning    string  `json:"reasoning"`
 	}
 
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
@@ -957,6 +1142,14 @@ func parsePredictionResponse(response string, symbol string, currentPrice float6
 		result.StopLoss = currentPrice * 0.99 // Default 1% stop
 	}
 
+	// Parse hold_duration from AI response, fallback to CLI timeWindow
+	holdDuration := timeWindow
+	if result.HoldDuration != "" {
+		if parsed, err := time.ParseDuration(result.HoldDuration); err == nil && parsed > 0 {
+			holdDuration = parsed
+		}
+	}
+
 	now := time.Now()
 	return &Prediction{
 		Symbol:      symbol,
@@ -965,10 +1158,118 @@ func parsePredictionResponse(response string, symbol string, currentPrice float6
 		EntryPrice:  currentPrice,
 		TargetPrice: result.TargetPrice,
 		StopLoss:    result.StopLoss,
-		TimeWindow:  timeWindow,
+		TimeWindow:  holdDuration,
 		CreatedAt:   now,
-		ExpiresAt:   now.Add(timeWindow),
+		ExpiresAt:   now.Add(holdDuration),
 		Reasoning:   result.Reasoning,
+	}, nil
+}
+
+// parsePredictionResponseWithGates parses AI response with hard gate validation.
+// Enforces: RSI regime lock, volume expansion, EMA alignment, VWAP exhaustion, trend strength.
+func parsePredictionResponseWithGates(response string, symbol string, currentPrice float64, timeWindow time.Duration) (*Prediction, error) {
+	// Extract JSON from response
+	response = strings.TrimSpace(response)
+	
+	// Find JSON in response
+	start := strings.Index(response, "{")
+	end := strings.LastIndex(response, "}")
+	if start == -1 || end == -1 || end <= start {
+		return nil, fmt.Errorf("no JSON found in response")
+	}
+	jsonStr := response[start : end+1]
+
+	var result struct {
+		Action       string  `json:"action"`
+		GatesPassed  struct {
+			RSIRegime        bool `json:"rsi_regime"`
+			RSIDirection     bool `json:"rsi_direction"`     // backward compat
+			VolumeExpansion  bool `json:"volume_expansion"`
+			EMAAlignment     bool `json:"ema_alignment"`
+			VWAPNotExhausted bool `json:"vwap_not_exhausted"`
+			TrendStrength    bool `json:"trend_strength"`
+		} `json:"gates_passed"`
+		SignalQuality struct {
+			RSIValue         float64 `json:"rsi_value"`
+			RSIDirection     string  `json:"rsi_direction"`
+			RSISlope         string  `json:"rsi_slope"`      // backward compat
+			VolumeRatio      float64 `json:"volume_ratio"`
+			VWAPDeviationPct float64 `json:"vwap_deviation_pct"`
+			ADXValue         float64 `json:"adx_value"`
+			EMATrend         string  `json:"ema_trend"`
+			MTFAligned       bool    `json:"mtf_aligned"`
+		} `json:"signal_quality"`
+		Confidence   float64 `json:"confidence"`
+		HoldDuration string  `json:"hold_duration"`
+		TargetPrice  float64 `json:"target_price"`
+		StopLoss     float64 `json:"stop_loss"`
+		Reasoning    string  `json:"reasoning"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+
+	// Skip NO_TRADE, HOLD, or empty actions - these are correct risk avoidance
+	if result.Action == "NO_TRADE" || result.Action == "HOLD" || result.Action == "" {
+		return nil, nil
+	}
+
+	// HARD GATE ENFORCEMENT: All 5 gates must pass
+	// Use RSIRegime if present, fall back to RSIDirection for backward compat
+	rsiGate := result.GatesPassed.RSIRegime || result.GatesPassed.RSIDirection
+	
+	allGatesPassed := rsiGate && 
+		result.GatesPassed.VolumeExpansion && 
+		result.GatesPassed.EMAAlignment &&
+		result.GatesPassed.VWAPNotExhausted &&
+		result.GatesPassed.TrendStrength
+	
+	if !allGatesPassed {
+		// AI tried to trade but gates didn't pass - reject as safety net
+		return nil, nil
+	}
+
+	// Validate prices
+	if result.TargetPrice <= 0 {
+		result.TargetPrice = currentPrice * 1.01
+	}
+	if result.StopLoss <= 0 {
+		result.StopLoss = currentPrice * 0.99
+	}
+
+	// Parse hold_duration
+	holdDuration := timeWindow
+	if result.HoldDuration != "" {
+		if parsed, err := time.ParseDuration(result.HoldDuration); err == nil && parsed > 0 {
+			holdDuration = parsed
+		}
+	}
+
+	// Build reasoning with signal quality
+	reasoning := result.Reasoning
+	if reasoning == "" {
+		reasoning = fmt.Sprintf("RSI=%.0f %s | Vol=%.1fx | VWAP=%.2f%% | ADX=%.0f | EMA=%s",
+			result.SignalQuality.RSIValue,
+			result.SignalQuality.RSIDirection,
+			result.SignalQuality.VolumeRatio,
+			result.SignalQuality.VWAPDeviationPct,
+			result.SignalQuality.ADXValue,
+			result.SignalQuality.EMATrend)
+	}
+
+	now := time.Now()
+	return &Prediction{
+		Symbol:      symbol,
+		Action:      result.Action,
+		Confidence:  result.Confidence,
+		EntryPrice:  currentPrice,
+		TargetPrice: result.TargetPrice,
+		StopLoss:    result.StopLoss,
+		TimeWindow:  holdDuration,
+		CreatedAt:   now,
+		ExpiresAt:   now.Add(holdDuration),
+		Reasoning:   reasoning,
 	}, nil
 }
 
@@ -986,20 +1287,24 @@ func displayPaperTradingWithStatus(output *Output, symbols []string, ticks map[s
 	predictions := tracker.GetActivePredictions()
 
 	// Header
-	output.Bold("🤖 AI Paper Trading Mode")
+	output.Bold("🤖 AI Paper Trading Mode (Hard Gates Enabled)")
 	output.Printf("  %s | %d symbols | %d active predictions\n\n",
 		time.Now().Format("15:04:05"), len(symbols), len(predictions))
 
-	// Stats bar
+	// Stats bar - show RIGHT/WRONG/EXPIRED separately
 	winRateColor := "\033[33m" // Yellow
 	if stats.WinRate >= 60 {
 		winRateColor = "\033[32m" // Green
-	} else if stats.WinRate < 50 && stats.TotalPredictions > 0 {
+	} else if stats.WinRate < 50 && (stats.RightPredictions+stats.WrongPredictions) > 0 {
 		winRateColor = "\033[31m" // Red
 	}
 
-	fmt.Printf("Stats: Total=%d | %sWin Rate=%.1f%%\033[0m | Avg P&L=%.2f%% | Best=%.2f%% | Worst=%.2f%%\n\n",
-		stats.TotalPredictions, winRateColor, stats.WinRate, stats.AvgPnLPercent, stats.BestPrediction, stats.WorstPrediction)
+	// Show decisive (RIGHT+WRONG) vs EXPIRED separately for transparency
+	decisiveCount := stats.RightPredictions + stats.WrongPredictions
+	fmt.Printf("Stats: R=%d W=%d E=%d | %sWin=%.1f%%\033[0m (of %d decisive) | P&L=%.2f%% | Best=+%.2f%% | Worst=%.2f%%\n\n",
+		stats.RightPredictions, stats.WrongPredictions, stats.ExpiredPredictions,
+		winRateColor, stats.WinRate, decisiveCount,
+		stats.AvgPnLPercent, stats.BestPrediction, stats.WorstPrediction)
 
 	// Active predictions
 	if len(predictions) > 0 {
@@ -1235,12 +1540,17 @@ func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []st
 
 			prediction := result.Prediction
 			if prediction == nil {
+				// NO_TRADE is risk avoidance - don't score it, just show as avoided
 				if verbose {
-					output.Dim("  ⏸ Decision: HOLD (confidence below threshold or no clear signal)")
+					output.Dim("  ⏸ NO_TRADE @ ₹%.2f - Risk avoided (gates failed or chop zone)", currentPrice)
 					output.Println()
 				} else {
-					output.Dim("  %s @ ₹%.2f: HOLD (no signal)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
+					output.Dim("  %s @ ₹%.2f: AVOIDED (no clear edge)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
 				}
+				// Track avoidance count but don't score as RIGHT/WRONG
+				tracker.mu.Lock()
+				tracker.stats.ExpiredPredictions++ // Reuse this field for "avoided" count
+				tracker.mu.Unlock()
 				continue
 			}
 
@@ -1319,23 +1629,37 @@ func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []st
 	output.Bold("📈 Backtest Results")
 	output.Println()
 	
+	// Calculate win rate only from actual trades (not avoided)
+	actualTrades := stats.RightPredictions + stats.WrongPredictions
+	winRate := 0.0
+	if actualTrades > 0 {
+		winRate = float64(stats.RightPredictions) / float64(actualTrades) * 100
+	}
+	
 	winRateColor := ""
-	if stats.WinRate >= 60 {
+	if winRate >= 60 {
 		winRateColor = "\033[32m" // Green
-	} else if stats.WinRate < 50 {
+	} else if winRate < 50 && actualTrades > 0 {
 		winRateColor = "\033[31m" // Red
 	}
 	
-	output.Printf("  Total Predictions: %d\n", stats.TotalPredictions)
+	// ExpiredPredictions is reused for "avoided" count in backtest
+	avoidedCount := stats.ExpiredPredictions
+	
+	output.Printf("  Actual Trades: %d (Avoided: %d)\n", actualTrades, avoidedCount)
 	output.Printf("  Right: %d | Wrong: %d\n", stats.RightPredictions, stats.WrongPredictions)
-	fmt.Printf("  Win Rate: %s%.1f%%\033[0m\n", winRateColor, stats.WinRate)
-	output.Printf("  Avg P&L: %.2f%%\n", stats.AvgPnLPercent)
-	output.Printf("  Best: +%.2f%% | Worst: %.2f%%\n", stats.BestPrediction, stats.WorstPrediction)
+	if actualTrades > 0 {
+		fmt.Printf("  Win Rate: %s%.1f%%\033[0m (of %d trades)\n", winRateColor, winRate, actualTrades)
+		output.Printf("  Avg P&L: %.2f%%\n", stats.AvgPnLPercent)
+		output.Printf("  Best: +%.2f%% | Worst: %.2f%%\n", stats.BestPrediction, stats.WorstPrediction)
+	} else {
+		output.Printf("  No trades taken - all situations correctly avoided\n")
+	}
 	output.Println()
 
 	// Show recent predictions
 	if len(tracker.history) > 0 {
-		output.Bold("Recent Predictions:")
+		output.Bold("Recent Trades:")
 		start := 0
 		if len(tracker.history) > 10 {
 			start = len(tracker.history) - 10
