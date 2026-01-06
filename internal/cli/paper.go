@@ -612,81 +612,17 @@ func getAIPredictionWithToolsVerbose(ctx context.Context, app *App, symbol strin
 	// Build prompt for AI with history context
 	prompt := buildToolBasedPrompt(symbol, currentPrice, timeWindow, symbolHistory, tracker.GetStats())
 
-	systemPrompt := `You are a TREND-FOLLOWING intraday trader analyzing Indian stock market (NSE).
-You have access to 15 powerful analysis tools. USE MULTIPLE TOOLS to make well-informed decisions!
+	// Simplified prompt for gpt-5-mini - concise and direct
+	systemPrompt := `You are an NSE trader. Call these 5 tools (timeframe="15min"), then output JSON.
 
-AVAILABLE TOOLS (use at least 5-6 for best results):
-TREND INDICATORS:
-- calculate_rsi: RSI for trend direction (PRIMARY)
-- calculate_macd: MACD for trend and momentum
-- calculate_ema_crossover: EMA crossover for trend confirmation
-- calculate_adx: ADX for trend strength
+TOOLS: calculate_rsi, calculate_ema_crossover, calculate_bollinger_bands, calculate_vwap, detect_candlestick_patterns
 
-VOLATILITY & LEVELS:
-- calculate_bollinger_bands: Bollinger Bands for entry timing
-- calculate_atr: ATR for stop loss placement
-- get_support_resistance: Pivot points and S/R levels
-- calculate_fibonacci_levels: Fibonacci retracement levels
+RULES:
+- BUY: RSI>50 + EMA9>EMA21 + Price>VWAP (3+ signals agree)
+- SELL: RSI<50 + EMA9<EMA21 + Price<VWAP (3+ signals agree)
+- NO TRADE: mixed signals
 
-PATTERNS & CONFIRMATION:
-- detect_candlestick_patterns: Candlestick patterns
-- analyze_volume: Volume analysis for confirmation
-- calculate_vwap: VWAP for institutional bias
-- calculate_stochastic: Stochastic for overbought/oversold
-
-CRITICAL: ALWAYS use "15min" timeframe for all tools.
-
-=== MULTI-INDICATOR DECISION FRAMEWORK ===
-
-STEP 1 - DETERMINE TREND (use 3+ indicators):
-   RSI: > 55 = Bullish, < 45 = Bearish
-   MACD: Above signal = Bullish, Below signal = Bearish
-   EMA Crossover: Fast > Slow = Bullish, Fast < Slow = Bearish
-   ADX: > 25 = Strong trend, < 20 = Weak/ranging
-   
-   RULE: Need 2+ indicators agreeing for valid trend
-
-STEP 2 - CHECK TREND STRENGTH (ADX):
-   ADX > 25 = Strong trend → Trade with confidence
-   ADX 20-25 = Moderate → Reduce position size
-   ADX < 20 = Weak/Ranging → AVOID trading
-
-STEP 3 - CHECK ENTRY TIMING:
-   Bollinger %B: 0.2-0.4 for BUY, 0.6-0.8 for SELL (ideal)
-   VWAP: Price above = Bullish bias, below = Bearish bias
-   Volume: High volume confirms, low volume = caution
-
-STEP 4 - AVOID EXTENDED MOVES:
-   RSI > 70 or < 30 = Extended, reduce confidence
-   %B > 0.85 or < 0.15 = Extended, reduce confidence
-   Stochastic > 80 or < 20 = Extended
-
-STEP 5 - PATTERN CONFIRMATION:
-   Candlestick patterns: Confirming = +5%, Conflicting = -10%
-   Volume spike with move = Strong confirmation
-
-CONFIDENCE SCORING:
-   4+ indicators align + good entry + volume confirm: 75-85%
-   3+ indicators align + good entry: 68-74%
-   2+ indicators align + acceptable entry: 65-70%
-   Mixed signals or poor entry: < 65% (filtered out)
-
-After using tools, respond with valid JSON:
-{
-  "action": "BUY" or "SELL",
-  "confidence": 0-100,
-  "target_price": number,
-  "stop_loss": number,
-  "reasoning": "brief explanation mentioning key indicators"
-}
-
-CRITICAL RULES:
-- USE AT LEAST 5 TOOLS before deciding
-- Need 2+ trend indicators agreeing
-- ADX < 20 = DO NOT TRADE (ranging market)
-- RSI > 70 or < 30 = Reduce confidence significantly
-- Target: 0.3-0.8% from entry
-- Stop loss: Use ATR-based (1.5x ATR)`
+OUTPUT JSON: {"action":"BUY/SELL","confidence":65-80,"target_price":<price±0.4%>,"stop_loss":<price∓0.5%>,"reasoning":"X/5 signals"}`
 
 	// Get AI response with tools (verbose to capture chain of thought)
 	tools := agents.GetToolDefinitions()
@@ -727,81 +663,17 @@ func getAIPredictionBacktest(ctx context.Context, app *App, symbol string, candl
 	// Build prompt for AI with history context
 	prompt := buildToolBasedPrompt(symbol, currentPrice, timeWindow, symbolHistory, tracker.GetStats())
 
-	systemPrompt := `You are a TREND-FOLLOWING intraday trader analyzing Indian stock market (NSE).
-You have access to 15 powerful analysis tools. USE MULTIPLE TOOLS to make well-informed decisions!
+	// Simplified prompt for gpt-5-mini - concise and direct (same as live trading)
+	systemPrompt := `You are an NSE trader. Call these 5 tools (timeframe="15min"), then output JSON.
 
-AVAILABLE TOOLS (use at least 5-6 for best results):
-TREND INDICATORS:
-- calculate_rsi: RSI for trend direction (PRIMARY)
-- calculate_macd: MACD for trend and momentum
-- calculate_ema_crossover: EMA crossover for trend confirmation
-- calculate_adx: ADX for trend strength
+TOOLS: calculate_rsi, calculate_ema_crossover, calculate_bollinger_bands, calculate_vwap, detect_candlestick_patterns
 
-VOLATILITY & LEVELS:
-- calculate_bollinger_bands: Bollinger Bands for entry timing
-- calculate_atr: ATR for stop loss placement
-- get_support_resistance: Pivot points and S/R levels
-- calculate_fibonacci_levels: Fibonacci retracement levels
+RULES:
+- BUY: RSI>50 + EMA9>EMA21 + Price>VWAP (3+ signals agree)
+- SELL: RSI<50 + EMA9<EMA21 + Price<VWAP (3+ signals agree)
+- NO TRADE: mixed signals
 
-PATTERNS & CONFIRMATION:
-- detect_candlestick_patterns: Candlestick patterns
-- analyze_volume: Volume analysis for confirmation
-- calculate_vwap: VWAP for institutional bias
-- calculate_stochastic: Stochastic for overbought/oversold
-
-CRITICAL: ALWAYS use "15min" timeframe for all tools.
-
-=== MULTI-INDICATOR DECISION FRAMEWORK ===
-
-STEP 1 - DETERMINE TREND (use 3+ indicators):
-   RSI: > 55 = Bullish, < 45 = Bearish
-   MACD: Above signal = Bullish, Below signal = Bearish
-   EMA Crossover: Fast > Slow = Bullish, Fast < Slow = Bearish
-   ADX: > 25 = Strong trend, < 20 = Weak/ranging
-   
-   RULE: Need 2+ indicators agreeing for valid trend
-
-STEP 2 - CHECK TREND STRENGTH (ADX):
-   ADX > 25 = Strong trend → Trade with confidence
-   ADX 20-25 = Moderate → Reduce position size
-   ADX < 20 = Weak/Ranging → AVOID trading
-
-STEP 3 - CHECK ENTRY TIMING:
-   Bollinger %B: 0.2-0.4 for BUY, 0.6-0.8 for SELL (ideal)
-   VWAP: Price above = Bullish bias, below = Bearish bias
-   Volume: High volume confirms, low volume = caution
-
-STEP 4 - AVOID EXTENDED MOVES:
-   RSI > 70 or < 30 = Extended, reduce confidence
-   %B > 0.85 or < 0.15 = Extended, reduce confidence
-   Stochastic > 80 or < 20 = Extended
-
-STEP 5 - PATTERN CONFIRMATION:
-   Candlestick patterns: Confirming = +5%, Conflicting = -10%
-   Volume spike with move = Strong confirmation
-
-CONFIDENCE SCORING:
-   4+ indicators align + good entry + volume confirm: 75-85%
-   3+ indicators align + good entry: 68-74%
-   2+ indicators align + acceptable entry: 65-70%
-   Mixed signals or poor entry: < 65% (filtered out)
-
-After using tools, respond with valid JSON:
-{
-  "action": "BUY" or "SELL",
-  "confidence": 0-100,
-  "target_price": number,
-  "stop_loss": number,
-  "reasoning": "brief explanation mentioning key indicators"
-}
-
-CRITICAL RULES:
-- USE AT LEAST 5 TOOLS before deciding
-- Need 2+ trend indicators agreeing
-- ADX < 20 = DO NOT TRADE (ranging market)
-- RSI > 70 or < 30 = Reduce confidence significantly
-- Target: 0.3-0.8% from entry
-- Stop loss: Use ATR-based (1.5x ATR)`
+OUTPUT JSON: {"action":"BUY/SELL","confidence":65-80,"target_price":<price±0.4%>,"stop_loss":<price∓0.5%>,"reasoning":"X/5 signals"}`
 
 	// Get AI response with tools (verbose to capture chain of thought)
 	tools := agents.GetToolDefinitions()

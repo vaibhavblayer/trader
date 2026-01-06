@@ -104,8 +104,8 @@ func (c *OpenAIClient) CompleteWithToolsVerbose(ctx context.Context, systemPromp
 		ToolCalls: make([]ToolCallLog, 0),
 	}
 
-	// Allow up to 5 rounds of tool calls
-	for i := 0; i < 5; i++ {
+	// Allow up to 8 rounds of tool calls (increased for mini models that may call more tools)
+	for i := 0; i < 8; i++ {
 		resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 			Model:    c.model,
 			Messages: messages,

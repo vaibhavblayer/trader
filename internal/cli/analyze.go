@@ -1023,6 +1023,18 @@ func newScanCmd(app *App) *cobra.Command {
 		Short: "Scan stocks based on technical and price criteria",
 		Long: `Scan stocks based on technical and price filters.
 
+SCOPE:
+  --all: Scan ALL NSE equity stocks (1500+ stocks, takes time)
+  --index: Scan index constituents:
+    nifty50    - Nifty 50 (50 stocks)
+    nifty100   - Nifty 100 (100 stocks)
+    nifty200   - Nifty 200 (200 stocks)
+    nifty500   - Nifty 500 (500 stocks)
+    banknifty  - Bank Nifty (12 stocks)
+    fno        - F&O stocks (~180 liquid stocks)
+    smallcap   - Small-cap stocks (~100 stocks)
+  --watchlist: Scan specific watchlist (default: 'default')
+
 PRICE FILTERS:
   --min-price, --max-price: Filter by current price range
   --penny: Show penny stocks (price < ₹50)
@@ -1034,25 +1046,38 @@ TECHNICAL FILTERS:
   --volume-above: Volume multiple above average
   --gap-up, --gap-down: Gap percentages
 
+VOLATILITY FILTERS (for day trading):
+  --volatile: Show volatile stocks (ATR > 2%)
+  --min-atr: Minimum ATR percentage
+  --min-change: Minimum absolute change percentage
+
 PRESETS:
   --preset momentum: RSI > 60, Volume > 1.5x
   --preset oversold: RSI < 30
   --preset overbought: RSI > 70
   --preset breakout: Volume > 2x
-  --preset reversal: RSI < 35, Volume > 1.5x`,
-		Example: `  # Find penny stocks (< ₹50)
-  trader scan --penny
+  --preset reversal: RSI < 35, Volume > 1.5x
+  --preset movers: Top movers (change > 2%, volume > 1.2x)
+  --preset volatile: High volatility stocks (ATR > 2%)`,
+		Example: `  # Find volatile stocks for day trading
+  trader scan --index fno --volatile --limit 10
+  trader scan --index fno --preset movers --limit 10
   
-  # Find stocks between ₹100-₹500
-  trader scan --min-price 100 --max-price 500
+  # Scan F&O stocks for penny stocks
+  trader scan --index fno --penny
   
-  # Technical scan
-  trader scan --rsi-below 30
-  trader scan --volume-above 2 --gap-up 2
-  trader scan --preset momentum`,
+  # Scan Nifty 500 for oversold stocks
+  trader scan --index nifty500 --rsi-below 30 --limit 20
+  
+  # Scan entire NSE market (takes time)
+  trader scan --all --penny --limit 50
+  
+  # Technical scan on F&O stocks
+  trader scan --index fno --preset momentum
+  trader scan --index nifty500 --gainers --sort change --limit 10`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
-			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second) // 5 min timeout for full scan
 			defer cancel()
 
 			if app.Broker == nil {
@@ -1069,6 +1094,10 @@ PRESETS:
 			watchlistName, _ := cmd.Flags().GetString("watchlist")
 			exchange, _ := cmd.Flags().GetString("exchange")
 			
+			// Scope flags
+			scanAll, _ := cmd.Flags().GetBool("all")
+			indexName, _ := cmd.Flags().GetString("index")
+			
 			// Price filters
 			minPrice, _ := cmd.Flags().GetFloat64("min-price")
 			maxPrice, _ := cmd.Flags().GetFloat64("max-price")
@@ -1077,6 +1106,12 @@ PRESETS:
 			largecap, _ := cmd.Flags().GetBool("largecap")
 			limit, _ := cmd.Flags().GetInt("limit")
 			sortBy, _ := cmd.Flags().GetString("sort")
+			
+			// Volatility filters
+			volatile, _ := cmd.Flags().GetBool("volatile")
+			minATR, _ := cmd.Flags().GetFloat64("min-atr")
+			minChange, _ := cmd.Flags().GetFloat64("min-change")
+			
 			gainers, _ := cmd.Flags().GetBool("gainers")
 			losers, _ := cmd.Flags().GetBool("losers")
 
@@ -1122,7 +1157,40 @@ PRESETS:
 					if volumeAbove == 0 {
 						volumeAbove = 1.5
 					}
+				case "movers":
+					// Top movers - high absolute change with volume
+					if minChange == 0 {
+						minChange = 2.0 // At least 2% move
+					}
+					if volumeAbove == 0 {
+						volumeAbove = 1.2
+					}
+					if sortBy == "" {
+						sortBy = "change"
+					}
+				case "volatile":
+					// High volatility stocks - good for day trading
+					if minATR == 0 {
+						minATR = 2.0 // At least 2% ATR
+					}
+					if volumeAbove == 0 {
+						volumeAbove = 1.0
+					}
+					if sortBy == "" {
+						sortBy = "atr"
+					}
 				}
+			}
+			
+			// Apply --volatile flag (shortcut for volatile preset)
+			if volatile {
+				if minATR == 0 {
+					minATR = 2.0
+				}
+				if sortBy == "" {
+					sortBy = "atr"
+				}
+				output.Info("Scanning for volatile stocks (ATR > %.1f%%)", minATR)
 			}
 
 			output.Info("Scanning stocks...")
@@ -1151,29 +1219,73 @@ PRESETS:
 				output.Printf("  Gap Down > %.1f%%\n", gapDown)
 			}
 
-			// Get symbols to scan
+			// Get symbols to scan based on scope
 			var symbols []string
-			if watchlistName == "" {
-				watchlistName = "default"
-			}
+			
+			if scanAll {
+				// Fetch all NSE equity instruments
+				output.Info("Fetching all NSE instruments...")
+				instruments, err := app.Broker.GetInstruments(ctx, models.Exchange(exchange))
+				if err != nil {
+					output.Error("Failed to fetch instruments: %v", err)
+					return err
+				}
+				
+				// Filter for equity stocks only (EQ segment)
+				for _, inst := range instruments {
+					if inst.Segment == "NSE" && inst.InstrType == "EQ" {
+						symbols = append(symbols, inst.Symbol)
+					}
+				}
+				output.Printf("  Scanning %d equity stocks from %s\n", len(symbols), exchange)
+				output.Warning("Full market scan may take 10-15 minutes. Consider using --index nifty200 for faster results.")
+				output.Println()
+			} else if indexName != "" {
+				// Use index constituents
+				symbols = getIndexConstituents(indexName)
+				if len(symbols) == 0 {
+					output.Error("Unknown index: %s", indexName)
+					output.Println("Available indices: nifty50, nifty100, nifty200, nifty500, banknifty, fno, smallcap")
+					return fmt.Errorf("unknown index: %s", indexName)
+				}
+				output.Printf("  Scanning %d stocks from %s\n", len(symbols), strings.ToUpper(indexName))
+			} else {
+				// Use watchlist
+				if watchlistName == "" {
+					watchlistName = "default"
+				}
 
-			if app.Store != nil {
-				var err error
-				symbols, err = app.Store.GetWatchlist(ctx, watchlistName)
-				if err != nil || len(symbols) == 0 {
-					// Fallback to default stocks
+				if app.Store != nil {
+					var err error
+					symbols, err = app.Store.GetWatchlist(ctx, watchlistName)
+					if err != nil || len(symbols) == 0 {
+						// Fallback to default stocks
+						symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC", "KOTAKBANK", "LT"}
+					}
+				} else {
 					symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC", "KOTAKBANK", "LT"}
 				}
-			} else {
-				symbols = []string{"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "ITC", "KOTAKBANK", "LT"}
+				output.Printf("  Scanning %d symbols from '%s' watchlist\n", len(symbols), watchlistName)
 			}
-
-			output.Printf("  Scanning %d symbols from '%s' watchlist\n", len(symbols), watchlistName)
 			output.Println()
 
 			var results []ScanResult
+			scanned := 0
+			errors := 0
+			startTime := time.Now()
 
 			for _, symbol := range symbols {
+				scanned++
+				
+				// Show progress for large scans
+				if len(symbols) > 50 && scanned%50 == 0 {
+					elapsed := time.Since(startTime)
+					rate := float64(scanned) / elapsed.Seconds()
+					remaining := time.Duration(float64(len(symbols)-scanned)/rate) * time.Second
+					output.Printf("\r  Progress: %d/%d (%.0f/s) | Found: %d | ETA: %s    ", 
+						scanned, len(symbols), rate, len(results), remaining.Round(time.Second))
+				}
+				
 				// Fetch historical data
 				candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
 					Symbol:    symbol,
@@ -1183,14 +1295,19 @@ PRESETS:
 					To:        time.Now(),
 				})
 				if err != nil || len(candles) < 15 {
+					errors++
 					continue
 				}
 
 				// Extract price data
 				closes := make([]float64, len(candles))
+				highs := make([]float64, len(candles))
+				lows := make([]float64, len(candles))
 				volumes := make([]int64, len(candles))
 				for i, c := range candles {
 					closes[i] = c.Close
+					highs[i] = c.High
+					lows[i] = c.Low
 					volumes[i] = c.Volume
 				}
 
@@ -1235,6 +1352,22 @@ PRESETS:
 						gap = ((currOpen - prevClose) / prevClose) * 100
 					}
 				}
+				
+				// Calculate ATR (14-period) as percentage of price
+				atr := calculateATR(highs, lows, closes, 14)
+				atrPct := 0.0
+				if currentPrice > 0 {
+					atrPct = (atr / currentPrice) * 100
+				}
+				
+				// Calculate today's range as percentage
+				dayRange := 0.0
+				if len(candles) > 0 {
+					lastCandle := candles[len(candles)-1]
+					if lastCandle.Low > 0 {
+						dayRange = ((lastCandle.High - lastCandle.Low) / lastCandle.Low) * 100
+					}
+				}
 
 				// Apply technical filters
 				if rsiBelow > 0 && rsi >= rsiBelow {
@@ -1250,6 +1383,14 @@ PRESETS:
 					continue
 				}
 				if gapDown > 0 && gap > -gapDown {
+					continue
+				}
+				
+				// Apply volatility filters
+				if minATR > 0 && atrPct < minATR {
+					continue
+				}
+				if minChange > 0 && (change < minChange && change > -minChange) {
 					continue
 				}
 				
@@ -1269,16 +1410,27 @@ PRESETS:
 					signal = "OVERBOUGHT"
 				} else if volRatio > 2.0 {
 					signal = "HIGH VOLUME"
+				} else if atrPct > 3.0 {
+					signal = "VOLATILE"
 				}
 
 				results = append(results, ScanResult{
-					Symbol: symbol,
-					LTP:    closes[len(closes)-1],
-					Change: change,
-					RSI:    rsi,
-					Volume: volRatio,
-					Signal: signal,
+					Symbol:   symbol,
+					LTP:      closes[len(closes)-1],
+					Change:   change,
+					RSI:      rsi,
+					Volume:   volRatio,
+					ATRPct:   atrPct,
+					DayRange: dayRange,
+					Signal:   signal,
 				})
+			}
+			
+			// Clear progress line
+			if len(symbols) > 50 {
+				output.Printf("\r                                                                    \r")
+				output.Printf("  Scanned %d stocks in %s, found %d matches\n\n", 
+					scanned, time.Since(startTime).Round(time.Second), len(results))
 			}
 			
 			// Sort results
@@ -1289,7 +1441,8 @@ PRESETS:
 				})
 			case "change":
 				sort.Slice(results, func(i, j int) bool {
-					return results[i].Change > results[j].Change
+					// Sort by absolute change for movers
+					return absFloat(results[i].Change) > absFloat(results[j].Change)
 				})
 			case "rsi":
 				sort.Slice(results, func(i, j int) bool {
@@ -1298,6 +1451,10 @@ PRESETS:
 			case "volume":
 				sort.Slice(results, func(i, j int) bool {
 					return results[i].Volume > results[j].Volume
+				})
+			case "atr", "volatile":
+				sort.Slice(results, func(i, j int) bool {
+					return results[i].ATRPct > results[j].ATRPct
 				})
 			}
 			
@@ -1315,12 +1472,17 @@ PRESETS:
 	}
 
 	// Technical filters
-	cmd.Flags().String("preset", "", "Use preset screener (momentum, oversold, overbought, breakout, reversal)")
+	cmd.Flags().String("preset", "", "Use preset screener (momentum, oversold, overbought, breakout, reversal, movers, volatile)")
 	cmd.Flags().Float64("rsi-below", 0, "RSI below threshold")
 	cmd.Flags().Float64("rsi-above", 0, "RSI above threshold")
 	cmd.Flags().Float64("volume-above", 0, "Volume multiple above average")
 	cmd.Flags().Float64("gap-up", 0, "Gap up percentage")
 	cmd.Flags().Float64("gap-down", 0, "Gap down percentage")
+	
+	// Volatility filters (for day trading)
+	cmd.Flags().Bool("volatile", false, "Show volatile stocks (ATR > 2%)")
+	cmd.Flags().Float64("min-atr", 0, "Minimum ATR percentage (volatility filter)")
+	cmd.Flags().Float64("min-change", 0, "Minimum absolute change percentage")
 	
 	// Price filters
 	cmd.Flags().Float64("min-price", 0, "Minimum stock price")
@@ -1335,33 +1497,245 @@ PRESETS:
 	
 	// Output options
 	cmd.Flags().Int("limit", 0, "Limit number of results")
-	cmd.Flags().String("sort", "", "Sort by: price, change, rsi, volume")
+	cmd.Flags().String("sort", "", "Sort by: price, change, rsi, volume, atr")
 	
+	// Scope options
+	cmd.Flags().Bool("all", false, "Scan ALL NSE equity stocks (takes time)")
+	cmd.Flags().String("index", "", "Scan index constituents (nifty50, nifty100, nifty200)")
 	cmd.Flags().String("watchlist", "", "Scan specific watchlist (default: 'default')")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 
 	return cmd
 }
 
+// getIndexConstituents returns the stock symbols for a given index
+func getIndexConstituents(indexName string) []string {
+	switch strings.ToLower(indexName) {
+	case "nifty50", "nifty-50", "nifty 50":
+		return []string{
+			"ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
+			"BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BPCL", "BHARTIARTL",
+			"BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY",
+			"EICHERMOT", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE",
+			"HEROMOTOCO", "HINDALCO", "HINDUNILVR", "ICICIBANK", "ITC",
+			"INDUSINDBK", "INFY", "JSWSTEEL", "KOTAKBANK", "LT",
+			"M&M", "MARUTI", "NTPC", "NESTLEIND", "ONGC",
+			"POWERGRID", "RELIANCE", "SBILIFE", "SBIN", "SUNPHARMA",
+			"TCS", "TATACONSUM", "TATAMOTORS", "TATASTEEL", "TECHM",
+			"TITAN", "ULTRACEMCO", "UPL", "WIPRO", "ZOMATO",
+		}
+	case "nifty100", "nifty-100", "nifty 100":
+		// Nifty 50 + Next 50
+		nifty50 := getIndexConstituents("nifty50")
+		next50 := []string{
+			"ABB", "ADANIGREEN", "AMBUJACEM", "AUROPHARMA", "BAJAJHLDNG",
+			"BANKBARODA", "BEL", "BERGEPAINT", "BOSCHLTD", "CANBK",
+			"CHOLAFIN", "COLPAL", "DLF", "DABUR", "GAIL",
+			"GODREJCP", "HAVELLS", "HINDPETRO", "ICICIPRULI", "ICICIGI",
+			"IDEA", "INDIGO", "IOC", "IRCTC", "JINDALSTEL",
+			"LICI", "LUPIN", "MARICO", "MCDOWELL-N", "MOTHERSON",
+			"NAUKRI", "NHPC", "NMDC", "OBEROIRLTY", "OFSS",
+			"PAGEIND", "PETRONET", "PIDILITIND", "PNB", "POLYCAB",
+			"RECLTD", "SAIL", "SBICARD", "SHREECEM", "SIEMENS",
+			"SRF", "TATAPOWER", "TORNTPHARM", "TRENT", "VEDL",
+		}
+		return append(nifty50, next50...)
+	case "nifty200", "nifty-200", "nifty 200":
+		// Nifty 100 + additional 100 stocks
+		nifty100 := getIndexConstituents("nifty100")
+		additional := []string{
+			"ACC", "ALKEM", "APOLLOTYRE", "ASHOKLEY", "ASTRAL",
+			"ATUL", "AUBANK", "AUROPHARMA", "BALKRISIND", "BANDHANBNK",
+			"BATAINDIA", "BHARATFORG", "BHEL", "BIOCON", "CANFINHOME",
+			"CGPOWER", "CHAMBLFERT", "COFORGE", "CONCOR", "CROMPTON",
+			"CUMMINSIND", "DEEPAKNTR", "DELHIVERY", "DIXON", "ESCORTS",
+			"EXIDEIND", "FEDERALBNK", "FORTIS", "GLAND", "GLAXO",
+			"GMRINFRA", "GODREJPROP", "GSPL", "GUJGASLTD", "HAL",
+			"HDFCAMC", "HONAUT", "IDFCFIRSTB", "IEX", "INDHOTEL",
+			"INDUSTOWER", "IPCA", "IRFC", "ISEC", "JKCEMENT",
+			"JSL", "JUBLFOOD", "KAJARIACER", "KEI", "KPITTECH",
+			"L&TFH", "LAURUSLABS", "LICHSGFIN", "LTIM", "LTTS",
+			"M&MFIN", "MANAPPURAM", "MFSL", "MGL", "MPHASIS",
+			"MRF", "MUTHOOTFIN", "NAM-INDIA", "NATIONALUM", "NAVINFLUOR",
+			"NYKAA", "OIL", "PAYTM", "PEL", "PERSISTENT",
+			"PFC", "PIIND", "PNB", "POLYCAB", "PRESTIGE",
+			"PVRINOX", "RAMCOCEM", "RBLBANK", "RELAXO", "SCHAEFFLER",
+			"SHRIRAMFIN", "SONACOMS", "STARHEALTH", "SUMICHEM", "SUNDARMFIN",
+			"SUNDRMFAST", "SUPREMEIND", "SYNGENE", "TATACHEM", "TATACOMM",
+			"TATAELXSI", "THERMAX", "TIINDIA", "TIMKEN", "TORNTPOWER",
+			"TVSMOTOR", "UBL", "UNIONBANK", "UNITDSPR", "VOLTAS",
+		}
+		return append(nifty100, additional...)
+	case "banknifty", "bank-nifty", "bank nifty":
+		return []string{
+			"AUBANK", "AXISBANK", "BANDHANBNK", "BANKBARODA", "FEDERALBNK",
+			"HDFCBANK", "ICICIBANK", "IDFCFIRSTB", "INDUSINDBK", "KOTAKBANK",
+			"PNB", "SBIN",
+		}
+	case "nifty500", "nifty-500", "nifty 500":
+		// Nifty 200 + additional 300 stocks (major NSE stocks)
+		nifty200 := getIndexConstituents("nifty200")
+		additional := []string{
+			// Additional 300 stocks from Nifty 500
+			"3MINDIA", "ABORTIONCL", "ABSLAMC", "AFFLE", "AIAENG",
+			"AJANTPHARM", "AKZOINDIA", "AMARAJABAT", "AMBER", "APLAPOLLO",
+			"APTUS", "ARE&M", "ASAHIINDIA", "ASHOKA", "ASTRAZEN",
+			"ATUL", "AVANTIFEED", "BASF", "BAYERCROP", "BBTC",
+			"BDL", "BEML", "BLUESTARCO", "BRIGADE", "BSE",
+			"BSOFT", "CAMPUS", "CARBORUNIV", "CASTROLIND", "CEATLTD",
+			"CENTRALBK", "CENTURYTEX", "CERA", "CHALET", "CLEAN",
+			"COCHINSHIP", "COROMANDEL", "CREDITACC", "CRISIL", "CYIENT",
+			"DATAPATTNS", "DCMSHRIRAM", "DEVYANI", "DMART", "EASEMYTRIP",
+			"ECLERX", "EDELWEISS", "EIDPARRY", "ELECON", "ELGIEQUIP",
+			"EMAMILTD", "ENDURANCE", "ENGINERSIN", "EPIGRAL", "EQUITASBNK",
+			"ERIS", "FINCABLES", "FINPIPE", "FIRSTSOUR", "FIVESTAR",
+			"FLUOROCHEM", "FOSECOIND", "FSL", "GALAXYSURF", "GARFIBRES",
+			"GATEWAY", "GESHIP", "GILLETTE", "GLENMARK", "GLOBUSSPR",
+			"GNFC", "GODFRYPHLP", "GODREJAGRO", "GODREJIND", "GPPL",
+			"GRANULES", "GRAPHITE", "GRINDWELL", "GRSE", "GSFC",
+			"GUJALKALI", "HAPPSTMNDS", "HATSUN", "HEG", "HEIDELBERG",
+			"HFCL", "HIKAL", "HINDCOPPER", "HINDZINC", "HOMEFIRST",
+			"HUDCO", "IBREALEST", "IBULHSGFIN", "ICRA", "IDBI",
+			"IFBIND", "IIFL", "IIFLWAM", "INDIACEM", "INDIAMART",
+			"INDIANB", "INDIGOPNTS", "INFIBEAM", "INTELLECT", "IPCALAB",
+			"IRB", "IRCON", "ISEC", "ITI", "J&KBANK",
+			"JAMNAAUTO", "JBCHEPHARM", "JBMA", "JINDALSAW", "JKLAKSHMI",
+			"JKPAPER", "JMFINANCIL", "JSWENERGY", "JTEKTINDIA", "JUSTDIAL",
+			"JYOTHYLAB", "KALYANKJIL", "KANSAINER", "KARURVYSYA", "KEC",
+			"KFINTECH", "KIRLOSENG", "KNRCON", "KPIL", "KRBL",
+			"KSB", "LATENTVIEW", "LAXMIMACH", "LEMONTREE", "LINDEINDIA",
+			"LLOYDSME", "LUXIND", "MAHABANK", "MAHINDCIE", "MAHLIFE",
+			"MAHLOG", "MAHSEAMLES", "MAITHANALL", "MAPMYINDIA", "MASTEK",
+			"MAXHEALTH", "MAZDOCK", "MCX", "MEDANTA", "MEDPLUS",
+			"METROPOLIS", "MIDHANI", "MINDACORP", "MMTC", "MOIL",
+			"MOTILALOFS", "MPHASIS", "MRPL", "MSUMI", "MTARTECH",
+			"NATCOPHARM", "NAUKRI", "NAVNETEDUL", "NBCC", "NCC",
+			"NETWORK18", "NH", "NLCINDIA", "NOCIL", "NUVOCO",
+			"OBEROIRLTY", "OLECTRA", "ORIENTELEC", "ORIENTCEM", "PARAS",
+			"PATANJALI", "PCBL", "PDSL", "PGHH", "PHOENIXLTD",
+			"PNBHOUSING", "POLYMED", "POONAWALLA", "POWERINDIA", "PPLPHARMA",
+			"PRINCEPIPE", "PRSMJOHNSN", "QUESS", "RADICO", "RAIN",
+			"RAJESHEXPO", "RALLIS", "RATNAMANI", "RAYMOND", "REDINGTON",
+			"RELAXO", "RENUKA", "RITES", "RKFORGE", "ROUTE",
+			"RPOWER", "SAFARI", "SAGCEM", "SANOFI", "SAPPHIRE",
+			"SAREGAMA", "SBICARD", "SCHNEIDER", "SEQUENT", "SHARDACROP",
+			"SHILPAMED", "SHOPERSTOP", "SHYAMMETL", "SJVN", "SKFINDIA",
+			"SOBHA", "SOLARA", "SONATSOFTW", "SOUTHBANK", "SPARC",
+			"SPANDANA", "SPLPETRO", "STAR", "STLTECH", "SUDARSCHEM",
+			"SUNDRMFAST", "SUNFLAG", "SUNTV", "SUPRAJIT", "SUPRIYA",
+			"SUVENPHAR", "SWANENERGY", "SYMPHONY", "TANLA", "TATACOFFEE",
+			"TATAINVEST", "TATATECH", "TCNSBRANDS", "TEAMLEASE", "TECHNOE",
+			"TEGA", "THANGAMAYL", "THYROCARE", "TI", "TINPLATE",
+			"TMB", "TORNTPOWER", "TRENT", "TRIDENT", "TRITURBINE",
+			"TRIVENI", "TTKPRESTIG", "TV18BRDCST", "UCOBANK", "UFLEX",
+			"UJJIVAN", "UJJIVANSFB", "UNIONBANK", "UNOMINDA", "UPL",
+			"UTIAMC", "VAIBHAVGBL", "VAKRANGEE", "VARROC", "VBL",
+			"VEDL", "VENKEYS", "VGUARD", "VINATIORGA", "VIPIND",
+			"VMART", "VOLTAMP", "VSTIND", "WELCORP", "WELSPUNIND",
+			"WESTLIFE", "WHIRLPOOL", "WOCKPHARMA", "YESBANK", "ZEEL",
+			"ZENSARTECH", "ZFCVINDIA", "ZOMATO", "ZYDUSLIFE",
+		}
+		return append(nifty200, additional...)
+	case "fno", "f&o":
+		// F&O stocks - most liquid stocks with derivatives
+		return []string{
+			"AARTIIND", "ABB", "ABBOTINDIA", "ABCAPITAL", "ABFRL",
+			"ACC", "ADANIENT", "ADANIPORTS", "ALKEM", "AMBUJACEM",
+			"APOLLOHOSP", "APOLLOTYRE", "ASHOKLEY", "ASIANPAINT", "ASTRAL",
+			"ATUL", "AUBANK", "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO",
+			"BAJAJFINSV", "BAJFINANCE", "BALKRISIND", "BANDHANBNK", "BANKBARODA",
+			"BATAINDIA", "BEL", "BERGEPAINT", "BHARATFORG", "BHARTIARTL",
+			"BHEL", "BIOCON", "BOSCHLTD", "BPCL", "BRITANNIA",
+			"BSOFT", "CANBK", "CANFINHOME", "CHAMBLFERT", "CHOLAFIN",
+			"CIPLA", "COALINDIA", "COFORGE", "COLPAL", "CONCOR",
+			"COROMANDEL", "CROMPTON", "CUB", "CUMMINSIND", "DABUR",
+			"DALBHARAT", "DEEPAKNTR", "DELTACORP", "DIVISLAB", "DIXON",
+			"DLF", "DRREDDY", "EICHERMOT", "ESCORTS", "EXIDEIND",
+			"FEDERALBNK", "GAIL", "GLENMARK", "GMRINFRA", "GNFC",
+			"GODREJCP", "GODREJPROP", "GRANULES", "GRASIM", "GUJGASLTD",
+			"HAL", "HAVELLS", "HCLTECH", "HDFCAMC", "HDFCBANK",
+			"HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDCOPPER", "HINDPETRO",
+			"HINDUNILVR", "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDEA",
+			"IDFC", "IDFCFIRSTB", "IEX", "IGL", "INDHOTEL",
+			"INDIACEM", "INDIAMART", "INDIGO", "INDUSINDBK", "INDUSTOWER",
+			"INFY", "IOC", "IPCALAB", "IRCTC", "ITC",
+			"JINDALSTEL", "JKCEMENT", "JSWSTEEL", "JUBLFOOD", "KOTAKBANK",
+			"LALPATHLAB", "LAURUSLABS", "LICHSGFIN", "LT", "LTIM",
+			"LTTS", "LUPIN", "M&M", "M&MFIN", "MANAPPURAM",
+			"MARICO", "MARUTI", "MCDOWELL-N", "MCX", "METROPOLIS",
+			"MFSL", "MGL", "MOTHERSON", "MPHASIS", "MRF",
+			"MUTHOOTFIN", "NATIONALUM", "NAUKRI", "NAVINFLUOR", "NESTLEIND",
+			"NMDC", "NTPC", "OBEROIRLTY", "OFSS", "ONGC",
+			"PAGEIND", "PEL", "PERSISTENT", "PETRONET", "PFC",
+			"PIDILITIND", "PIIND", "PNB", "POLYCAB", "POWERGRID",
+			"PVRINOX", "RAMCOCEM", "RBLBANK", "RECLTD", "RELIANCE",
+			"SAIL", "SBICARD", "SBILIFE", "SBIN", "SHREECEM",
+			"SHRIRAMFIN", "SIEMENS", "SRF", "SUNPHARMA", "SUNTV",
+			"SYNGENE", "TATACHEM", "TATACOMM", "TATACONSUM", "TATAELXSI",
+			"TATAMOTORS", "TATAPOWER", "TATASTEEL", "TCS", "TECHM",
+			"TITAN", "TORNTPHARM", "TRENT", "TVSMOTOR", "UBL",
+			"ULTRACEMCO", "UNIONBANK", "UPL", "VEDL", "VOLTAS",
+			"WIPRO", "ZEEL", "ZYDUSLIFE",
+		}
+	case "smallcap", "small-cap", "small cap":
+		// Popular small-cap stocks
+		return []string{
+			"AARTIDRUGS", "AFFLE", "AJANTPHARM", "ALKYLAMINE", "AMBER",
+			"ANGELONE", "APTUS", "ASTERDM", "ASTRAZEN", "AVANTIFEED",
+			"BANARISUG", "BASF", "BCG", "BEML", "BLUESTARCO",
+			"BRIGADE", "CAMPUS", "CARBORUNIV", "CEATLTD", "CENTURYTEX",
+			"CERA", "CHALET", "CLEAN", "COCHINSHIP", "CREDITACC",
+			"CRISIL", "CYIENT", "DATAPATTNS", "DCMSHRIRAM", "DEVYANI",
+			"EASEMYTRIP", "ECLERX", "EDELWEISS", "EIDPARRY", "ELECON",
+			"ELGIEQUIP", "EMAMILTD", "ENDURANCE", "ENGINERSIN", "EPIGRAL",
+			"EQUITASBNK", "ERIS", "FINCABLES", "FINPIPE", "FIRSTSOUR",
+			"FIVESTAR", "FLUOROCHEM", "FSL", "GALAXYSURF", "GARFIBRES",
+			"GATEWAY", "GESHIP", "GLENMARK", "GLOBUSSPR", "GNFC",
+			"GODFRYPHLP", "GODREJAGRO", "GODREJIND", "GPPL", "GRANULES",
+			"GRAPHITE", "GRINDWELL", "GRSE", "GSFC", "GUJALKALI",
+			"HAPPSTMNDS", "HATSUN", "HEG", "HEIDELBERG", "HFCL",
+			"HIKAL", "HINDCOPPER", "HINDZINC", "HOMEFIRST", "HUDCO",
+			"IBREALEST", "ICRA", "IDBI", "IFBIND", "IIFL",
+			"INDIACEM", "INDIAMART", "INDIANB", "INDIGOPNTS", "INFIBEAM",
+			"INTELLECT", "IRB", "IRCON", "ITI", "J&KBANK",
+			"JAMNAAUTO", "JBCHEPHARM", "JINDALSAW", "JKLAKSHMI", "JKPAPER",
+			"JMFINANCIL", "JSWENERGY", "JUSTDIAL", "JYOTHYLAB", "KALYANKJIL",
+		}
+	default:
+		return nil
+	}
+}
+
 type ScanResult struct {
-	Symbol string
-	LTP    float64
-	Change float64
-	RSI    float64
-	Volume float64
-	Signal string
+	Symbol    string
+	LTP       float64
+	Change    float64
+	RSI       float64
+	Volume    float64
+	ATRPct    float64 // ATR as percentage of price (volatility measure)
+	DayRange  float64 // Today's high-low range as percentage
+	Signal    string
 }
 
 func displayScanResults(output *Output, results []ScanResult) error {
 	output.Bold("Scan Results")
 	output.Printf("  Found %d stocks\n\n", len(results))
 
-	table := NewTable(output, "Symbol", "LTP", "Change", "RSI", "Volume", "Signal")
+	table := NewTable(output, "Symbol", "LTP", "Change", "ATR%", "RSI", "Volume", "Signal")
 	for _, r := range results {
+		// Color ATR based on volatility level
+		atrColor := ColorYellow
+		if r.ATRPct > 3.0 {
+			atrColor = ColorGreen // High volatility - good for day trading
+		} else if r.ATRPct < 1.5 {
+			atrColor = ColorRed // Low volatility
+		}
+		
 		table.AddRow(
 			r.Symbol,
 			FormatPrice(r.LTP),
 			output.ColoredString(output.PnLColor(r.Change), FormatPercent(r.Change)),
+			output.ColoredString(atrColor, fmt.Sprintf("%.1f%%", r.ATRPct)),
 			fmt.Sprintf("%.1f", r.RSI),
 			fmt.Sprintf("%.1fx", r.Volume),
 			r.Signal,
@@ -1969,6 +2343,14 @@ func getLastValue(data []float64) float64 {
 		return 0
 	}
 	return data[len(data)-1]
+}
+
+// absFloat returns the absolute value of a float64
+func absFloat(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // detectPatterns detects candlestick patterns in the data

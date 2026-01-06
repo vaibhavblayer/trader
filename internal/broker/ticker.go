@@ -37,7 +37,8 @@ type ZerodhaTicker struct {
 	maxRetries   int
 	baseDelay    time.Duration
 	
-	mu sync.RWMutex
+	mu      sync.RWMutex
+	writeMu sync.Mutex // Protects websocket writes (Subscribe, SetMode)
 }
 
 // ZerodhaTickerConfig holds configuration for the ticker.
@@ -86,11 +87,16 @@ func (t *ZerodhaTicker) Connect(ctx context.Context) error {
 	// Channel to signal connection
 	connectedCh := make(chan struct{})
 	
+	// Track first connection
+	firstConnect := true
+	
 	// Set up callbacks
 	t.ticker.OnConnect(func() {
 		t.mu.Lock()
 		t.connected = true
 		t.reconnecting = false
+		isFirst := firstConnect
+		firstConnect = false
 		t.mu.Unlock()
 		
 		// Signal connection
@@ -99,8 +105,13 @@ func (t *ZerodhaTicker) Connect(ctx context.Context) error {
 		default:
 		}
 		
-		// Resubscribe to previously subscribed symbols
-		t.resubscribe()
+		// On reconnection, resubscribe to previously subscribed symbols
+		// On first connection, the external handler will subscribe
+		if !isFirst {
+			t.resubscribe()
+			// Don't call external onConnect on reconnection to avoid duplicate subscriptions
+			return
+		}
 		
 		if t.onConnect != nil {
 			go t.onConnect()
@@ -178,9 +189,9 @@ func (t *ZerodhaTicker) Disconnect() error {
 // Subscribe subscribes to symbols with the specified mode.
 func (t *ZerodhaTicker) Subscribe(symbols []string, mode TickMode) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	
 	if !t.connected {
+		t.mu.Unlock()
 		return fmt.Errorf("not connected")
 	}
 	
@@ -194,10 +205,15 @@ func (t *ZerodhaTicker) Subscribe(symbols []string, mode TickMode) error {
 		tokens = append(tokens, token)
 		t.subscribed[token] = mode
 	}
+	t.mu.Unlock()
 	
 	if len(tokens) == 0 {
 		return nil
 	}
+	
+	// Lock for websocket writes
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	
 	// Subscribe to tokens
 	if err := t.ticker.Subscribe(tokens); err != nil {
@@ -220,9 +236,9 @@ func (t *ZerodhaTicker) Subscribe(symbols []string, mode TickMode) error {
 // Unsubscribe unsubscribes from symbols.
 func (t *ZerodhaTicker) Unsubscribe(symbols []string) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	
 	if !t.connected {
+		t.mu.Unlock()
 		return fmt.Errorf("not connected")
 	}
 	
@@ -234,10 +250,15 @@ func (t *ZerodhaTicker) Unsubscribe(symbols []string) error {
 			delete(t.subscribed, token)
 		}
 	}
+	t.mu.Unlock()
 	
 	if len(tokens) == 0 {
 		return nil
 	}
+	
+	// Lock for websocket writes
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	
 	if err := t.ticker.Unsubscribe(tokens); err != nil {
 		return fmt.Errorf("failed to unsubscribe: %w", err)
@@ -409,6 +430,10 @@ func (t *ZerodhaTicker) resubscribe() {
 			quoteTokens = append(quoteTokens, token)
 		}
 	}
+	
+	// Lock for websocket writes
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	
 	// Subscribe and set modes
 	if len(quoteTokens) > 0 {
