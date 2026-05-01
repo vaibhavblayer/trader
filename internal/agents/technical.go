@@ -136,14 +136,36 @@ func (a *TechnicalAgent) ruleBasedAnalysis(req AnalysisRequest) (*AnalysisResult
 		baseScore = req.SignalScore.Score
 	}
 
-	// Adjust based on patterns
+	// Adjust based on patterns (with reliability weighting)
 	patternScore := a.analyzePatterns(req.Patterns)
-	
+
 	// Adjust based on levels
 	levelScore := a.analyzeLevels(req)
 
-	// Combine scores
-	totalScore := baseScore*0.5 + patternScore*0.3 + levelScore*0.2
+	// Market regime adjustment: trend-following signals are stronger in trending
+	// regimes, mean-reversion signals are stronger in ranging regimes
+	regimeFactor := 1.0
+	if req.MarketState != nil {
+		switch req.MarketState.MarketRegime {
+		case RegimeTrendingUp:
+			if baseScore > 0 {
+				regimeFactor = 1.2 // boost bullish signals in uptrend
+			} else if baseScore < 0 {
+				regimeFactor = 0.7 // dampen bearish signals in uptrend
+			}
+		case RegimeTrendingDown:
+			if baseScore < 0 {
+				regimeFactor = 1.2
+			} else if baseScore > 0 {
+				regimeFactor = 0.7
+			}
+		case RegimeHighVolatility:
+			regimeFactor = 0.6 // reduce all signals in high vol
+		}
+	}
+
+	// Combine scores with regime adjustment
+	totalScore := (baseScore*0.5 + patternScore*0.3 + levelScore*0.2) * regimeFactor
 
 	// Determine recommendation
 	var reasoning strings.Builder
@@ -158,8 +180,13 @@ func (a *TechnicalAgent) ruleBasedAnalysis(req AnalysisRequest) (*AnalysisResult
 		reasoning.WriteString("Mixed signals, no clear direction. ")
 	}
 
-	// Calculate confidence based on signal strength
-	result.Confidence = ClampConfidence(50 + abs(totalScore)/2)
+	// Calculate confidence: higher absolute score = higher confidence
+	// but cap it — rule-based analysis shouldn't claim >85% confidence
+	rawConf := 50 + abs(totalScore)/2
+	if rawConf > 85 {
+		rawConf = 85
+	}
+	result.Confidence = ClampConfidence(rawConf)
 
 	// Add pattern analysis to reasoning
 	if len(req.Patterns) > 0 {
@@ -169,6 +196,11 @@ func (a *TechnicalAgent) ruleBasedAnalysis(req AnalysisRequest) (*AnalysisResult
 	// Add signal score to reasoning
 	if req.SignalScore != nil {
 		reasoning.WriteString(fmt.Sprintf("Signal score: %.1f (%s). ", req.SignalScore.Score, req.SignalScore.Recommendation))
+	}
+
+	// Add regime context
+	if req.MarketState != nil {
+		reasoning.WriteString(fmt.Sprintf("Market regime: %s. ", req.MarketState.MarketRegime))
 	}
 
 	result.Reasoning = reasoning.String()
@@ -182,29 +214,63 @@ func (a *TechnicalAgent) ruleBasedAnalysis(req AnalysisRequest) (*AnalysisResult
 	return result, nil
 }
 
-// analyzePatterns scores the detected patterns.
+// analyzePatterns scores the detected patterns, weighted by reliability.
+// Reversal patterns near S/R levels are stronger. Continuation patterns
+// in a trending regime are stronger. Conflicting patterns cancel out.
 func (a *TechnicalAgent) analyzePatterns(patterns []analysis.Pattern) float64 {
 	if len(patterns) == 0 {
 		return 0
 	}
 
-	var score float64
+	var bullishScore, bearishScore float64
+	var bullishCount, bearishCount int
+
 	for _, p := range patterns {
-		patternScore := p.Strength * 100
+		// Base score from pattern strength (0-1)
+		weight := p.Strength
+
+		// Boost completed patterns, penalize incomplete ones
+		if p.Completion > 0 {
+			weight *= p.Completion
+		}
+
+		// Volume-confirmed patterns are more reliable
+		if p.VolumeConfirm {
+			weight *= 1.3
+		}
+
 		switch p.Direction {
 		case analysis.PatternBullish:
-			score += patternScore
+			bullishScore += weight * 100
+			bullishCount++
 		case analysis.PatternBearish:
-			score -= patternScore
+			bearishScore += weight * 100
+			bearishCount++
 		}
 	}
 
-	// Normalize to -100 to 100
-	if len(patterns) > 0 {
-		score /= float64(len(patterns))
+	// If both bullish and bearish patterns are present, they partially cancel
+	// but the stronger side still wins with reduced confidence
+	if bullishCount > 0 && bearishCount > 0 {
+		// Conflicting patterns: reduce the net score
+		net := bullishScore - bearishScore
+		// Apply a conflict penalty proportional to the weaker side
+		weaker := bullishScore
+		if bearishScore < weaker {
+			weaker = bearishScore
+		}
+		conflictPenalty := weaker * 0.5 // 50% of the weaker signal cancels out
+		if net > 0 {
+			net -= conflictPenalty
+		} else {
+			net += conflictPenalty
+		}
+		return clampScore(net/float64(len(patterns)), -100, 100)
 	}
 
-	return score
+	// No conflict: normalize by count
+	score := (bullishScore - bearishScore) / float64(len(patterns))
+	return clampScore(score, -100, 100)
 }
 
 // analyzeLevels scores based on support/resistance proximity.
@@ -251,55 +317,88 @@ func (a *TechnicalAgent) summarizePatterns(patterns []analysis.Pattern) string {
 }
 
 // calculateTradeLevels sets entry, stop-loss, and targets based on analysis.
+// Uses ATR-based dynamic stops when indicator data is available, falling back
+// to support/resistance levels, then to fixed percentages.
 func (a *TechnicalAgent) calculateTradeLevels(result *AnalysisResult, req AnalysisRequest) {
 	price := req.CurrentPrice
 
+	// Try to get ATR for dynamic stop-loss sizing
+	atrPercent := 0.0
+	if atrVals, ok := req.Indicators["ATR_14"]; ok && len(atrVals) > 0 {
+		lastATR := atrVals[len(atrVals)-1]
+		if lastATR > 0 && price > 0 {
+			atrPercent = lastATR / price
+		}
+	}
+
 	if result.Recommendation == Buy {
 		result.EntryPrice = price
-		
-		// Stop-loss below nearest support or 2% below entry
-		if req.Levels != nil && req.Levels.NearestSupport > 0 {
-			result.StopLoss = req.Levels.NearestSupport * 0.99 // 1% below support
+
+		// Stop-loss: prefer ATR-based, then S/R-based, then fixed %
+		if atrPercent > 0 {
+			// 2x ATR below entry — adapts to current volatility
+			result.StopLoss = price * (1 - 2*atrPercent)
+		} else if req.Levels != nil && req.Levels.NearestSupport > 0 {
+			result.StopLoss = req.Levels.NearestSupport * 0.99
 		} else {
-			result.StopLoss = price * 0.98 // 2% below entry
+			result.StopLoss = price * 0.98
 		}
 
-		// Targets based on resistance or percentage
+		// Targets: prefer R:R multiples of risk, anchored to resistance if available
+		risk := price - result.StopLoss
+		if risk <= 0 {
+			risk = price * 0.02
+		}
+
 		if req.Levels != nil && req.Levels.NearestResistance > 0 {
+			t1 := req.Levels.NearestResistance
+			// Ensure T1 gives at least 1:1 R:R
+			if t1-price < risk {
+				t1 = price + risk
+			}
 			result.Targets = []float64{
-				req.Levels.NearestResistance,
-				req.Levels.NearestResistance * 1.02,
-				req.Levels.NearestResistance * 1.05,
+				t1,
+				price + risk*2.5,
+				price + risk*4,
 			}
 		} else {
 			result.Targets = []float64{
-				price * 1.02, // 2%
-				price * 1.04, // 4%
-				price * 1.06, // 6%
+				price + risk*1.5,
+				price + risk*2.5,
+				price + risk*4,
 			}
 		}
 	} else if result.Recommendation == Sell {
 		result.EntryPrice = price
 
-		// Stop-loss above nearest resistance or 2% above entry
-		if req.Levels != nil && req.Levels.NearestResistance > 0 {
-			result.StopLoss = req.Levels.NearestResistance * 1.01 // 1% above resistance
+		if atrPercent > 0 {
+			result.StopLoss = price * (1 + 2*atrPercent)
+		} else if req.Levels != nil && req.Levels.NearestResistance > 0 {
+			result.StopLoss = req.Levels.NearestResistance * 1.01
 		} else {
-			result.StopLoss = price * 1.02 // 2% above entry
+			result.StopLoss = price * 1.02
 		}
 
-		// Targets based on support or percentage
+		risk := result.StopLoss - price
+		if risk <= 0 {
+			risk = price * 0.02
+		}
+
 		if req.Levels != nil && req.Levels.NearestSupport > 0 {
+			t1 := req.Levels.NearestSupport
+			if price-t1 < risk {
+				t1 = price - risk
+			}
 			result.Targets = []float64{
-				req.Levels.NearestSupport,
-				req.Levels.NearestSupport * 0.98,
-				req.Levels.NearestSupport * 0.95,
+				t1,
+				price - risk*2.5,
+				price - risk*4,
 			}
 		} else {
 			result.Targets = []float64{
-				price * 0.98, // 2%
-				price * 0.96, // 4%
-				price * 0.94, // 6%
+				price - risk*1.5,
+				price - risk*2.5,
+				price - risk*4,
 			}
 		}
 	}

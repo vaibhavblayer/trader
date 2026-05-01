@@ -85,11 +85,11 @@ type PortfolioGreeks struct {
 
 // HedgeSuggestion represents a hedging suggestion.
 type HedgeSuggestion struct {
-	Type        string
-	Symbol      string
-	Action      string
-	Quantity    int
-	Reason      string
+	Type         string
+	Symbol       string
+	Action       string
+	Quantity     int
+	Reason       string
 	ExpectedCost float64
 }
 
@@ -100,37 +100,73 @@ type BacktestEngine interface {
 
 // BacktestConfig represents backtesting configuration.
 type BacktestConfig struct {
-	Symbol        string
-	StartDate     time.Time
-	EndDate       time.Time
+	Symbol         string
+	StartDate      time.Time
+	EndDate        time.Time
 	InitialCapital float64
-	Strategy      string
-	Parameters    map[string]interface{}
-	Slippage      float64
-	Commission    float64
+	Strategy       string
+	Parameters     map[string]interface{}
+	Slippage       float64 // as fraction, e.g. 0.001 = 0.1%
+	Commission     float64 // as fraction, e.g. 0.0003 = 0.03%
+
+	// Risk management
+	StopLossPercent    float64 // e.g. 3.0 means 3% stop loss
+	TakeProfitPercent  float64 // e.g. 6.0 means 6% take profit
+	TrailingStopPercent float64 // e.g. 2.0 means 2% trailing stop
+	MaxPositionPercent float64 // max % of capital per trade (default 95)
+	AllowShort         bool    // allow short selling
 }
 
 // BacktestResult represents backtesting results.
 type BacktestResult struct {
-	TotalReturn     float64
+	// Core metrics
+	TotalReturn      float64
 	AnnualizedReturn float64
-	WinRate         float64
-	MaxDrawdown     float64
-	SharpeRatio     float64
-	TotalTrades     int
-	WinningTrades   int
-	LosingTrades    int
-	AvgWin          float64
-	AvgLoss         float64
-	ProfitFactor    float64
-	EquityCurve     []EquityPoint
-	Trades          []BacktestTrade
+	WinRate          float64
+	MaxDrawdown      float64
+	SharpeRatio      float64
+	SortinoRatio     float64
+	CalmarRatio      float64
+
+	// Trade counts
+	TotalTrades   int
+	WinningTrades int
+	LosingTrades  int
+
+	// P&L
+	GrossProfit  float64
+	GrossLoss    float64
+	NetProfit    float64
+	AvgWin       float64
+	AvgLoss      float64
+	LargestWin   float64
+	LargestLoss  float64
+	ProfitFactor float64
+	Expectancy   float64
+
+	// Streaks
+	MaxConsecutiveWins   int
+	MaxConsecutiveLosses int
+
+	// Time
+	AvgHoldBars    int
+	AvgWinHoldBars int
+	AvgLossHoldBars int
+
+	// Capital
+	StartCapital float64
+	EndCapital   float64
+
+	// Curves
+	EquityCurve []EquityPoint
+	Trades      []BacktestTrade
 }
 
 // EquityPoint represents a point on the equity curve.
 type EquityPoint struct {
 	Timestamp time.Time
 	Equity    float64
+	Drawdown  float64 // current drawdown as fraction
 }
 
 // BacktestTrade represents a trade in backtesting.
@@ -144,4 +180,6 @@ type BacktestTrade struct {
 	Quantity   int
 	PnL        float64
 	PnLPercent float64
+	ExitReason string
+	HoldBars   int
 }

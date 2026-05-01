@@ -73,11 +73,47 @@ func (a *TraderAgent) MakeFinalDecision(ctx context.Context, req AnalysisRequest
 		}
 	}
 
-	// Calculate consensus
+	// Calculate consensus with conviction scoring
 	consensus := a.calculateConsensus(agentResults)
 	decision.Consensus = consensus
-	decision.Action = string(a.determineAction(consensus))
+	action := a.determineAction(consensus)
+	decision.Action = string(action)
 	decision.Confidence = consensus.WeightedScore
+	decision.ConflictingCount = consensus.TotalAgents - consensus.AgreeingAgents
+
+	// Consolidate entry/SL/targets from agreeing agents
+	if action == Buy || action == Sell {
+		decision.EntryPrice = a.GetBestEntry(agentResults, action)
+		decision.StopLoss = a.GetBestStopLoss(agentResults, action)
+		decision.Targets = a.GetBestTargets(agentResults, action)
+
+		if decision.EntryPrice > 0 && decision.StopLoss > 0 && len(decision.Targets) > 0 {
+			decision.RiskRewardRatio = CalculateRiskReward(
+				decision.EntryPrice, decision.StopLoss, decision.Targets, action == Buy,
+			)
+		}
+	}
+
+	// Capture market context at decision time
+	if req.MarketState != nil {
+		decision.MarketCondition = req.MarketState.MarketTrend
+		decision.MarketRegime = string(req.MarketState.MarketRegime)
+		decision.VIXAtDecision = req.MarketState.VIXLevel
+	}
+	if req.SignalScore != nil {
+		decision.SignalScore = req.SignalScore.Score
+	}
+
+	// Capture active patterns
+	if len(req.Patterns) > 0 {
+		for _, p := range req.Patterns {
+			decision.PatternContext = append(decision.PatternContext, p.Name)
+		}
+	}
+
+	// Calibrate confidence: if we have historical data, adjust raw confidence
+	// toward the actual observed win rate for similar confidence levels
+	decision.CalibratedConf = a.calibrateConfidence(decision.Confidence, consensus)
 
 	// If we have an LLM, use it for final reasoning
 	if a.llmClient != nil {
@@ -95,6 +131,37 @@ func (a *TraderAgent) MakeFinalDecision(ctx context.Context, req AnalysisRequest
 	return decision, nil
 }
 
+// calibrateConfidence adjusts raw confidence based on consensus quality signals.
+// This is a heuristic calibration; with enough historical data, this should be
+// replaced by a lookup table mapping raw confidence → observed win rate.
+func (a *TraderAgent) calibrateConfidence(rawConf float64, consensus *models.ConsensusDetails) float64 {
+	calibrated := rawConf
+
+	// Boost for unanimous agreement
+	if consensus.Unanimous && rawConf > 50 {
+		calibrated = math.Min(100, rawConf*1.1)
+	}
+
+	// Penalize for low conviction (close call)
+	if consensus.Conviction < 10 {
+		calibrated *= 0.7
+	} else if consensus.Conviction < 20 {
+		calibrated *= 0.85
+	}
+
+	// Penalize when many agents disagree
+	if consensus.TotalAgents > 0 {
+		agreementRatio := float64(consensus.AgreeingAgents) / float64(consensus.TotalAgents)
+		if agreementRatio < 0.5 {
+			calibrated *= 0.6
+		} else if agreementRatio < 0.75 {
+			calibrated *= 0.8
+		}
+	}
+
+	return ClampConfidence(calibrated)
+}
+
 // ConsensusResult contains the consensus calculation details.
 type ConsensusResult struct {
 	Action         Recommendation
@@ -107,7 +174,8 @@ type ConsensusResult struct {
 }
 
 // calculateConsensus calculates weighted consensus from agent results.
-// Property 7: Confidence aggregation produces weighted average in [0, 100]
+// Uses conviction scoring: the margin between the top signal and the runner-up
+// determines how confident the consensus really is, not just the raw average.
 func (a *TraderAgent) calculateConsensus(results map[string]*AnalysisResult) *models.ConsensusDetails {
 	var buyScore, sellScore, holdScore float64
 	var totalWeight float64
@@ -118,7 +186,6 @@ func (a *TraderAgent) calculateConsensus(results map[string]*AnalysisResult) *mo
 		weight := a.getAgentWeight(name)
 		totalWeight += weight
 
-		// Weight the confidence by agent weight
 		weightedConfidence := result.Confidence * weight
 
 		switch result.Recommendation {
@@ -138,35 +205,65 @@ func (a *TraderAgent) calculateConsensus(results map[string]*AnalysisResult) *mo
 		holdScore /= totalWeight
 	}
 
-	// Determine winning action
+	// Determine winning action and conviction
 	var action Recommendation
 	var confidence float64
+	var conviction float64 // margin between top two scores
 
-	if buyScore > sellScore && buyScore > holdScore {
-		action = Buy
-		confidence = buyScore
-	} else if sellScore > buyScore && sellScore > holdScore {
-		action = Sell
-		confidence = sellScore
-	} else {
-		action = Hold
-		confidence = holdScore
+	scores := []struct {
+		rec   Recommendation
+		score float64
+	}{
+		{Buy, buyScore},
+		{Sell, sellScore},
+		{Hold, holdScore},
 	}
 
-	// Count agreeing agents
-	for _, result := range results {
-		if result.Recommendation == action {
-			agreeingAgents++
+	// Sort descending by score
+	for i := 0; i < len(scores)-1; i++ {
+		for j := i + 1; j < len(scores); j++ {
+			if scores[j].score > scores[i].score {
+				scores[i], scores[j] = scores[j], scores[i]
+			}
 		}
 	}
 
-	// Ensure confidence is in valid range [0, 100]
+	action = scores[0].rec
+	confidence = scores[0].score
+	if scores[0].score > 0 {
+		conviction = scores[0].score - scores[1].score
+	}
+
+	// Penalize confidence when conviction is low (close call between BUY and SELL)
+	// A 60% BUY vs 55% SELL is much weaker than 80% BUY vs 20% SELL
+	if conviction < 15 && action != Hold {
+		// Low conviction: reduce confidence proportionally
+		confidence *= (0.5 + conviction/30) // at conviction=0 -> 50% of raw, at conviction=15 -> 100%
+	}
+
+	// Count agreeing agents
+	conflicting := 0
+	for _, result := range results {
+		if result.Recommendation == action {
+			agreeingAgents++
+		} else if result.Recommendation != Hold {
+			// Count agents with opposing directional view (not just HOLD)
+			conflicting++
+		}
+	}
+
+	// If agents are split between BUY and SELL (not just HOLD), that's a red flag
+	// Reduce confidence when there's active disagreement
+	if conflicting > 0 && action != Hold {
+		conflictPenalty := float64(conflicting) / float64(len(results)) * 20
+		confidence -= conflictPenalty
+	}
+
 	confidence = ClampConfidence(confidence)
 
-	// Build calculation explanation
 	calculation := fmt.Sprintf(
-		"Buy: %.1f%%, Sell: %.1f%%, Hold: %.1f%% (weighted by agent importance)",
-		buyScore, sellScore, holdScore,
+		"Buy: %.1f%%, Sell: %.1f%%, Hold: %.1f%% | Conviction: %.1f%% | Agreement: %d/%d",
+		buyScore, sellScore, holdScore, conviction, agreeingAgents, len(results),
 	)
 
 	return &models.ConsensusDetails{
@@ -174,6 +271,11 @@ func (a *TraderAgent) calculateConsensus(results map[string]*AnalysisResult) *mo
 		AgreeingAgents: agreeingAgents,
 		WeightedScore:  confidence,
 		Calculation:    calculation,
+		BuyScore:       buyScore,
+		SellScore:      sellScore,
+		HoldScore:      holdScore,
+		Conviction:     conviction,
+		Unanimous:      agreeingAgents == len(results),
 	}
 }
 
@@ -187,26 +289,25 @@ func (a *TraderAgent) getAgentWeight(agentName string) float64 {
 
 // determineAction determines the final action from consensus.
 func (a *TraderAgent) determineAction(consensus *models.ConsensusDetails) Recommendation {
-	// Parse the calculation to determine action
-	// The consensus already has the weighted score
-	
 	// If confidence is too low, default to Hold
 	if consensus.WeightedScore < 40 {
 		return Hold
 	}
 
-	// If less than half of agents agree, be cautious
-	if consensus.AgreeingAgents < consensus.TotalAgents/2 {
+	// If conviction is very low (close call), default to Hold
+	if consensus.Conviction < 10 {
 		return Hold
 	}
 
-	// Parse from calculation string (format: "Buy: X%, Sell: Y%, Hold: Z%")
-	var buyScore, sellScore, holdScore float64
-	fmt.Sscanf(consensus.Calculation, "Buy: %f%%, Sell: %f%%, Hold: %f%%", &buyScore, &sellScore, &holdScore)
+	// If less than half of agents agree, be cautious
+	if consensus.AgreeingAgents < (consensus.TotalAgents+1)/2 {
+		return Hold
+	}
 
-	if buyScore > sellScore && buyScore > holdScore {
+	// Use the stored scores directly instead of parsing a string
+	if consensus.BuyScore > consensus.SellScore && consensus.BuyScore > consensus.HoldScore {
 		return Buy
-	} else if sellScore > buyScore && sellScore > holdScore {
+	} else if consensus.SellScore > consensus.BuyScore && consensus.SellScore > consensus.HoldScore {
 		return Sell
 	}
 	return Hold

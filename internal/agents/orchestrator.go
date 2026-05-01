@@ -174,7 +174,7 @@ func (o *Orchestrator) ProcessSymbol(ctx context.Context, req AnalysisRequest) (
 		return nil, fmt.Errorf("making final decision: %w", err)
 	}
 
-	// Perform risk check
+	// Perform risk check and enhanced position sizing
 	if o.riskAgent != nil {
 		riskCheck := o.riskAgent.CheckRisk(ctx, req)
 		decision.RiskCheck = &models.RiskCheckResult{
@@ -184,6 +184,34 @@ func (o *Orchestrator) ProcessSymbol(ctx context.Context, req AnalysisRequest) (
 			PortfolioImpact: riskCheck.PortfolioImpact,
 			SectorExposure:  riskCheck.SectorExposure,
 			DailyLossStatus: riskCheck.DailyLossRemaining,
+			VolAdjustedSize: riskCheck.SuggestedSize, // already vol-adjusted in CalculatePositionSize
+		}
+		decision.PositionSizeQty = int(riskCheck.SuggestedSize)
+
+		// Calculate max loss if stop is hit
+		if decision.StopLoss > 0 && decision.EntryPrice > 0 && riskCheck.SuggestedSize > 0 {
+			var riskPerShare float64
+			if decision.Action == "BUY" {
+				riskPerShare = decision.EntryPrice - decision.StopLoss
+			} else {
+				riskPerShare = decision.StopLoss - decision.EntryPrice
+			}
+			decision.RiskCheck.MaxLossAmount = riskPerShare * riskCheck.SuggestedSize
+
+			// Reject if max loss exceeds daily loss remaining
+			if riskCheck.DailyLossRemaining > 0 && decision.RiskCheck.MaxLossAmount > riskCheck.DailyLossRemaining {
+				decision.RiskCheck.Approved = false
+				decision.RiskCheck.Violations = append(decision.RiskCheck.Violations,
+					fmt.Sprintf("max loss ₹%.0f exceeds daily remaining ₹%.0f",
+						decision.RiskCheck.MaxLossAmount, riskCheck.DailyLossRemaining))
+			}
+		}
+
+		// Validate risk-reward ratio
+		if decision.RiskRewardRatio > 0 && decision.RiskRewardRatio < 1.5 {
+			decision.RiskCheck.Approved = false
+			decision.RiskCheck.Violations = append(decision.RiskCheck.Violations,
+				fmt.Sprintf("risk-reward ratio %.1f below minimum 1.5", decision.RiskRewardRatio))
 		}
 	}
 
@@ -193,7 +221,6 @@ func (o *Orchestrator) ProcessSymbol(ctx context.Context, req AnalysisRequest) (
 	// Save decision to store
 	if o.store != nil {
 		if err := o.store.SaveDecision(ctx, decision); err != nil {
-			// Log error but don't fail
 			if o.notifier != nil {
 				o.notifier.SendError(ctx, err, "saving decision")
 			}
@@ -333,7 +360,7 @@ func (o *Orchestrator) shouldExecute(decision *models.Decision) bool {
 	return true
 }
 
-// RecordTrade records a trade execution for tracking.
+// RecordTrade records a trade execution and updates agent accuracy tracking.
 func (o *Orchestrator) RecordTrade(pnl float64) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -346,6 +373,76 @@ func (o *Orchestrator) RecordTrade(pnl float64) {
 		o.consecutiveLosses++
 	} else {
 		o.consecutiveLosses = 0
+	}
+}
+
+// RecordDecisionOutcome records the outcome of a decision and updates agent accuracy.
+// This is the feedback loop: agents that were right get their weight boosted,
+// agents that were wrong get their weight reduced.
+func (o *Orchestrator) RecordDecisionOutcome(ctx context.Context, decisionID string, outcome models.DecisionOutcome, pnl float64) error {
+	if o.store == nil {
+		return fmt.Errorf("data store not configured")
+	}
+
+	// Update the decision in the store
+	if err := o.store.UpdateDecisionOutcome(ctx, decisionID, outcome, pnl); err != nil {
+		return fmt.Errorf("updating decision outcome: %w", err)
+	}
+
+	// Fetch the decision to analyze agent accuracy
+	decision, err := o.store.GetDecisionByID(ctx, decisionID)
+	if err != nil || decision == nil {
+		return err
+	}
+
+	// Determine if the decision was correct
+	wasCorrect := (outcome == models.OutcomeWin)
+	actualDirection := decision.Action // BUY or SELL
+
+	// Update agent weights based on who was right
+	if o.traderAgent != nil && decision.AgentResults != nil {
+		for agentName, agentResult := range decision.AgentResults {
+			agentAgreed := agentResult.Recommendation == actualDirection
+			agentWasRight := (agentAgreed && wasCorrect) || (!agentAgreed && !wasCorrect)
+
+			currentWeight := o.traderAgent.getAgentWeight(agentName)
+
+			// Small incremental adjustment (±2% of current weight)
+			// This prevents wild swings but allows gradual adaptation
+			adjustment := currentWeight * 0.02
+			if agentWasRight {
+				o.traderAgent.agentWeights[agentName] = currentWeight + adjustment
+			} else {
+				newWeight := currentWeight - adjustment
+				if newWeight < 0.05 {
+					newWeight = 0.05 // floor: never zero out an agent
+				}
+				o.traderAgent.agentWeights[agentName] = newWeight
+			}
+		}
+
+		// Normalize weights so they sum to 1.0
+		o.normalizeAgentWeights()
+	}
+
+	return nil
+}
+
+// normalizeAgentWeights ensures agent weights sum to 1.0.
+func (o *Orchestrator) normalizeAgentWeights() {
+	if o.traderAgent == nil {
+		return
+	}
+
+	var total float64
+	for _, w := range o.traderAgent.agentWeights {
+		total += w
+	}
+	if total <= 0 {
+		return
+	}
+	for name, w := range o.traderAgent.agentWeights {
+		o.traderAgent.agentWeights[name] = w / total
 	}
 }
 

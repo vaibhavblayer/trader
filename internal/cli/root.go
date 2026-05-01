@@ -4,6 +4,8 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
@@ -73,8 +75,18 @@ func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 
 	// Initialize LLM client if OpenAI API key is available
 	if cfg.Credentials.OpenAI.APIKey != "" {
-		app.LLMClient = agents.NewOpenAIClient(cfg.Credentials.OpenAI.APIKey, cfg.Agents.Model)
-		logger.Debug().Str("model", cfg.Agents.Model).Msg("OpenAI LLM client initialized")
+		if cfg.Agents.ReasoningEffort != "" {
+			app.LLMClient = agents.NewOpenAIClientWithReasoning(
+				cfg.Credentials.OpenAI.APIKey, cfg.Agents.Model, cfg.Agents.ReasoningEffort,
+			)
+			logger.Debug().
+				Str("model", cfg.Agents.Model).
+				Str("reasoning_effort", cfg.Agents.ReasoningEffort).
+				Msg("OpenAI LLM client initialized with reasoning")
+		} else {
+			app.LLMClient = agents.NewOpenAIClient(cfg.Credentials.OpenAI.APIKey, cfg.Agents.Model)
+			logger.Debug().Str("model", cfg.Agents.Model).Msg("OpenAI LLM client initialized")
+		}
 	}
 
 	rootCmd := &cobra.Command{
@@ -221,7 +233,33 @@ func newConfigCmd(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			if output.IsJSON() {
-				return output.JSON(app.Config)
+				// Redact credentials in JSON output
+				safe := map[string]interface{}{
+					"trading":       app.Config.Trading,
+					"risk":          app.Config.Risk,
+					"ui":            app.Config.UI,
+					"notifications": app.Config.Notifications,
+					"security":      app.Config.Security,
+					"agents": map[string]interface{}{
+						"model":                    app.Config.Agents.Model,
+						"reasoning_effort":          app.Config.Agents.ReasoningEffort,
+						"autonomous_mode":           app.Config.Agents.AutonomousMode,
+						"auto_execute_threshold":    app.Config.Agents.AutoExecuteThreshold,
+						"max_daily_trades":          app.Config.Agents.MaxDailyTrades,
+						"max_daily_loss":            app.Config.Agents.MaxDailyLoss,
+						"max_position_size":         app.Config.Agents.MaxPositionSize,
+						"cooldown_minutes":          app.Config.Agents.CooldownMinutes,
+						"consecutive_loss_limit":    app.Config.Agents.ConsecutiveLossLimit,
+						"enabled_agents":            app.Config.Agents.EnabledAgents,
+						"agent_weights":             app.Config.Agents.AgentWeights,
+					},
+					"credentials": map[string]interface{}{
+						"zerodha_configured": app.Config.Credentials.Zerodha.APIKey != "",
+						"openai_configured":  app.Config.Credentials.OpenAI.APIKey != "",
+						"tavily_configured":  app.Config.Credentials.Tavily.APIKey != "",
+					},
+				}
+				return output.JSON(safe)
 			}
 			return showConfig(output, app.Config)
 		},
@@ -270,7 +308,310 @@ func newConfigCmd(app *App) *cobra.Command {
 		},
 	})
 
+	cmd.AddCommand(newConfigSetCmd(app))
+
 	return cmd
+}
+
+// newConfigSetCmd creates the config set subcommand for changing settings from the CLI.
+func newConfigSetCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "set <key> <value>",
+		Short: "Set a configuration value",
+		Long: `Set a configuration value from the CLI.
+
+Supported keys:
+  model              AI model name (e.g., gpt-5.4-mini, gpt-4o, gpt-5.2)
+  reasoning          Reasoning effort for reasoning models (low, medium, high, off)
+  mode               Trading mode (paper, live)
+  autonomous         Autonomous mode (MANUAL, NOTIFY_ONLY, SEMI_AUTO, FULL_AUTO)
+  threshold          Auto-execute confidence threshold (0-100)
+  max-trades         Maximum daily trades
+  max-loss           Maximum daily loss in INR
+  cooldown           Cooldown between trades in minutes
+  max-position       Maximum position size in INR
+  stop-after-losses  Stop after N consecutive losses`,
+		Example: `  trader config set model gpt-5.4-mini
+  trader config set reasoning high
+  trader config set mode paper
+  trader config set autonomous NOTIFY_ONLY
+  trader config set threshold 85
+  trader config set max-trades 15
+  trader config set max-loss 10000`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			key := args[0]
+			value := args[1]
+
+			configDir := config.DefaultConfigDir()
+
+			switch key {
+			case "model":
+				if err := updateAgentsToml(configDir, "model", value); err != nil {
+					output.Error("Failed to update model: %v", err)
+					return err
+				}
+				app.Config.Agents.Model = value
+				output.Success("✓ AI model set to: %s", value)
+				output.Dim("Restart any running daemon for changes to take effect")
+
+			case "reasoning":
+				validEfforts := map[string]bool{"low": true, "medium": true, "high": true, "off": true}
+				if !validEfforts[value] {
+					output.Error("Invalid reasoning effort: %s", value)
+					output.Println("  Valid: low, medium, high, off")
+					return fmt.Errorf("invalid reasoning effort")
+				}
+				tomlValue := value
+				if value == "off" {
+					tomlValue = "" // empty string disables it
+				}
+				if err := updateAgentsToml(configDir, "reasoning_effort", tomlValue); err != nil {
+					output.Error("Failed to update reasoning effort: %v", err)
+					return err
+				}
+				app.Config.Agents.ReasoningEffort = tomlValue
+				if value == "off" {
+					output.Success("✓ Reasoning effort disabled (using model default)")
+				} else {
+					output.Success("✓ Reasoning effort set to: %s", value)
+				}
+				output.Dim("Restart any running daemon for changes to take effect")
+
+			case "mode":
+				if value != "paper" && value != "live" {
+					output.Error("Invalid mode: %s (must be 'paper' or 'live')", value)
+					return fmt.Errorf("invalid mode")
+				}
+				if err := updateConfigToml(configDir, "trading", "mode", value); err != nil {
+					output.Error("Failed to update mode: %v", err)
+					return err
+				}
+				app.Config.Trading.Mode = value
+				output.Success("✓ Trading mode set to: %s", value)
+
+			case "autonomous":
+				validModes := map[string]bool{"MANUAL": true, "NOTIFY_ONLY": true, "SEMI_AUTO": true, "FULL_AUTO": true}
+				if !validModes[value] {
+					output.Error("Invalid autonomous mode: %s", value)
+					output.Println("  Valid: MANUAL, NOTIFY_ONLY, SEMI_AUTO, FULL_AUTO")
+					return fmt.Errorf("invalid autonomous mode")
+				}
+				if err := updateAgentsToml(configDir, "autonomous_mode", value); err != nil {
+					output.Error("Failed to update autonomous mode: %v", err)
+					return err
+				}
+				app.Config.Agents.AutonomousMode = value
+				output.Success("✓ Autonomous mode set to: %s", value)
+
+			case "threshold":
+				var threshold float64
+				if _, err := fmt.Sscanf(value, "%f", &threshold); err != nil || threshold < 0 || threshold > 100 {
+					output.Error("Invalid threshold: %s (must be 0-100)", value)
+					return fmt.Errorf("invalid threshold")
+				}
+				if err := updateAgentsToml(configDir, "auto_execute_threshold", value); err != nil {
+					output.Error("Failed to update threshold: %v", err)
+					return err
+				}
+				app.Config.Agents.AutoExecuteThreshold = threshold
+				output.Success("✓ Auto-execute threshold set to: %.0f%%", threshold)
+
+			case "max-trades":
+				var maxTrades int
+				if _, err := fmt.Sscanf(value, "%d", &maxTrades); err != nil || maxTrades < 0 {
+					output.Error("Invalid max-trades: %s (must be a positive integer)", value)
+					return fmt.Errorf("invalid max-trades")
+				}
+				if err := updateAgentsToml(configDir, "max_daily_trades", value); err != nil {
+					output.Error("Failed to update max trades: %v", err)
+					return err
+				}
+				app.Config.Agents.MaxDailyTrades = maxTrades
+				output.Success("✓ Max daily trades set to: %d", maxTrades)
+
+			case "max-loss":
+				var maxLoss float64
+				if _, err := fmt.Sscanf(value, "%f", &maxLoss); err != nil || maxLoss < 0 {
+					output.Error("Invalid max-loss: %s (must be a positive number)", value)
+					return fmt.Errorf("invalid max-loss")
+				}
+				if err := updateAgentsToml(configDir, "max_daily_loss", value); err != nil {
+					output.Error("Failed to update max loss: %v", err)
+					return err
+				}
+				app.Config.Agents.MaxDailyLoss = maxLoss
+				output.Success("✓ Max daily loss set to: ₹%.0f", maxLoss)
+
+			case "cooldown":
+				var cooldown int
+				if _, err := fmt.Sscanf(value, "%d", &cooldown); err != nil || cooldown < 0 {
+					output.Error("Invalid cooldown: %s (must be a positive integer)", value)
+					return fmt.Errorf("invalid cooldown")
+				}
+				if err := updateAgentsToml(configDir, "cooldown_minutes", value); err != nil {
+					output.Error("Failed to update cooldown: %v", err)
+					return err
+				}
+				app.Config.Agents.CooldownMinutes = cooldown
+				output.Success("✓ Cooldown set to: %d minutes", cooldown)
+
+			case "max-position":
+				var maxPos float64
+				if _, err := fmt.Sscanf(value, "%f", &maxPos); err != nil || maxPos < 0 {
+					output.Error("Invalid max-position: %s (must be a positive number)", value)
+					return fmt.Errorf("invalid max-position")
+				}
+				if err := updateAgentsToml(configDir, "max_position_size", value); err != nil {
+					output.Error("Failed to update max position: %v", err)
+					return err
+				}
+				app.Config.Agents.MaxPositionSize = maxPos
+				output.Success("✓ Max position size set to: ₹%.0f", maxPos)
+
+			case "stop-after-losses":
+				var limit int
+				if _, err := fmt.Sscanf(value, "%d", &limit); err != nil || limit < 0 {
+					output.Error("Invalid stop-after-losses: %s (must be a positive integer)", value)
+					return fmt.Errorf("invalid stop-after-losses")
+				}
+				if err := updateAgentsToml(configDir, "consecutive_loss_limit", value); err != nil {
+					output.Error("Failed to update consecutive loss limit: %v", err)
+					return err
+				}
+				app.Config.Agents.ConsecutiveLossLimit = limit
+				output.Success("✓ Consecutive loss limit set to: %d", limit)
+
+			default:
+				output.Error("Unknown config key: %s", key)
+				output.Println("  Run 'trader config set --help' to see supported keys")
+				return fmt.Errorf("unknown key: %s", key)
+			}
+
+			return nil
+		},
+	}
+
+	return cmd
+}
+
+// updateAgentsToml updates a top-level key in agents.toml.
+func updateAgentsToml(configDir, key, value string) error {
+	return updateTomlFile(configDir, "agents.toml", key, value)
+}
+
+// updateConfigToml updates a key in a section of config.toml.
+func updateConfigToml(configDir, section, key, value string) error {
+	filePath := configDir + "/config.toml"
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("reading config file: %w", err)
+	}
+
+	content := string(data)
+	lines := strings.Split(content, "\n")
+	inSection := false
+	found := false
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Track which section we're in
+		if strings.HasPrefix(trimmed, "[") {
+			inSection = strings.TrimSpace(trimmed) == "["+section+"]"
+		}
+
+		// Find the key in the right section
+		if inSection && strings.HasPrefix(trimmed, key+" ") || inSection && strings.HasPrefix(trimmed, key+"=") {
+			lines[i] = fmt.Sprintf(`%s = "%s"`, key, value)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("key '%s' not found in [%s] section", key, section)
+	}
+
+	return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0644)
+}
+
+// updateTomlFile updates a top-level key in a TOML file.
+// If the key doesn't exist, it inserts it after the closest related key.
+func updateTomlFile(configDir, filename, key, value string) error {
+	filePath := configDir + "/" + filename
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", filename, err)
+	}
+
+	content := string(data)
+	lines := strings.Split(content, "\n")
+	found := false
+	firstSectionIdx := len(lines) // index of first [section] header
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Track where sections start
+		if strings.HasPrefix(trimmed, "[") && firstSectionIdx == len(lines) {
+			firstSectionIdx = i
+		}
+
+		// Skip lines inside [sections] — we only want top-level keys
+		if i >= firstSectionIdx {
+			break
+		}
+
+		if strings.HasPrefix(trimmed, key+" ") || strings.HasPrefix(trimmed, key+"=") {
+			if isNumericValue(value) {
+				lines[i] = fmt.Sprintf(`%s = %s`, key, value)
+			} else {
+				lines[i] = fmt.Sprintf(`%s = "%s"`, key, value)
+			}
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		// Key doesn't exist yet — insert it before the first section header
+		var newLine string
+		if isNumericValue(value) {
+			newLine = fmt.Sprintf(`%s = %s`, key, value)
+		} else {
+			newLine = fmt.Sprintf(`%s = "%s"`, key, value)
+		}
+
+		// Find a good insertion point: after the "model" line for reasoning_effort,
+		// or just before the first section header otherwise
+		insertIdx := firstSectionIdx
+		for i := 0; i < firstSectionIdx; i++ {
+			trimmed := strings.TrimSpace(lines[i])
+			// Insert reasoning_effort right after model line
+			if key == "reasoning_effort" && strings.HasPrefix(trimmed, "model") {
+				insertIdx = i + 1
+				break
+			}
+		}
+
+		// Insert the new line
+		newLines := make([]string, 0, len(lines)+1)
+		newLines = append(newLines, lines[:insertIdx]...)
+		newLines = append(newLines, newLine)
+		newLines = append(newLines, lines[insertIdx:]...)
+		lines = newLines
+	}
+
+	return os.WriteFile(filePath, []byte(strings.Join(lines, "\n")), 0644)
+}
+
+// isNumericValue checks if a string looks like a number.
+func isNumericValue(s string) bool {
+	var f float64
+	_, err := fmt.Sscanf(s, "%f", &f)
+	return err == nil
 }
 
 func showConfig(output *Output, cfg *config.Config) error {
@@ -290,6 +631,11 @@ func showConfig(output *Output, cfg *config.Config) error {
 
 	output.Bold("Agent Configuration")
 	output.Printf("  Model:           %s\n", cfg.Agents.Model)
+	if cfg.Agents.ReasoningEffort != "" {
+		output.Printf("  Reasoning:       %s\n", cfg.Agents.ReasoningEffort)
+	} else {
+		output.Printf("  Reasoning:       default\n")
+	}
 	output.Printf("  Autonomous Mode: %s\n", cfg.Agents.AutonomousMode)
 	output.Printf("  Auto Threshold:  %.0f%%\n", cfg.Agents.AutoExecuteThreshold)
 	output.Printf("  Max Daily Trades: %d\n", cfg.Agents.MaxDailyTrades)

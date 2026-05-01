@@ -173,6 +173,7 @@ func (a *RiskAgent) CheckRisk(ctx context.Context, req AnalysisRequest) *RiskChe
 }
 
 // CalculatePositionSize calculates the recommended position size.
+// Uses a combination of max-percent-of-portfolio and Kelly Criterion.
 func (a *RiskAgent) CalculatePositionSize(req AnalysisRequest) float64 {
 	if req.Portfolio == nil || req.CurrentPrice <= 0 {
 		return 0
@@ -182,6 +183,37 @@ func (a *RiskAgent) CalculatePositionSize(req AnalysisRequest) float64 {
 	maxPositionValue := req.Portfolio.TotalValue * (a.config.MaxPositionPercent / 100)
 	baseSize := maxPositionValue / req.CurrentPrice
 
+	// Kelly Criterion sizing (if we have signal score as a proxy for edge)
+	kellySize := baseSize
+	if req.SignalScore != nil && req.SignalScore.Score != 0 {
+		// Estimate win probability from signal score
+		// Score ranges from -100 to +100; map |score| to win probability
+		absScore := req.SignalScore.Score
+		if absScore < 0 {
+			absScore = -absScore
+		}
+		winProb := 0.5 + (absScore / 200) // maps 0->50%, 100->100%
+		// Assume avg win = 2 * avg loss (2:1 R:R target)
+		avgWinLossRatio := 2.0
+		kellyFraction := (winProb*avgWinLossRatio - (1 - winProb)) / avgWinLossRatio
+		if kellyFraction < 0 {
+			kellyFraction = 0
+		}
+		// Half-Kelly for safety
+		kellyFraction *= 0.5
+		// Cap at max position percent
+		if kellyFraction > a.config.MaxPositionPercent/100 {
+			kellyFraction = a.config.MaxPositionPercent / 100
+		}
+		kellySize = (req.Portfolio.TotalValue * kellyFraction) / req.CurrentPrice
+	}
+
+	// Use the more conservative of base and Kelly
+	size := baseSize
+	if kellySize < size && kellySize > 0 {
+		size = kellySize
+	}
+
 	// Adjust for volatility
 	volatilityFactor := 1.0
 	if req.MarketState != nil {
@@ -190,8 +222,8 @@ func (a *RiskAgent) CalculatePositionSize(req AnalysisRequest) float64 {
 
 	// Adjust for available cash
 	cashFactor := 1.0
-	if req.Portfolio.AvailableCash < maxPositionValue {
-		cashFactor = req.Portfolio.AvailableCash / maxPositionValue
+	if req.Portfolio.AvailableCash < size*req.CurrentPrice {
+		cashFactor = req.Portfolio.AvailableCash / (size * req.CurrentPrice)
 	}
 
 	// Adjust for daily loss remaining
@@ -202,10 +234,13 @@ func (a *RiskAgent) CalculatePositionSize(req AnalysisRequest) float64 {
 		if remaining < a.config.DailyLossLimit*0.5 {
 			lossLimitFactor = remaining / (a.config.DailyLossLimit * 0.5)
 		}
+		if remaining <= 0 {
+			return 0
+		}
 	}
 
 	// Apply all factors
-	adjustedSize := baseSize * volatilityFactor * cashFactor * lossLimitFactor
+	adjustedSize := size * volatilityFactor * cashFactor * lossLimitFactor
 
 	// Round down to whole shares
 	return float64(int(adjustedSize))

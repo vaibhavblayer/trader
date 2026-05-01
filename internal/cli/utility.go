@@ -15,6 +15,7 @@ import (
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
 	"zerodha-trader/internal/store"
+	"zerodha-trader/internal/trading"
 )
 
 // addUtilityCommands adds utility commands.
@@ -158,14 +159,23 @@ func newBacktestCmd(app *App) *cobra.Command {
 		Short: "Backtest trading strategies",
 		Long: `Backtest trading strategies on historical data.
 
-Calculates metrics including:
-- Total return
-- Win rate
-- Max drawdown
-- Sharpe ratio
-- Profit factor`,
-		Example: `  trader backtest --strategy momentum --symbol RELIANCE --days 365
-  trader backtest --strategy breakout --watchlist nifty50 --days 180`,
+Available strategies:
+  ema_crossover      EMA 9/21 crossover (default)
+  sma_crossover      SMA 10/20 crossover
+  rsi_oversold       RSI oversold/overbought reversal
+  macd               MACD signal line crossover
+  supertrend         SuperTrend direction change
+  bollinger_breakout Bollinger Band mean reversion
+  adx_trend          ADX trend strength + DI crossover
+  donchian_breakout  Donchian channel breakout (turtle)
+  multi_indicator    EMA + RSI + ADX + volume filter
+
+Calculates: total return, win rate, max drawdown, Sharpe ratio,
+Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.`,
+		Example: `  trader backtest --strategy ema_crossover --symbol RELIANCE --days 365
+  trader backtest --strategy supertrend --symbol INFY --days 180 --sl 2.5 --tp 5
+  trader backtest --strategy macd --symbol TCS --trailing 2.0 --short
+  trader backtest --strategy multi_indicator --symbol HDFCBANK --capital 500000`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -175,17 +185,37 @@ Calculates metrics including:
 			symbol, _ := cmd.Flags().GetString("symbol")
 			days, _ := cmd.Flags().GetInt("days")
 			capital, _ := cmd.Flags().GetFloat64("capital")
+			slippagePct, _ := cmd.Flags().GetFloat64("slippage")
+			commissionPct, _ := cmd.Flags().GetFloat64("commission")
 			exchange, _ := cmd.Flags().GetString("exchange")
+			stopLoss, _ := cmd.Flags().GetFloat64("sl")
+			takeProfit, _ := cmd.Flags().GetFloat64("tp")
+			trailingStop, _ := cmd.Flags().GetFloat64("trailing")
+			allowShort, _ := cmd.Flags().GetBool("short")
 
 			if symbol == "" {
 				output.Error("Symbol is required. Use --symbol flag.")
 				return fmt.Errorf("symbol required")
 			}
 
-			output.Bold("Backtesting: %s Strategy", strategy)
-			output.Printf("  Symbol:  %s\n", symbol)
-			output.Printf("  Period:  %d days\n", days)
-			output.Printf("  Capital: %s\n", FormatIndianCurrency(capital))
+			output.Bold("Backtesting: %s", strategy)
+			output.Printf("  Symbol:     %s\n", symbol)
+			output.Printf("  Period:     %d days\n", days)
+			output.Printf("  Capital:    %s\n", FormatIndianCurrency(capital))
+			output.Printf("  Slippage:   %.2f%%\n", slippagePct)
+			output.Printf("  Commission: %.2f%%\n", commissionPct)
+			if stopLoss > 0 {
+				output.Printf("  Stop Loss:  %.1f%%\n", stopLoss)
+			}
+			if takeProfit > 0 {
+				output.Printf("  Take Profit: %.1f%%\n", takeProfit)
+			}
+			if trailingStop > 0 {
+				output.Printf("  Trailing SL: %.1f%%\n", trailingStop)
+			}
+			if allowShort {
+				output.Printf("  Short:      enabled\n")
+			}
 			output.Println()
 
 			if app.Broker == nil {
@@ -195,7 +225,6 @@ Calculates metrics including:
 
 			output.Info("Fetching historical data...")
 
-			// Fetch historical data
 			candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
 				Symbol:    symbol,
 				Exchange:  models.Exchange(exchange),
@@ -208,270 +237,127 @@ Calculates metrics including:
 				return err
 			}
 
-			if len(candles) < 30 {
-				output.Error("Insufficient data for backtest (need at least 30 candles, got %d)", len(candles))
+			if len(candles) < 50 {
+				output.Error("Insufficient data for backtest (need at least 50 candles, got %d)", len(candles))
 				return fmt.Errorf("insufficient data")
 			}
 
 			output.Info("Running backtest on %d candles...", len(candles))
 			output.Println()
 
-			// Run simple momentum backtest
-			results := runMomentumBacktest(candles, capital, strategy)
-
-			if output.IsJSON() {
-				return output.JSON(results)
+			engine := trading.NewBacktestEngine(nil)
+			result, err := engine.RunOnCandles(ctx, trading.BacktestConfig{
+				Symbol:              symbol,
+				InitialCapital:      capital,
+				Strategy:            strategy,
+				Slippage:            slippagePct / 100,
+				Commission:          commissionPct / 100,
+				StopLossPercent:     stopLoss,
+				TakeProfitPercent:   takeProfit,
+				TrailingStopPercent: trailingStop,
+				AllowShort:          allowShort,
+			}, candles)
+			if err != nil {
+				output.Error("Backtest failed: %v", err)
+				return err
 			}
 
-			return displayBacktestResults(output, results)
+			if output.IsJSON() {
+				return output.JSON(result)
+			}
+
+			return displayBacktestResult(output, result)
 		},
 	}
 
-	cmd.Flags().String("strategy", "momentum", "Strategy to backtest")
+	cmd.Flags().String("strategy", "ema_crossover", "Strategy (ema_crossover, sma_crossover, rsi_oversold, macd, supertrend, bollinger_breakout, adx_trend, donchian_breakout, multi_indicator)")
 	cmd.Flags().String("symbol", "", "Symbol to backtest")
 	cmd.Flags().String("watchlist", "", "Watchlist to backtest")
 	cmd.Flags().Int("days", 365, "Number of days to backtest")
 	cmd.Flags().Float64("capital", 1000000, "Starting capital")
 	cmd.Flags().Float64("slippage", 0.1, "Slippage percentage")
 	cmd.Flags().Float64("commission", 0.03, "Commission percentage")
+	cmd.Flags().Float64("sl", 3.0, "Stop loss percentage (0 to disable)")
+	cmd.Flags().Float64("tp", 0, "Take profit percentage (0 to disable)")
+	cmd.Flags().Float64("trailing", 0, "Trailing stop percentage (0 to disable)")
+	cmd.Flags().Bool("short", false, "Allow short selling")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 
 	return cmd
 }
 
-// runMomentumBacktest runs a simple momentum-based backtest
-func runMomentumBacktest(candles []models.Candle, capital float64, strategy string) BacktestResults {
-	// Extract closes
-	closes := make([]float64, len(candles))
-	for i, c := range candles {
-		closes[i] = c.Close
-	}
-
-	// Calculate EMAs for signals
-	ema9 := calculateEMA(closes, 9)
-	ema21 := calculateEMA(closes, 21)
-
-	// Simulate trades
-	var trades []backtestTrade
-	inPosition := false
-	entryPrice := 0.0
-	entryIdx := 0
-	currentCapital := capital
-	maxCapital := capital
-	maxDrawdown := 0.0
-
-	// Track equity curve
-	equityCurve := make([]float64, 0, len(candles))
-	equityCurve = append(equityCurve, capital) // Starting point
-
-	for i := 21; i < len(candles); i++ {
-		if len(ema9) <= i || len(ema21) <= i {
-			continue
-		}
-
-		// Track equity at each point
-		equity := currentCapital
-		if inPosition {
-			// Mark-to-market: calculate unrealized P&L
-			unrealizedPnL := ((candles[i].Close - entryPrice) / entryPrice) * currentCapital
-			equity = currentCapital + unrealizedPnL
-		}
-		equityCurve = append(equityCurve, equity)
-
-		// Entry signal: EMA9 crosses above EMA21
-		if !inPosition && ema9[i] > ema21[i] && ema9[i-1] <= ema21[i-1] {
-			inPosition = true
-			entryPrice = candles[i].Close
-			entryIdx = i
-		}
-
-		// Exit signal: EMA9 crosses below EMA21 or stop loss
-		if inPosition {
-			exitSignal := ema9[i] < ema21[i] && ema9[i-1] >= ema21[i-1]
-			stopLoss := candles[i].Close < entryPrice*0.97 // 3% stop loss
-
-			if exitSignal || stopLoss {
-				exitPrice := candles[i].Close
-				pnlPercent := ((exitPrice - entryPrice) / entryPrice) * 100
-				pnl := (currentCapital * (pnlPercent / 100))
-				currentCapital += pnl
-
-				trades = append(trades, backtestTrade{
-					entryPrice: entryPrice,
-					exitPrice:  exitPrice,
-					pnl:        pnl,
-					pnlPercent: pnlPercent,
-					holdDays:   i - entryIdx,
-				})
-
-				// Track max drawdown
-				if currentCapital > maxCapital {
-					maxCapital = currentCapital
-				}
-				drawdown := ((maxCapital - currentCapital) / maxCapital) * 100
-				if drawdown > maxDrawdown {
-					maxDrawdown = drawdown
-				}
-
-				inPosition = false
-			}
-		}
-	}
-
-	// Calculate results
-	totalTrades := len(trades)
-	winningTrades := 0
-	grossProfit := 0.0
-	grossLoss := 0.0
-	totalHoldDays := 0
-	largestWin := 0.0
-	largestLoss := 0.0
-
-	for _, t := range trades {
-		if t.pnl > 0 {
-			winningTrades++
-			grossProfit += t.pnl
-			if t.pnl > largestWin {
-				largestWin = t.pnl
-			}
-		} else {
-			grossLoss += t.pnl
-			if t.pnl < largestLoss {
-				largestLoss = t.pnl
-			}
-		}
-		totalHoldDays += t.holdDays
-	}
-
-	winRate := 0.0
-	avgWin := 0.0
-	avgLoss := 0.0
-	profitFactor := 0.0
-	avgHoldDays := 0
-
-	if totalTrades > 0 {
-		winRate = float64(winningTrades) / float64(totalTrades) * 100
-		avgHoldDays = totalHoldDays / totalTrades
-	}
-	if winningTrades > 0 {
-		avgWin = grossProfit / float64(winningTrades)
-	}
-	losingTrades := totalTrades - winningTrades
-	if losingTrades > 0 {
-		avgLoss = grossLoss / float64(losingTrades)
-	}
-	if grossLoss != 0 {
-		profitFactor = grossProfit / (-grossLoss)
-	}
-
-	netProfit := grossProfit + grossLoss
-	totalReturn := (netProfit / capital) * 100
-
-	// Simplified Sharpe ratio (annualized)
-	sharpeRatio := 0.0
-	if maxDrawdown > 0 {
-		sharpeRatio = totalReturn / maxDrawdown
-	}
-
-	return BacktestResults{
-		TotalTrades:   totalTrades,
-		WinningTrades: winningTrades,
-		LosingTrades:  losingTrades,
-		WinRate:       winRate,
-		GrossProfit:   grossProfit,
-		GrossLoss:     grossLoss,
-		NetProfit:     netProfit,
-		TotalReturn:   totalReturn,
-		MaxDrawdown:   maxDrawdown,
-		SharpeRatio:   sharpeRatio,
-		ProfitFactor:  profitFactor,
-		AvgWin:        avgWin,
-		AvgLoss:       avgLoss,
-		LargestWin:    largestWin,
-		LargestLoss:   largestLoss,
-		AvgHoldTime:   fmt.Sprintf("%dd", avgHoldDays),
-		StartCapital:  capital,
-		EndCapital:    currentCapital,
-		EquityCurve:   equityCurve,
-	}
-}
-
-type backtestTrade struct {
-	entryPrice float64
-	exitPrice  float64
-	pnl        float64
-	pnlPercent float64
-	holdDays   int
-}
-
-type BacktestResults struct {
-	TotalTrades   int
-	WinningTrades int
-	LosingTrades  int
-	WinRate       float64
-	GrossProfit   float64
-	GrossLoss     float64
-	NetProfit     float64
-	TotalReturn   float64
-	MaxDrawdown   float64
-	SharpeRatio   float64
-	ProfitFactor  float64
-	AvgWin        float64
-	AvgLoss       float64
-	LargestWin    float64
-	LargestLoss   float64
-	AvgHoldTime   string
-	StartCapital  float64
-	EndCapital    float64
-	EquityCurve   []float64 // Track equity over time
-}
-
-func displayBacktestResults(output *Output, r BacktestResults) error {
+func displayBacktestResult(output *Output, r *trading.BacktestResult) error {
 	output.Bold("Backtest Results")
 	output.Println()
 
 	// Trade statistics
 	output.Bold("Trade Statistics")
-	output.Printf("  Total Trades:     %d\n", r.TotalTrades)
-	output.Printf("  Winning Trades:   %d (%.1f%%)\n", r.WinningTrades, r.WinRate)
-	output.Printf("  Losing Trades:    %d (%.1f%%)\n", r.LosingTrades, 100-r.WinRate)
-	output.Printf("  Avg Hold Time:    %s\n", r.AvgHoldTime)
+	output.Printf("  Total Trades:       %d\n", r.TotalTrades)
+	output.Printf("  Winning Trades:     %d (%.1f%%)\n", r.WinningTrades, r.WinRate)
+	output.Printf("  Losing Trades:      %d (%.1f%%)\n", r.LosingTrades, 100-r.WinRate)
+	output.Printf("  Avg Hold (bars):    %d\n", r.AvgHoldBars)
+	output.Printf("  Avg Win Hold:       %d bars\n", r.AvgWinHoldBars)
+	output.Printf("  Avg Loss Hold:      %d bars\n", r.AvgLossHoldBars)
 	output.Println()
 
 	// P&L
 	output.Bold("Profit & Loss")
-	output.Printf("  Gross Profit:     %s\n", output.Green(FormatIndianCurrency(r.GrossProfit)))
-	output.Printf("  Gross Loss:       %s\n", output.Red(FormatIndianCurrency(r.GrossLoss)))
-	output.Printf("  Net Profit:       %s\n", output.FormatPnL(r.NetProfit))
-	output.Printf("  Total Return:     %s\n", output.FormatPercent(r.TotalReturn))
+	output.Printf("  Gross Profit:       %s\n", output.Green(FormatIndianCurrency(r.GrossProfit)))
+	output.Printf("  Gross Loss:         %s\n", output.Red(FormatIndianCurrency(r.GrossLoss)))
+	output.Printf("  Net Profit:         %s\n", output.FormatPnL(r.NetProfit))
+	output.Printf("  Total Return:       %s\n", output.FormatPercent(r.TotalReturn))
+	output.Printf("  Annualized Return:  %s\n", output.FormatPercent(r.AnnualizedReturn))
 	output.Println()
 
 	// Performance metrics
 	output.Bold("Performance Metrics")
-	output.Printf("  Win Rate:         %.1f%%\n", r.WinRate)
-	output.Printf("  Profit Factor:    %.2f\n", r.ProfitFactor)
-	output.Printf("  Sharpe Ratio:     %.2f\n", r.SharpeRatio)
-	output.Printf("  Max Drawdown:     %s\n", output.Red(fmt.Sprintf("%.1f%%", r.MaxDrawdown)))
+	output.Printf("  Win Rate:           %.1f%%\n", r.WinRate)
+	output.Printf("  Profit Factor:      %.2f\n", r.ProfitFactor)
+	output.Printf("  Expectancy/Trade:   %s\n", FormatIndianCurrency(r.Expectancy))
+	output.Printf("  Sharpe Ratio:       %.2f\n", r.SharpeRatio)
+	output.Printf("  Sortino Ratio:      %.2f\n", r.SortinoRatio)
+	output.Printf("  Calmar Ratio:       %.2f\n", r.CalmarRatio)
+	output.Printf("  Max Drawdown:       %s\n", output.Red(fmt.Sprintf("%.1f%%", r.MaxDrawdown)))
 	output.Println()
 
 	// Trade analysis
 	output.Bold("Trade Analysis")
-	output.Printf("  Avg Win:          %s\n", FormatIndianCurrency(r.AvgWin))
-	output.Printf("  Avg Loss:         %s\n", FormatIndianCurrency(r.AvgLoss))
-	output.Printf("  Largest Win:      %s\n", FormatIndianCurrency(r.LargestWin))
-	output.Printf("  Largest Loss:     %s\n", FormatIndianCurrency(r.LargestLoss))
-	output.Printf("  Expectancy:       %s\n", FormatIndianCurrency(r.AvgWin*r.WinRate/100+r.AvgLoss*(100-r.WinRate)/100))
+	output.Printf("  Avg Win:            %s\n", FormatIndianCurrency(r.AvgWin))
+	output.Printf("  Avg Loss:           %s\n", FormatIndianCurrency(r.AvgLoss))
+	output.Printf("  Largest Win:        %s\n", FormatIndianCurrency(r.LargestWin))
+	output.Printf("  Largest Loss:       %s\n", FormatIndianCurrency(r.LargestLoss))
+	output.Printf("  Max Consec Wins:    %d\n", r.MaxConsecutiveWins)
+	output.Printf("  Max Consec Losses:  %d\n", r.MaxConsecutiveLosses)
 	output.Println()
 
 	// Capital
 	output.Bold("Capital")
-	output.Printf("  Start:            %s\n", FormatIndianCurrency(r.StartCapital))
-	output.Printf("  End:              %s\n", FormatIndianCurrency(r.EndCapital))
+	output.Printf("  Start:              %s\n", FormatIndianCurrency(r.StartCapital))
+	output.Printf("  End:                %s\n", FormatIndianCurrency(r.EndCapital))
 	output.Println()
 
+	// Exit reason breakdown
+	if len(r.Trades) > 0 {
+		exitReasons := make(map[string]int)
+		for _, t := range r.Trades {
+			exitReasons[t.ExitReason]++
+		}
+		output.Bold("Exit Reasons")
+		for reason, count := range exitReasons {
+			output.Printf("  %-20s %d (%.0f%%)\n", reason, count, float64(count)/float64(len(r.Trades))*100)
+		}
+		output.Println()
+	}
+
 	// Equity curve (ASCII)
-	output.Bold("Equity Curve")
-	drawEquityCurve(output, r.EquityCurve, r.StartCapital)
+	if len(r.EquityCurve) > 0 {
+		output.Bold("Equity Curve")
+		equitySlice := make([]float64, len(r.EquityCurve))
+		for i, ep := range r.EquityCurve {
+			equitySlice[i] = ep.Equity
+		}
+		drawEquityCurve(output, equitySlice, r.StartCapital)
+	}
 
 	return nil
 }
@@ -482,7 +368,6 @@ func drawEquityCurve(output *Output, equityCurve []float64, startCapital float64
 		return
 	}
 
-	// Find min/max for scaling
 	minEquity := equityCurve[0]
 	maxEquity := equityCurve[0]
 	for _, e := range equityCurve {
@@ -494,7 +379,6 @@ func drawEquityCurve(output *Output, equityCurve []float64, startCapital float64
 		}
 	}
 
-	// Add some padding
 	padding := (maxEquity - minEquity) * 0.1
 	if padding == 0 {
 		padding = startCapital * 0.05
@@ -502,11 +386,9 @@ func drawEquityCurve(output *Output, equityCurve []float64, startCapital float64
 	minEquity -= padding
 	maxEquity += padding
 
-	// Chart dimensions
 	width := 40
 	height := 8
 
-	// Create chart grid
 	chart := make([][]rune, height)
 	for i := range chart {
 		chart[i] = make([]rune, width)
@@ -515,16 +397,14 @@ func drawEquityCurve(output *Output, equityCurve []float64, startCapital float64
 		}
 	}
 
-	// Plot equity curve
 	for i := 0; i < len(equityCurve)-1; i++ {
 		x := i * width / len(equityCurve)
 		y := int((equityCurve[i] - minEquity) / (maxEquity - minEquity) * float64(height-1))
 		if y >= 0 && y < height && x >= 0 && x < width {
-			chart[height-1-y][x] = '█'
+			chart[height-1-y][x] = '\u2588'
 		}
 	}
 
-	// Print chart
 	for i := 0; i < height; i++ {
 		label := ""
 		if i == 0 {
@@ -534,9 +414,9 @@ func drawEquityCurve(output *Output, equityCurve []float64, startCapital float64
 		} else {
 			label = "        "
 		}
-		output.Printf("  %s │%s\n", label, string(chart[i]))
+		output.Printf("  %s \u2502%s\n", label, string(chart[i]))
 	}
-	output.Printf("          └%s\n", strings.Repeat("─", width))
+	output.Printf("          \u2514%s\n", strings.Repeat("\u2500", width))
 }
 
 func newExportCmd(app *App) *cobra.Command {

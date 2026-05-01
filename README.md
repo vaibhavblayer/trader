@@ -5,6 +5,7 @@ An AI-powered autonomous day trading CLI for the Indian stock market (NSE/BSE), 
 ## Features
 
 ### Market Data
+
 - Real-time quotes and live WebSocket streaming
 - Multi-symbol live streaming with table display
 - Predefined sector watchlists (NIFTY 50, Bank NIFTY, IT, Auto, Pharma, FMCG)
@@ -13,6 +14,7 @@ An AI-powered autonomous day trading CLI for the Indian stock market (NSE/BSE), 
 - Voice notifications for price alerts (macOS)
 
 ### Technical Analysis
+
 - 20+ indicators (RSI, MACD, Bollinger Bands, SuperTrend, ADX, etc.)
 - Candlestick pattern detection (Engulfing, Doji, Hammer, etc.)
 - Chart pattern recognition (Head & Shoulders, Triangles, Flags)
@@ -20,12 +22,14 @@ An AI-powered autonomous day trading CLI for the Indian stock market (NSE/BSE), 
 - Multi-timeframe analysis with confluence scoring
 
 ### AI-Powered Trading
+
 - Multiple specialized agents (Technical, News, Research, Risk)
 - Consensus-based decision making
 - Configurable autonomous modes (Manual, Notify, Semi-Auto, Full-Auto)
 - Full transparency with decision audit trail
 
 ### Indian Market Specific
+
 - MIS margin multipliers and peak margin tracking (SEBI compliant)
 - Circuit limit monitoring
 - Pre-market/closing session support
@@ -35,6 +39,7 @@ An AI-powered autonomous day trading CLI for the Indian stock market (NSE/BSE), 
 - FII/DII and MF flow tracking
 
 ### Order Management
+
 - Regular, bracket, and cover orders
 - GTT (Good Till Triggered) orders
 - Position and portfolio management
@@ -80,6 +85,7 @@ trader completion fish > ~/.config/fish/completions/trader.fish
 ```
 
 After setup, press Tab to autocomplete commands and flags:
+
 ```bash
 trader li<Tab>        # completes to 'trader live'
 trader live --<Tab>   # shows available flags
@@ -90,6 +96,7 @@ trader live --<Tab>   # shows available flags
 On first run, config templates are created at `~/.config/zerodha-trader/`:
 
 ### credentials.toml
+
 ```toml
 [zerodha]
 api_key = "your_api_key"
@@ -118,6 +125,7 @@ trader auth-status
 ```
 
 ### config.toml
+
 ```toml
 [trading]
 mode = "PAPER"  # PAPER or LIVE
@@ -130,7 +138,7 @@ max_daily_loss = 5000
 max_concurrent_positions = 5
 
 [agents]
-model = "gpt-4"
+model = "gpt-5.4-mini"
 autonomous_mode = "NOTIFY_ONLY"  # MANUAL, NOTIFY_ONLY, SEMI_AUTO, FULL_AUTO
 auto_execute_threshold = 85
 ```
@@ -257,7 +265,7 @@ AI PAPER TRADING
     -t, --window            Prediction time window (e.g., 5m, 15m, 1h)
     -c, --threshold         Minimum confidence threshold (default 60%)
     -i, --interval          Analysis interval in seconds (default 60)
-  
+
   Examples:
     trader paper RELIANCE INFY TCS    # Track predictions for symbols
     trader paper -w nifty50           # Paper trade NIFTY 50 stocks

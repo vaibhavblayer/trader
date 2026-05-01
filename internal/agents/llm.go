@@ -11,8 +11,9 @@ import (
 
 // OpenAIClient implements LLMClient using OpenAI API.
 type OpenAIClient struct {
-	client *openai.Client
-	model  string
+	client          *openai.Client
+	model           string
+	reasoningEffort string // "low", "medium", "high", or "" for default
 }
 
 // NewOpenAIClient creates a new OpenAI LLM client.
@@ -23,14 +24,27 @@ func NewOpenAIClient(apiKey string, model string) *OpenAIClient {
 	}
 }
 
+// NewOpenAIClientWithReasoning creates a new OpenAI LLM client with reasoning effort.
+func NewOpenAIClientWithReasoning(apiKey, model, reasoningEffort string) *OpenAIClient {
+	return &OpenAIClient{
+		client:          openai.NewClient(apiKey),
+		model:           model,
+		reasoningEffort: reasoningEffort,
+	}
+}
+
 // Complete sends a prompt to the LLM and returns the response.
 func (c *OpenAIClient) Complete(ctx context.Context, prompt string) (string, error) {
-	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	req := openai.ChatCompletionRequest{
 		Model: c.model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleUser, Content: prompt},
 		},
-	})
+	}
+	if c.reasoningEffort != "" {
+		req.ReasoningEffort = c.reasoningEffort
+	}
+	resp, err := c.client.CreateChatCompletion(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("openai completion failed: %w", err)
 	}
@@ -42,13 +56,17 @@ func (c *OpenAIClient) Complete(ctx context.Context, prompt string) (string, err
 
 // CompleteWithSystem sends a prompt with system message to the LLM.
 func (c *OpenAIClient) CompleteWithSystem(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+	req := openai.ChatCompletionRequest{
 		Model: c.model,
 		Messages: []openai.ChatCompletionMessage{
 			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
 			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 		},
-	})
+	}
+	if c.reasoningEffort != "" {
+		req.ReasoningEffort = c.reasoningEffort
+	}
+	resp, err := c.client.CreateChatCompletion(ctx, req)
 	if err != nil {
 		return "", fmt.Errorf("openai completion failed: %w", err)
 	}
@@ -106,11 +124,15 @@ func (c *OpenAIClient) CompleteWithToolsVerbose(ctx context.Context, systemPromp
 
 	// Allow up to 8 rounds of tool calls (increased for mini models that may call more tools)
 	for i := 0; i < 8; i++ {
-		resp, err := c.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		req := openai.ChatCompletionRequest{
 			Model:    c.model,
 			Messages: messages,
 			Tools:    tools,
-		})
+		}
+		if c.reasoningEffort != "" {
+			req.ReasoningEffort = c.reasoningEffort
+		}
+		resp, err := c.client.CreateChatCompletion(ctx, req)
 		if err != nil {
 			return nil, fmt.Errorf("openai completion failed: %w", err)
 		}
@@ -163,4 +185,14 @@ func (c *OpenAIClient) GetClient() *openai.Client {
 // GetModel returns the model name.
 func (c *OpenAIClient) GetModel() string {
 	return c.model
+}
+
+// GetReasoningEffort returns the reasoning effort setting.
+func (c *OpenAIClient) GetReasoningEffort() string {
+	return c.reasoningEffort
+}
+
+// SetReasoningEffort updates the reasoning effort setting.
+func (c *OpenAIClient) SetReasoningEffort(effort string) {
+	c.reasoningEffort = effort
 }

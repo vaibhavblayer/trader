@@ -746,6 +746,11 @@ func newTraderConfigCmd(app *App) *cobra.Command {
 			output.Println()
 
 			output.Printf("  Model:              %s\n", app.Config.Agents.Model)
+			if app.Config.Agents.ReasoningEffort != "" {
+				output.Printf("  Reasoning:          %s\n", app.Config.Agents.ReasoningEffort)
+			} else {
+				output.Printf("  Reasoning:          default\n")
+			}
 			output.Printf("  Autonomous Mode:    %s\n", app.Config.Agents.AutonomousMode)
 			output.Printf("  Auto Threshold:     %.0f%%\n", app.Config.Agents.AutoExecuteThreshold)
 			output.Printf("  Max Daily Trades:   %d\n", app.Config.Agents.MaxDailyTrades)

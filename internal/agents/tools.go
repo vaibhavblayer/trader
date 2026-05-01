@@ -1043,9 +1043,25 @@ func (te *ToolExecutor) fetchCandles(ctx context.Context, symbol, timeframe stri
 	
 	switch timeframe {
 	case "1min":
-		from = now.Add(-time.Duration(periods) * time.Minute)
+		// Ensure at least 2 days for 1min candles
+		minDays := 2
+		calculatedFrom := now.Add(-time.Duration(periods) * time.Minute)
+		minFrom := now.AddDate(0, 0, -minDays)
+		if calculatedFrom.After(minFrom) {
+			from = minFrom
+		} else {
+			from = calculatedFrom
+		}
 	case "5min":
-		from = now.Add(-time.Duration(periods*5) * time.Minute)
+		// Ensure at least 5 days for 5min candles to get enough for indicators
+		minDays := 5
+		calculatedFrom := now.Add(-time.Duration(periods*5) * time.Minute)
+		minFrom := now.AddDate(0, 0, -minDays)
+		if calculatedFrom.After(minFrom) {
+			from = minFrom
+		} else {
+			from = calculatedFrom
+		}
 	case "15min":
 		// Ensure at least 10 days of data for 15min candles to get enough for indicators
 		minDays := 10

@@ -94,8 +94,13 @@ api_key = ""
 
 const agentsTemplate = `# Zerodha Go Trader Agent Configuration
 
-# LLM model to use (e.g., gpt-5.2, gpt-4o)
-model = "gpt-5.2"
+# LLM model to use (e.g., gpt-5.4-mini, gpt-5.2, gpt-4o)
+model = "gpt-5.4-mini"
+
+# Reasoning effort for reasoning models (low, medium, high)
+# Leave empty to use model default. Only applies to reasoning-capable models.
+# Higher effort = better analysis but slower and more expensive.
+reasoning_effort = ""
 
 # Operating mode:
 #   FULL_AUTO   - AI executes trades automatically when confidence >= threshold

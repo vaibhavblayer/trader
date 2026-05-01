@@ -451,9 +451,12 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			analysisTicker := time.NewTicker(time.Duration(interval) * time.Second)
 			defer analysisTicker.Stop()
 
-			// Display ticker
-			displayTicker := time.NewTicker(500 * time.Millisecond)
-			defer displayTicker.Stop()
+			// Display ticker - only used in non-verbose mode
+			var displayTicker *time.Ticker
+			if !verbose {
+				displayTicker = time.NewTicker(500 * time.Millisecond)
+				defer displayTicker.Stop()
+			}
 
 			// Track last analysis time per symbol
 			lastAnalysis := make(map[string]time.Time)
@@ -462,9 +465,66 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			var lastAIStatus string
 			var lastAIStatusMu sync.Mutex
 
+			// In verbose mode, show initial header
+			if verbose {
+				output.Bold("🤖 AI Paper Trading - Live Verbose Mode")
+				output.Printf("  Symbols: %v | Window: %s | Threshold: %.0f%% | Interval: %ds\n", validSymbols, timeWindow, threshold, interval)
+				output.Println()
+				output.Dim("Live data updates every analysis cycle. Analysis logs scroll below.")
+				output.Println()
+			}
+
+			// Helper to print sticky header in verbose mode
+			printVerboseHeader := func(ticksCopy map[string]models.Tick) {
+				stats := tracker.GetStats()
+				
+				// Print separator and header
+				fmt.Println()
+				fmt.Println("\033[1;36m┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\033[0m")
+				fmt.Printf("\033[1;36m┃\033[0m 📊 \033[1mLIVE DATA\033[0m @ %s%s\033[1;36m┃\033[0m\n", 
+					time.Now().Format("15:04:05"), strings.Repeat(" ", 55))
+				fmt.Println("\033[1;36m┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\033[0m")
+				
+				for _, sym := range validSymbols {
+					if tick, ok := ticksCopy[sym]; ok {
+						change := 0.0
+						if tick.Close > 0 {
+							change = ((tick.LTP - tick.Close) / tick.Close) * 100
+						}
+						changeStr := fmt.Sprintf("%+.2f%%", change)
+						if change > 0 {
+							changeStr = fmt.Sprintf("\033[32m%+.2f%%\033[0m", change)
+						} else if change < 0 {
+							changeStr = fmt.Sprintf("\033[31m%+.2f%%\033[0m", change)
+						}
+						fmt.Printf("\033[1;36m┃\033[0m  \033[1m%-10s\033[0m ₹%-10.2f %s  Vol: %-12s \033[1;36m┃\033[0m\n", 
+							sym, tick.LTP, changeStr, FormatVolume(tick.Volume))
+					}
+				}
+				
+				// Stats line
+				decisiveCount := stats.RightPredictions + stats.WrongPredictions
+				winRateStr := fmt.Sprintf("%.1f%%", stats.WinRate)
+				if stats.WinRate >= 60 {
+					winRateStr = fmt.Sprintf("\033[32m%.1f%%\033[0m", stats.WinRate)
+				} else if stats.WinRate < 40 && decisiveCount > 0 {
+					winRateStr = fmt.Sprintf("\033[31m%.1f%%\033[0m", stats.WinRate)
+				}
+				fmt.Println("\033[1;36m┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫\033[0m")
+				fmt.Printf("\033[1;36m┃\033[0m  ✓ Right: \033[32m%d\033[0m  ✗ Wrong: \033[31m%d\033[0m  ⏰ Expired: %d  │  Win Rate: %s  │  Avg P&L: %.2f%% \033[1;36m┃\033[0m\n",
+					stats.RightPredictions, stats.WrongPredictions, stats.ExpiredPredictions, winRateStr, stats.AvgPnLPercent)
+				fmt.Println("\033[1;36m┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\033[0m")
+			}
+
 			for {
 				select {
-				case <-displayTicker.C:
+				case <-func() <-chan time.Time {
+					if displayTicker != nil {
+						return displayTicker.C
+					}
+					// Return a channel that never fires for verbose mode
+					return make(chan time.Time)
+				}():
 					tickMu.Lock()
 					prices := make(map[string]float64)
 					for sym, tick := range latestTicks {
@@ -485,7 +545,7 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 						lastAIStatusMu.Unlock()
 					}
 
-					// Display
+					// Display (only in non-verbose mode)
 					lastAIStatusMu.Lock()
 					displayPaperTradingWithStatus(output, validSymbols, latestTicks, tracker, lastAIStatus)
 					lastAIStatusMu.Unlock()
@@ -497,6 +557,62 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 						ticksCopy[k] = v
 					}
 					tickMu.Unlock()
+
+					// Check expired predictions in verbose mode
+					if verbose {
+						tickMu.Lock()
+						prices := make(map[string]float64)
+						for sym, tick := range latestTicks {
+							prices[sym] = tick.LTP
+						}
+						tickMu.Unlock()
+						
+						expired := tracker.CheckExpiredPredictions(prices)
+						for _, p := range expired {
+							speakPredictionResult(p)
+							if p.Outcome == "RIGHT" {
+								fmt.Printf("  \033[1;32m✅ PREDICTION RESULT: %s %s was RIGHT (+%.2f%%)\033[0m\n", p.Action, p.Symbol, p.PnLPercent)
+							} else if p.Outcome == "WRONG" {
+								fmt.Printf("  \033[1;31m❌ PREDICTION RESULT: %s %s was WRONG (%.2f%%)\033[0m\n", p.Action, p.Symbol, p.PnLPercent)
+							} else {
+								fmt.Printf("  \033[33m⏰ PREDICTION EXPIRED: %s %s (%.2f%%)\033[0m\n", p.Action, p.Symbol, p.PnLPercent)
+							}
+						}
+					}
+
+					// Check if any symbol needs analysis
+					needsAnalysis := false
+					for _, symbol := range validSymbols {
+						tick, ok := ticksCopy[symbol]
+						if !ok || tick.LTP == 0 {
+							continue
+						}
+						if last, ok := lastAnalysis[symbol]; !ok || time.Since(last) >= time.Duration(interval)*time.Second {
+							needsAnalysis = true
+							break
+						}
+					}
+
+					// In verbose mode, show live data header only when analysis will happen
+					if verbose && needsAnalysis {
+						printVerboseHeader(ticksCopy)
+						
+						// Show active predictions
+						predictions := tracker.GetActivePredictions()
+						if len(predictions) > 0 {
+							fmt.Println("\033[33m  📌 Active Predictions:\033[0m")
+							for _, p := range predictions {
+								remaining := time.Until(p.ExpiresAt)
+								actionColor := "\033[32m" // Green for BUY
+								if p.Action == "SELL" {
+									actionColor = "\033[31m" // Red for SELL
+								}
+								fmt.Printf("     %s%s\033[0m %s @ ₹%.2f → Target: ₹%.2f, SL: ₹%.2f (expires in %dm%ds)\n",
+									actionColor, p.Action, p.Symbol, p.EntryPrice, p.TargetPrice, p.StopLoss,
+									int(remaining.Minutes()), int(remaining.Seconds())%60)
+							}
+						}
+					}
 
 					// Analyze each symbol
 					for _, symbol := range validSymbols {
@@ -510,34 +626,97 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 							continue
 						}
 
-						// Update status
-						lastAIStatusMu.Lock()
-						lastAIStatus = fmt.Sprintf("🔍 Analyzing %s at ₹%.2f...", symbol, tick.LTP)
-						lastAIStatusMu.Unlock()
+						// Update status (for non-verbose mode)
+						if !verbose {
+							lastAIStatusMu.Lock()
+							lastAIStatus = fmt.Sprintf("🔍 Analyzing %s at ₹%.2f...", symbol, tick.LTP)
+							lastAIStatusMu.Unlock()
+						}
 
-						// Get AI prediction
-						prediction, err := getAIPrediction(ctx, app, symbol, tick.LTP, timeWindow, threshold, tracker, useTools)
+						// Get AI prediction with verbose output
+						result, err := getAIPredictionVerbose(ctx, app, symbol, tick.LTP, timeWindow, threshold, tracker, useTools)
 						lastAnalysis[symbol] = time.Now()
 						
 						if err != nil {
-							lastAIStatusMu.Lock()
-							lastAIStatus = fmt.Sprintf("⚠ AI error for %s: %v", symbol, err)
-							lastAIStatusMu.Unlock()
+							if verbose {
+								fmt.Printf("  ⚠ AI error for %s: %v\n", symbol, err)
+							} else {
+								lastAIStatusMu.Lock()
+								lastAIStatus = fmt.Sprintf("⚠ AI error for %s: %v", symbol, err)
+								lastAIStatusMu.Unlock()
+							}
 							continue
 						}
 
+						// Show verbose chain of thought if enabled
+						if verbose && result.ChainOfThought != nil {
+							fmt.Println("  ╔══════════════════════════════════════════════════════════════")
+							fmt.Printf("  ║ 🔍 ANALYSIS: %s @ ₹%.2f (%s)\n", symbol, tick.LTP, time.Now().Format("15:04:05"))
+							fmt.Println("  ╠══════════════════════════════════════════════════════════════")
+							
+							// Show each tool call with symbolic interpretation
+							if len(result.ChainOfThought.ToolCalls) > 0 {
+								fmt.Println("  ║ TOOL CALLS:")
+								for i, tc := range result.ChainOfThought.ToolCalls {
+									fmt.Printf("  ║ ┌─ [%d] %s\n", i+1, tc.ToolName)
+									// Show arguments if present
+									if tc.Arguments != "" && tc.Arguments != "{}" {
+										fmt.Printf("  ║ │  Args: %s\n", tc.Arguments)
+									}
+									// Parse and show symbolic interpretation
+									symbolic := parseToolResultSymbolic(tc.ToolName, tc.Result)
+									for _, line := range symbolic {
+										fmt.Printf("  ║ │  → %s\n", line)
+									}
+									fmt.Println("  ║ └─")
+								}
+							}
+							
+							// Show gate evaluation
+							fmt.Println("  ╠══════════════════════════════════════════════════════════════")
+							fmt.Println("  ║ GATE EVALUATION:")
+							gateResults := extractGateResults(result.ChainOfThought.Response)
+							for _, gate := range gateResults {
+								fmt.Printf("  ║   %s\n", gate)
+							}
+							
+							// Show final decision
+							fmt.Println("  ╠══════════════════════════════════════════════════════════════")
+							if result.Prediction != nil {
+								fmt.Printf("  ║ DECISION: %s (Confidence: %.0f%%)\n", result.Prediction.Action, result.Prediction.Confidence)
+								fmt.Printf("  ║ REASONING: %s\n", result.Prediction.Reasoning)
+								fmt.Printf("  ║ TARGET: ₹%.2f | STOP LOSS: ₹%.2f | WINDOW: %s\n", 
+									result.Prediction.TargetPrice, result.Prediction.StopLoss, result.Prediction.TimeWindow)
+							} else {
+								fmt.Println("  ║ DECISION: NO_TRADE (gates failed or insufficient edge)")
+							}
+							fmt.Println("  ╚══════════════════════════════════════════════════════════════")
+							fmt.Println()
+						}
+
+						prediction := result.Prediction
 						if prediction != nil {
 							tracker.AddPrediction(prediction)
 							speakNewPrediction(prediction)
-							lastAIStatusMu.Lock()
-							lastAIStatus = fmt.Sprintf("🎯 NEW: %s %s @ ₹%.2f (%.0f%% conf) → Target: ₹%.2f, SL: ₹%.2f\n   📊 Reason: %s", 
-								prediction.Action, symbol, prediction.EntryPrice, prediction.Confidence,
-								prediction.TargetPrice, prediction.StopLoss, prediction.Reasoning)
-							lastAIStatusMu.Unlock()
+							if verbose {
+								fmt.Printf("  🎯 NEW PREDICTION: %s %s @ ₹%.2f (%.0f%% conf)\n", 
+									prediction.Action, symbol, prediction.EntryPrice, prediction.Confidence)
+								fmt.Printf("     Target: ₹%.2f | SL: ₹%.2f | Window: %s\n",
+									prediction.TargetPrice, prediction.StopLoss, prediction.TimeWindow)
+								fmt.Printf("     Reason: %s\n\n", prediction.Reasoning)
+							} else {
+								lastAIStatusMu.Lock()
+								lastAIStatus = fmt.Sprintf("🎯 NEW: %s %s @ ₹%.2f (%.0f%% conf) → Target: ₹%.2f, SL: ₹%.2f\n   📊 Reason: %s", 
+									prediction.Action, symbol, prediction.EntryPrice, prediction.Confidence,
+									prediction.TargetPrice, prediction.StopLoss, prediction.Reasoning)
+								lastAIStatusMu.Unlock()
+							}
 						} else {
-							lastAIStatusMu.Lock()
-							lastAIStatus = fmt.Sprintf("⏸ AI suggests HOLD for %s (no clear signal)", symbol)
-							lastAIStatusMu.Unlock()
+							if !verbose {
+								lastAIStatusMu.Lock()
+								lastAIStatus = fmt.Sprintf("⏸ AI suggests HOLD for %s (no clear signal)", symbol)
+								lastAIStatusMu.Unlock()
+							}
 						}
 					}
 				}
@@ -1423,6 +1602,432 @@ func speakPredictionResult(p *Prediction) {
 	speak(msg)
 }
 
+// parseToolResultSymbolic parses tool output into symbolic expressions for transparent logging.
+// Example: RSI tool result → "RSI: 48.07 < 50 → BEARISH"
+func parseToolResultSymbolic(toolName string, result string) []string {
+	var lines []string
+	
+	// Check for error first
+	if strings.Contains(result, "Error") || strings.Contains(result, "error") {
+		// Extract just the error message
+		resultLines := strings.Split(result, "\n")
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if line != "" && len(lines) < 2 {
+				lines = append(lines, line)
+			}
+		}
+		return lines
+	}
+	
+	// Parse text output - extract key values line by line
+	resultLines := strings.Split(result, "\n")
+	
+	switch toolName {
+	case "calculate_rsi":
+		var rsi, prevRsi float64
+		var momentum string
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Current:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					fmt.Sscanf(parts[1], "%f", &rsi)
+				}
+				if strings.Contains(line, "BEARISH") {
+					momentum = "BEARISH"
+				} else if strings.Contains(line, "BULLISH") {
+					momentum = "BULLISH"
+				} else {
+					momentum = "NEUTRAL"
+				}
+			} else if strings.HasPrefix(line, "Previous:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					fmt.Sscanf(parts[1], "%f", &prevRsi)
+				}
+			}
+		}
+		
+		rsiZone := momentum
+		if rsi > 70 {
+			rsiZone = "OVERBOUGHT"
+		} else if rsi > 55 {
+			rsiZone = "BULLISH"
+		} else if rsi < 30 {
+			rsiZone = "OVERSOLD"
+		} else if rsi < 45 {
+			rsiZone = "BEARISH"
+		} else if rsi >= 45 && rsi <= 55 {
+			rsiZone = "CHOP ZONE (45-55)"
+		}
+		lines = append(lines, fmt.Sprintf("RSI: %.2f → %s", rsi, rsiZone))
+		
+		if prevRsi > 0 {
+			direction := "FLAT"
+			if rsi > prevRsi+0.5 {
+				direction = "RISING ↑"
+			} else if rsi < prevRsi-0.5 {
+				direction = "FALLING ↓"
+			}
+			lines = append(lines, fmt.Sprintf("Direction: %.2f → %.2f = %s", prevRsi, rsi, direction))
+		}
+		
+	case "analyze_volume":
+		var currVol, avgVol, ratio float64
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Current Volume:") {
+				fmt.Sscanf(line, "Current Volume: %f", &currVol)
+			} else if strings.Contains(line, "Avg Volume:") || strings.Contains(line, "Average") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 2 {
+					fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &avgVol)
+				}
+			} else if strings.HasPrefix(line, "Volume Ratio:") {
+				fmt.Sscanf(line, "Volume Ratio: %f", &ratio)
+			}
+		}
+		
+		if ratio == 0 && avgVol > 0 {
+			ratio = currVol / avgVol
+		}
+		
+		volStatus := "LOW"
+		if ratio > 2.0 {
+			volStatus = "HIGH EXPANSION ✓✓"
+		} else if ratio > 1.5 {
+			volStatus = "GOOD EXPANSION ✓"
+		} else if ratio > 1.3 {
+			volStatus = "ACCEPTABLE ✓"
+		} else if ratio > 1.0 {
+			volStatus = "NORMAL"
+		}
+		lines = append(lines, fmt.Sprintf("Volume: %.0f vs Avg %.0f = %.2fx → %s", currVol, avgVol, ratio, volStatus))
+		
+	case "calculate_ema_crossover":
+		var ema9, ema21 float64
+		var trend string
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "Fast EMA") || strings.Contains(line, "EMA(9)") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 2 {
+					fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &ema9)
+				}
+			} else if strings.Contains(line, "Slow EMA") || strings.Contains(line, "EMA(21)") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 2 {
+					fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &ema21)
+				}
+			} else if strings.Contains(line, "Trend:") {
+				parts := strings.Split(line, ":")
+				if len(parts) >= 2 {
+					trend = strings.TrimSpace(parts[1])
+				}
+			}
+		}
+		
+		alignment := "UNKNOWN"
+		if ema9 > ema21 {
+			alignment = "BULLISH (EMA9 > EMA21)"
+		} else if ema9 < ema21 {
+			alignment = "BEARISH (EMA9 < EMA21)"
+		}
+		lines = append(lines, fmt.Sprintf("EMA9: %.2f | EMA21: %.2f", ema9, ema21))
+		if trend != "" {
+			lines = append(lines, fmt.Sprintf("Trend: %s → %s", trend, alignment))
+		} else {
+			lines = append(lines, fmt.Sprintf("Structure: %s", alignment))
+		}
+		
+	case "calculate_vwap":
+		var vwap, price, deviation float64
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "VWAP:") {
+				fmt.Sscanf(line, "VWAP: %f", &vwap)
+			} else if strings.HasPrefix(line, "Current Price:") {
+				fmt.Sscanf(line, "Current Price: %f", &price)
+			} else if strings.HasPrefix(line, "Deviation:") {
+				// Parse "Deviation: -0.18%" - handle the % sign
+				devStr := strings.TrimPrefix(line, "Deviation:")
+				devStr = strings.TrimSpace(devStr)
+				devStr = strings.TrimSuffix(devStr, "%")
+				fmt.Sscanf(devStr, "%f", &deviation)
+			}
+		}
+		
+		exhaustion := "OK"
+		if deviation > 0.7 {
+			exhaustion = "STRETCHED HIGH ✗"
+		} else if deviation < -0.7 {
+			exhaustion = "STRETCHED LOW ✗"
+		} else if deviation > 0.3 {
+			exhaustion = "ABOVE VWAP"
+		} else if deviation < -0.3 {
+			exhaustion = "BELOW VWAP"
+		} else {
+			exhaustion = "AT VWAP ✓"
+		}
+		lines = append(lines, fmt.Sprintf("VWAP: %.2f | Price: %.2f | Dev: %.2f%%", vwap, price, deviation))
+		lines = append(lines, fmt.Sprintf("Exhaustion Check: %s", exhaustion))
+		
+	case "calculate_adx":
+		var adx, plusDI, minusDI float64
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "ADX:") || strings.HasPrefix(line, "Current ADX:") {
+				parts := strings.Fields(line)
+				for i, p := range parts {
+					if (p == "ADX:" || p == "Current") && i+1 < len(parts) {
+						fmt.Sscanf(parts[i+1], "%f", &adx)
+						if adx > 0 {
+							break
+						}
+					}
+				}
+			} else if strings.HasPrefix(line, "+DI:") {
+				fmt.Sscanf(line, "+DI: %f", &plusDI)
+			} else if strings.HasPrefix(line, "-DI:") {
+				fmt.Sscanf(line, "-DI: %f", &minusDI)
+			}
+		}
+		
+		strength := "NO TREND ✗"
+		if adx > 35 {
+			strength = "STRONG TREND ✓✓"
+		} else if adx > 25 {
+			strength = "TRENDING ✓"
+		} else if adx > 20 {
+			strength = "WEAK TREND"
+		}
+		lines = append(lines, fmt.Sprintf("ADX: %.2f → %s", adx, strength))
+		if plusDI > 0 || minusDI > 0 {
+			lines = append(lines, fmt.Sprintf("+DI: %.2f | -DI: %.2f", plusDI, minusDI))
+		}
+		
+	case "calculate_bollinger_bands":
+		var upper, middle, lower, price float64
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Upper Band:") {
+				fmt.Sscanf(line, "Upper Band: %f", &upper)
+			} else if strings.HasPrefix(line, "Middle Band:") {
+				fmt.Sscanf(line, "Middle Band: %f", &middle)
+			} else if strings.HasPrefix(line, "Lower Band:") {
+				fmt.Sscanf(line, "Lower Band: %f", &lower)
+			} else if strings.HasPrefix(line, "Current Price:") {
+				fmt.Sscanf(line, "Current Price: %f", &price)
+			}
+		}
+		
+		position := "MIDDLE"
+		if price > 0 && upper > 0 && lower > 0 {
+			if price > upper {
+				position = "ABOVE UPPER ⚠"
+			} else if price > middle+(upper-middle)*0.8 {
+				position = "NEAR UPPER"
+			} else if price < lower {
+				position = "BELOW LOWER ⚠"
+			} else if price < middle-(middle-lower)*0.8 {
+				position = "NEAR LOWER"
+			}
+		}
+		lines = append(lines, fmt.Sprintf("BB: [%.2f - %.2f - %.2f]", lower, middle, upper))
+		lines = append(lines, fmt.Sprintf("Price: %.2f → %s", price, position))
+		
+	case "calculate_atr":
+		var atr, pctOfPrice float64
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Current ATR:") {
+				fmt.Sscanf(line, "Current ATR: %f", &atr)
+				if idx := strings.Index(line, "("); idx > 0 {
+					fmt.Sscanf(line[idx:], "(%f%% of price)", &pctOfPrice)
+				}
+			}
+		}
+		lines = append(lines, fmt.Sprintf("ATR: %.2f (%.2f%% of price)", atr, pctOfPrice))
+		
+	case "detect_candlestick_patterns":
+		var patterns []string
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "•") || strings.HasPrefix(line, "-") || strings.HasPrefix(line, "*") {
+				pattern := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(line, "•"), "-"), "*")
+				pattern = strings.TrimSpace(pattern)
+				if pattern != "" && len(patterns) < 5 {
+					patterns = append(patterns, pattern)
+				}
+			}
+		}
+		if len(patterns) > 0 {
+			lines = append(lines, "Patterns found:")
+			for _, p := range patterns {
+				lines = append(lines, fmt.Sprintf("  • %s", p))
+			}
+		} else {
+			lines = append(lines, "No significant patterns")
+		}
+		
+	case "get_support_resistance":
+		var r1, r2, s1, s2, pivot float64
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Pivot:") || strings.HasPrefix(line, "PP:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					fmt.Sscanf(parts[1], "%f", &pivot)
+				}
+			} else if strings.HasPrefix(line, "R1:") {
+				fmt.Sscanf(line, "R1: %f", &r1)
+			} else if strings.HasPrefix(line, "R2:") {
+				fmt.Sscanf(line, "R2: %f", &r2)
+			} else if strings.HasPrefix(line, "S1:") {
+				fmt.Sscanf(line, "S1: %f", &s1)
+			} else if strings.HasPrefix(line, "S2:") {
+				fmt.Sscanf(line, "S2: %f", &s2)
+			}
+		}
+		if pivot > 0 {
+			lines = append(lines, fmt.Sprintf("Pivot: %.2f", pivot))
+		}
+		if r1 > 0 || r2 > 0 {
+			lines = append(lines, fmt.Sprintf("Resistance: R1=%.2f R2=%.2f", r1, r2))
+		}
+		if s1 > 0 || s2 > 0 {
+			lines = append(lines, fmt.Sprintf("Support: S1=%.2f S2=%.2f", s1, s2))
+		}
+		
+	default:
+		// For unknown tools, show first few meaningful lines
+		count := 0
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if line != "" && count < 5 {
+				lines = append(lines, line)
+				count++
+			}
+		}
+	}
+	
+	if len(lines) == 0 {
+		// Fallback: show first few lines of raw output
+		count := 0
+		for _, line := range resultLines {
+			line = strings.TrimSpace(line)
+			if line != "" && count < 3 {
+				lines = append(lines, line)
+				count++
+			}
+		}
+	}
+	
+	if len(lines) == 0 {
+		lines = append(lines, "(no data)")
+	}
+	
+	return lines
+}
+
+// extractGateResults parses the AI response JSON to extract gate pass/fail status.
+func extractGateResults(response string) []string {
+	var lines []string
+	
+	// Find JSON in response
+	start := strings.Index(response, "{")
+	end := strings.LastIndex(response, "}")
+	if start == -1 || end == -1 || end <= start {
+		return []string{"(could not parse gates)"}
+	}
+	jsonStr := response[start : end+1]
+	
+	var result struct {
+		GatesPassed struct {
+			RSIRegime        bool `json:"rsi_regime"`
+			RSIDirection     bool `json:"rsi_direction"`
+			VolumeExpansion  bool `json:"volume_expansion"`
+			EMAAlignment     bool `json:"ema_alignment"`
+			VWAPNotExhausted bool `json:"vwap_not_exhausted"`
+			TrendStrength    bool `json:"trend_strength"`
+		} `json:"gates_passed"`
+		SignalQuality struct {
+			RSIValue         float64 `json:"rsi_value"`
+			RSIDirection     string  `json:"rsi_direction"`
+			VolumeRatio      float64 `json:"volume_ratio"`
+			VWAPDeviationPct float64 `json:"vwap_deviation_pct"`
+			ADXValue         float64 `json:"adx_value"`
+			EMATrend         string  `json:"ema_trend"`
+		} `json:"signal_quality"`
+		Confidence float64 `json:"confidence"`
+	}
+	
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		return []string{"(could not parse gates)"}
+	}
+	
+	// Format gate results with pass/fail indicators
+	passIcon := "✓"
+	failIcon := "✗"
+	
+	// RSI Regime Gate
+	rsiGate := result.GatesPassed.RSIRegime || result.GatesPassed.RSIDirection
+	icon := failIcon
+	if rsiGate {
+		icon = passIcon
+	}
+	lines = append(lines, fmt.Sprintf("[%s] RSI Regime: %.1f %s (need >55↑ for BUY, <45↓ for SELL)", 
+		icon, result.SignalQuality.RSIValue, result.SignalQuality.RSIDirection))
+	
+	// Volume Expansion Gate
+	icon = failIcon
+	if result.GatesPassed.VolumeExpansion {
+		icon = passIcon
+	}
+	lines = append(lines, fmt.Sprintf("[%s] Volume Expansion: %.2fx (need >1.3x)", 
+		icon, result.SignalQuality.VolumeRatio))
+	
+	// EMA Alignment Gate
+	icon = failIcon
+	if result.GatesPassed.EMAAlignment {
+		icon = passIcon
+	}
+	lines = append(lines, fmt.Sprintf("[%s] EMA Alignment: %s", 
+		icon, result.SignalQuality.EMATrend))
+	
+	// VWAP Exhaustion Gate
+	icon = failIcon
+	if result.GatesPassed.VWAPNotExhausted {
+		icon = passIcon
+	}
+	lines = append(lines, fmt.Sprintf("[%s] VWAP Not Exhausted: %.2f%% (need <0.7%%)", 
+		icon, result.SignalQuality.VWAPDeviationPct))
+	
+	// Trend Strength Gate
+	icon = failIcon
+	if result.GatesPassed.TrendStrength {
+		icon = passIcon
+	}
+	lines = append(lines, fmt.Sprintf("[%s] Trend Strength: ADX %.1f (need >25)", 
+		icon, result.SignalQuality.ADXValue))
+	
+	// Summary
+	allPassed := rsiGate && 
+		result.GatesPassed.VolumeExpansion && 
+		result.GatesPassed.EMAAlignment &&
+		result.GatesPassed.VWAPNotExhausted &&
+		result.GatesPassed.TrendStrength
+	
+	if allPassed {
+		lines = append(lines, fmt.Sprintf("─── ALL GATES PASSED (Confidence: %.0f%%) ───", result.Confidence))
+	} else {
+		lines = append(lines, "─── GATES FAILED → NO_TRADE ───")
+	}
+	
+	return lines
+}
+
 // runBacktestMode runs the paper trading in backtest mode using historical data.
 func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []string, exchange string, timeWindow time.Duration, threshold float64, useTools bool, days int, fromDate, toDate string, verbose bool) error {
 	// Parse date range
@@ -1522,34 +2127,55 @@ func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []st
 				continue
 			}
 
-			// Show verbose chain of thought if enabled
-			if verbose && result.ChainOfThought != nil && len(result.ChainOfThought.ToolCalls) > 0 {
+			// Show verbose chain of thought if enabled - with full transparency
+			if verbose && result.ChainOfThought != nil {
 				output.Println()
-				output.Bold("  🔍 AI Analysis for %s @ ₹%.2f (%s)", symbol, currentPrice, currentCandle.Timestamp.Format("Jan 02 15:04"))
-				output.Println()
-				for _, tc := range result.ChainOfThought.ToolCalls {
-					output.Printf("  📊 Tool: %s\n", tc.ToolName)
-					// Show truncated result (first 200 chars)
-					resultPreview := tc.Result
-					if len(resultPreview) > 300 {
-						resultPreview = resultPreview[:300] + "..."
+				output.Bold("  ╔══════════════════════════════════════════════════════════════")
+				output.Bold("  ║ 🔍 ANALYSIS: %s @ ₹%.2f (%s)", symbol, currentPrice, currentCandle.Timestamp.Format("Jan 02 15:04"))
+				output.Bold("  ╠══════════════════════════════════════════════════════════════")
+				
+				// Show each tool call with symbolic interpretation
+				if len(result.ChainOfThought.ToolCalls) > 0 {
+					output.Printf("  ║ TOOL CALLS:\n")
+					for i, tc := range result.ChainOfThought.ToolCalls {
+						output.Printf("  ║ ┌─ [%d] %s\n", i+1, tc.ToolName)
+						// Show arguments if present
+						if tc.Arguments != "" && tc.Arguments != "{}" {
+							output.Printf("  ║ │  Args: %s\n", tc.Arguments)
+						}
+						// Parse and show symbolic interpretation
+						symbolic := parseToolResultSymbolic(tc.ToolName, tc.Result)
+						for _, line := range symbolic {
+							output.Printf("  ║ │  → %s\n", line)
+						}
+						output.Printf("  ║ └─\n")
 					}
-					// Indent the result
-					lines := strings.Split(resultPreview, "\n")
-					for _, line := range lines {
-						output.Dim("     %s", line)
-					}
-					output.Println()
 				}
+				
+				// Show gate evaluation
+				output.Printf("  ╠══════════════════════════════════════════════════════════════\n")
+				output.Printf("  ║ GATE EVALUATION:\n")
+				gateResults := extractGateResults(result.ChainOfThought.Response)
+				for _, gate := range gateResults {
+					output.Printf("  ║   %s\n", gate)
+				}
+				
+				// Show final decision
+				output.Printf("  ╠══════════════════════════════════════════════════════════════\n")
+				if result.Prediction != nil {
+					output.Printf("  ║ DECISION: %s (Confidence: %.0f%%)\n", result.Prediction.Action, result.Prediction.Confidence)
+					output.Printf("  ║ REASONING: %s\n", result.Prediction.Reasoning)
+				} else {
+					output.Printf("  ║ DECISION: NO_TRADE (gates failed or insufficient edge)\n")
+				}
+				output.Printf("  ╚══════════════════════════════════════════════════════════════\n")
+				output.Println()
 			}
 
 			prediction := result.Prediction
 			if prediction == nil {
 				// NO_TRADE is risk avoidance - don't score it, just show as avoided
-				if verbose {
-					output.Dim("  ⏸ NO_TRADE @ ₹%.2f - Risk avoided (gates failed or chop zone)", currentPrice)
-					output.Println()
-				} else {
+				if !verbose {
 					output.Dim("  %s @ ₹%.2f: AVOIDED (no clear edge)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
 				}
 				// Track avoidance count but don't score as RIGHT/WRONG
@@ -1564,7 +2190,9 @@ func runBacktestMode(ctx context.Context, app *App, output *Output, symbols []st
 			
 			// Only allow explicit BUY or SELL - everything else is avoided
 			if action != "BUY" && action != "SELL" {
-				output.Dim("  %s @ ₹%.2f: AVOIDED (no trade signal)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
+				if !verbose {
+					output.Dim("  %s @ ₹%.2f: AVOIDED (no trade signal)", currentCandle.Timestamp.Format("Jan 02 15:04"), currentPrice)
+				}
 				tracker.mu.Lock()
 				tracker.stats.ExpiredPredictions++
 				tracker.mu.Unlock()

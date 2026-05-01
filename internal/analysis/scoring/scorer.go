@@ -7,6 +7,7 @@ import (
 
 	"zerodha-trader/internal/analysis"
 	"zerodha-trader/internal/analysis/indicators"
+	"zerodha-trader/internal/analysis/patterns"
 	"zerodha-trader/internal/models"
 )
 
@@ -25,18 +26,50 @@ type IndicatorWeights struct {
 	ADX        float64
 	EMA        float64
 	Volume     float64
+	Divergence float64
 }
 
 // DefaultWeights returns the default indicator weights.
 func DefaultWeights() IndicatorWeights {
 	return IndicatorWeights{
-		RSI:        0.20,
-		MACD:       0.20,
-		Stochastic: 0.15,
+		RSI:        0.15,
+		MACD:       0.15,
+		Stochastic: 0.10,
 		SuperTrend: 0.15,
 		ADX:        0.10,
 		EMA:        0.10,
 		Volume:     0.10,
+		Divergence: 0.15,
+	}
+}
+
+// TrendingWeights returns weights optimized for trending markets.
+// Trend-following indicators get boosted, mean-reversion gets reduced.
+func TrendingWeights() IndicatorWeights {
+	return IndicatorWeights{
+		RSI:        0.08,
+		MACD:       0.20,
+		Stochastic: 0.05,
+		SuperTrend: 0.22,
+		ADX:        0.15,
+		EMA:        0.15,
+		Volume:     0.10,
+		Divergence: 0.05,
+	}
+}
+
+// RangingWeights returns weights optimized for ranging/sideways markets.
+// Mean-reversion indicators get boosted, trend-following gets reduced.
+func RangingWeights() IndicatorWeights {
+	return IndicatorWeights{
+		RSI:        0.22,
+		MACD:       0.10,
+		Stochastic: 0.18,
+		SuperTrend: 0.05,
+		ADX:        0.05,
+		EMA:        0.08,
+		Volume:     0.12,
+		Divergence: 0.20,
 	}
 }
 
@@ -58,10 +91,14 @@ func NewSignalScorerWithWeights(engine *indicators.Engine, weights IndicatorWeig
 
 // Score calculates a composite signal score for the given candles.
 // Returns a score from -100 (strong sell) to +100 (strong buy).
+// Automatically adapts indicator weights based on detected market regime.
 func (s *SignalScorer) Score(ctx context.Context, candles []models.Candle) (*analysis.SignalScore, error) {
 	if len(candles) < 50 {
 		return nil, fmt.Errorf("insufficient data: need at least 50 candles, got %d", len(candles))
 	}
+
+	// Detect market regime and select appropriate weights
+	weights := s.selectWeightsForRegime(candles)
 
 	components := make(map[string]float64)
 	var totalScore float64
@@ -71,55 +108,63 @@ func (s *SignalScorer) Score(ctx context.Context, candles []models.Candle) (*ana
 	rsiScore, err := s.calculateRSIScore(candles)
 	if err == nil {
 		components["RSI"] = rsiScore
-		totalScore += rsiScore * s.weights.RSI
-		totalWeight += s.weights.RSI
+		totalScore += rsiScore * weights.RSI
+		totalWeight += weights.RSI
 	}
 
 	// Calculate MACD score
 	macdScore, err := s.calculateMACDScore(candles)
 	if err == nil {
 		components["MACD"] = macdScore
-		totalScore += macdScore * s.weights.MACD
-		totalWeight += s.weights.MACD
+		totalScore += macdScore * weights.MACD
+		totalWeight += weights.MACD
 	}
 
 	// Calculate Stochastic score
 	stochScore, err := s.calculateStochasticScore(candles)
 	if err == nil {
 		components["Stochastic"] = stochScore
-		totalScore += stochScore * s.weights.Stochastic
-		totalWeight += s.weights.Stochastic
+		totalScore += stochScore * weights.Stochastic
+		totalWeight += weights.Stochastic
 	}
 
 	// Calculate SuperTrend score
 	superTrendScore, err := s.calculateSuperTrendScore(candles)
 	if err == nil {
 		components["SuperTrend"] = superTrendScore
-		totalScore += superTrendScore * s.weights.SuperTrend
-		totalWeight += s.weights.SuperTrend
+		totalScore += superTrendScore * weights.SuperTrend
+		totalWeight += weights.SuperTrend
 	}
 
 	// Calculate ADX score
 	adxScore, err := s.calculateADXScore(candles)
 	if err == nil {
 		components["ADX"] = adxScore
-		totalScore += adxScore * s.weights.ADX
-		totalWeight += s.weights.ADX
+		totalScore += adxScore * weights.ADX
+		totalWeight += weights.ADX
 	}
 
 	// Calculate EMA crossover score
 	emaScore, err := s.calculateEMAScore(candles)
 	if err == nil {
 		components["EMA"] = emaScore
-		totalScore += emaScore * s.weights.EMA
-		totalWeight += s.weights.EMA
+		totalScore += emaScore * weights.EMA
+		totalWeight += weights.EMA
+	}
+
+	// Calculate divergence score (RSI + MACD divergences)
+	divScore := s.calculateDivergenceScore(candles)
+	if divScore != 0 {
+		components["Divergence"] = divScore
+		totalScore += divScore * weights.Divergence
+		totalWeight += weights.Divergence
 	}
 
 	// Calculate volume confirmation
 	volumeConfirm, volumeScore := s.calculateVolumeConfirmation(candles)
 	components["Volume"] = volumeScore
-	totalScore += volumeScore * s.weights.Volume
-	totalWeight += s.weights.Volume
+	totalScore += volumeScore * weights.Volume
+	totalWeight += weights.Volume
 
 	// Normalize score if not all indicators were calculated
 	var finalScore float64
@@ -136,6 +181,126 @@ func (s *SignalScorer) Score(ctx context.Context, candles []models.Candle) (*ana
 		Components:     components,
 		VolumeConfirm:  volumeConfirm,
 	}, nil
+}
+
+// selectWeightsForRegime detects the current market regime from the candles
+// and returns the appropriate weight set.
+func (s *SignalScorer) selectWeightsForRegime(candles []models.Candle) IndicatorWeights {
+	// Use ADX to determine if market is trending or ranging
+	adx := indicators.NewADX(14)
+	adxVals, err := adx.Calculate(candles)
+	if err != nil {
+		return s.weights // fall back to configured weights
+	}
+
+	adxLine := adxVals["adx"]
+	n := len(candles)
+	if len(adxLine) < n || n < 1 {
+		return s.weights
+	}
+
+	// Average ADX over last 5 bars for stability
+	lookback := 5
+	if lookback > n {
+		lookback = n
+	}
+	var avgADX float64
+	var count int
+	for i := n - lookback; i < n; i++ {
+		if adxLine[i] > 0 {
+			avgADX += adxLine[i]
+			count++
+		}
+	}
+	if count > 0 {
+		avgADX /= float64(count)
+	}
+
+	// ADX > 25 = trending, ADX < 20 = ranging, between = use defaults
+	if avgADX > 25 {
+		return TrendingWeights()
+	} else if avgADX < 20 {
+		return RangingWeights()
+	}
+	return s.weights
+}
+
+// calculateDivergenceScore detects RSI and MACD divergences and returns a score.
+// Bullish divergence = positive score, bearish divergence = negative score.
+// Regular divergences are weighted more heavily than hidden divergences.
+func (s *SignalScorer) calculateDivergenceScore(candles []models.Candle) float64 {
+	detector := patterns.NewDivergenceDetector()
+
+	// Collect indicator values for multi-indicator divergence detection
+	indicatorMap := make(map[string][]float64)
+
+	rsi := indicators.NewRSI(14)
+	rsiVals, err := rsi.Calculate(candles)
+	if err == nil {
+		indicatorMap["RSI"] = rsiVals
+	}
+
+	macd := indicators.NewMACD(12, 26, 9)
+	macdVals, err := macd.Calculate(candles)
+	if err == nil {
+		if hist, ok := macdVals["histogram"]; ok {
+			indicatorMap["MACD"] = hist
+		}
+	}
+
+	if len(indicatorMap) == 0 {
+		return 0
+	}
+
+	result := detector.DetectMultiIndicator(candles, indicatorMap)
+	if result == nil {
+		return 0
+	}
+
+	// Only consider recent divergences (last 10 bars)
+	n := len(candles)
+	var score float64
+
+	for _, div := range result.Divergences {
+		// Skip old divergences
+		if div.EndIndex < n-10 {
+			continue
+		}
+
+		divScore := div.Strength * 100
+
+		if patterns.IsRegularDivergence(div.Type) {
+			divScore *= 1.0 // full weight for regular divergences
+		} else {
+			divScore *= 0.6 // reduced weight for hidden divergences
+		}
+
+		if patterns.IsBullishDivergence(div.Type) {
+			score += divScore
+		} else if patterns.IsBearishDivergence(div.Type) {
+			score -= divScore
+		}
+	}
+
+	// Multi-indicator confirmation bonus
+	bullishDivCount := 0
+	bearishDivCount := 0
+	for _, div := range result.Divergences {
+		if div.EndIndex >= n-10 {
+			if patterns.IsBullishDivergence(div.Type) {
+				bullishDivCount++
+			} else if patterns.IsBearishDivergence(div.Type) {
+				bearishDivCount++
+			}
+		}
+	}
+	if bullishDivCount >= 2 {
+		score += 20 // bonus for divergence confirmed across multiple indicators
+	} else if bearishDivCount >= 2 {
+		score -= 20
+	}
+
+	return clamp(score, -100, 100)
 }
 
 
