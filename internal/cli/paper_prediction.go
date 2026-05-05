@@ -482,6 +482,8 @@ func parsePredictionResponse(response string, symbol string, currentPrice float6
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(holdDuration),
 		Reasoning:   result.Reasoning,
+		SetupName:   "llm_simple",
+		Timeframe:   predictionTimeframeLabel(holdDuration),
 	}, nil
 }
 
@@ -574,7 +576,32 @@ func parsePredictionResponseWithGates(response string, symbol string, currentPri
 		CreatedAt:   now,
 		ExpiresAt:   now.Add(holdDuration),
 		Reasoning:   reasoning,
+		SetupName:   "llm_hard_gates",
+		Timeframe:   predictionTimeframeLabel(holdDuration),
+		Gates: []models.PaperPredictionGate{
+			{Name: "rsi_regime", Passed: rsiGate},
+			{Name: "volume_expansion", Passed: result.GatesPassed.VolumeExpansion},
+			{Name: "ema_alignment", Passed: result.GatesPassed.EMAAlignment},
+			{Name: "vwap_not_exhausted", Passed: result.GatesPassed.VWAPNotExhausted},
+			{Name: "trend_strength", Passed: result.GatesPassed.TrendStrength},
+		},
 	}, nil
+}
+
+func predictionTimeframeLabel(duration time.Duration) string {
+	if duration <= 0 {
+		return ""
+	}
+	if duration%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(duration/time.Hour))
+	}
+	if duration%time.Minute == 0 {
+		return fmt.Sprintf("%dm", int(duration/time.Minute))
+	}
+	if duration%time.Second == 0 {
+		return fmt.Sprintf("%ds", int(duration/time.Second))
+	}
+	return duration.String()
 }
 
 func extractJSONObject(response string) (string, error) {

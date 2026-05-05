@@ -276,6 +276,9 @@ func (s *SQLiteStore) initSchema() error {
 		created_at DATETIME NOT NULL,
 		expires_at DATETIME NOT NULL,
 		reasoning TEXT,
+		setup_name TEXT,
+		timeframe TEXT,
+		gates TEXT,
 		evaluated INTEGER DEFAULT 0,
 		exit_price REAL,
 		outcome TEXT,
@@ -335,6 +338,15 @@ func (s *SQLiteStore) initSchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("paper_predictions", "setup_name", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("paper_predictions", "timeframe", "TEXT"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("paper_predictions", "gates", "TEXT"); err != nil {
+		return err
+	}
 
 	if _, err := s.db.Exec(`
 		UPDATE alerts
@@ -344,6 +356,36 @@ func (s *SQLiteStore) initSchema() error {
 		return fmt.Errorf("failed to backfill alert IDs: %w", err)
 	}
 
+	return nil
+}
+
+func (s *SQLiteStore) ensureColumn(table, column, columnType string) error {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("checking %s.%s column: %w", table, column, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue interface{}
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scanning %s schema: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType))
+	if err != nil {
+		return fmt.Errorf("adding %s.%s column: %w", table, column, err)
+	}
 	return nil
 }
 
@@ -1579,14 +1621,18 @@ func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *model
 	if prediction.Evaluated {
 		evaluated = 1
 	}
+	gatesJSON, err := json.Marshal(prediction.Gates)
+	if err != nil {
+		return fmt.Errorf("failed to encode paper prediction gates: %w", err)
+	}
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO paper_predictions (
 			id, symbol, action, confidence, entry_price, target_price, stop_loss,
-			time_window_ns, created_at, expires_at, reasoning, evaluated,
+			time_window_ns, created_at, expires_at, reasoning, setup_name, timeframe, gates, evaluated,
 			exit_price, outcome, pnl_percent, updated_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			symbol = excluded.symbol,
 			action = excluded.action,
@@ -1598,6 +1644,9 @@ func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *model
 			created_at = excluded.created_at,
 			expires_at = excluded.expires_at,
 			reasoning = excluded.reasoning,
+			setup_name = excluded.setup_name,
+			timeframe = excluded.timeframe,
+			gates = excluded.gates,
 			evaluated = excluded.evaluated,
 			exit_price = excluded.exit_price,
 			outcome = excluded.outcome,
@@ -1605,7 +1654,8 @@ func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *model
 			updated_at = excluded.updated_at
 	`, prediction.ID, prediction.Symbol, prediction.Action, prediction.Confidence, prediction.EntryPrice,
 		prediction.TargetPrice, prediction.StopLoss, prediction.TimeWindow.Nanoseconds(),
-		prediction.CreatedAt, prediction.ExpiresAt, prediction.Reasoning, evaluated,
+		prediction.CreatedAt, prediction.ExpiresAt, prediction.Reasoning, prediction.SetupName,
+		prediction.Timeframe, string(gatesJSON), evaluated,
 		prediction.ExitPrice, prediction.Outcome, prediction.PnLPercent, time.Now())
 	if err != nil {
 		return fmt.Errorf("failed to save paper prediction: %w", err)
@@ -1617,7 +1667,8 @@ func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *model
 func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredictionFilter) ([]models.PaperPrediction, error) {
 	query := `
 		SELECT id, symbol, action, confidence, entry_price, target_price, stop_loss,
-			time_window_ns, created_at, expires_at, COALESCE(reasoning, ''), evaluated,
+			time_window_ns, created_at, expires_at, COALESCE(reasoning, ''),
+			COALESCE(setup_name, ''), COALESCE(timeframe, ''), COALESCE(gates, '[]'), evaluated,
 			COALESCE(exit_price, 0), COALESCE(outcome, ''), COALESCE(pnl_percent, 0)
 		FROM paper_predictions WHERE 1=1
 	`
@@ -1625,6 +1676,14 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 	if filter.Symbol != "" {
 		query += " AND symbol = ?"
 		args = append(args, filter.Symbol)
+	}
+	if filter.SetupName != "" {
+		query += " AND setup_name = ?"
+		args = append(args, filter.SetupName)
+	}
+	if filter.Timeframe != "" {
+		query += " AND timeframe = ?"
+		args = append(args, filter.Timeframe)
 	}
 	if !filter.StartDate.IsZero() {
 		query += " AND created_at >= ?"
@@ -1659,6 +1718,7 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 		var prediction models.PaperPrediction
 		var timeWindowNS int64
 		var evaluated int
+		var gatesJSON string
 		if err := rows.Scan(
 			&prediction.ID,
 			&prediction.Symbol,
@@ -1671,6 +1731,9 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 			&prediction.CreatedAt,
 			&prediction.ExpiresAt,
 			&prediction.Reasoning,
+			&prediction.SetupName,
+			&prediction.Timeframe,
+			&gatesJSON,
 			&evaluated,
 			&prediction.ExitPrice,
 			&prediction.Outcome,
@@ -1680,6 +1743,7 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 		}
 		prediction.TimeWindow = time.Duration(timeWindowNS)
 		prediction.Evaluated = evaluated == 1
+		_ = json.Unmarshal([]byte(gatesJSON), &prediction.Gates)
 		predictions = append(predictions, prediction)
 	}
 	return predictions, rows.Err()
@@ -1743,6 +1807,163 @@ func (s *SQLiteStore) GetPaperPredictionReport(ctx context.Context, filter Paper
 	}
 
 	return report, nil
+}
+
+// GetHistoricalCalibrationReport returns setup and gate expectancy from paper prediction outcomes.
+func (s *SQLiteStore) GetHistoricalCalibrationReport(ctx context.Context, filter PaperPredictionFilter) (*models.HistoricalCalibrationReport, error) {
+	predictions, err := s.GetPaperPredictions(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	report := &models.HistoricalCalibrationReport{
+		GeneratedAt: time.Now(),
+		StartDate:   filter.StartDate,
+		EndDate:     filter.EndDate,
+		Symbol:      filter.Symbol,
+		SetupName:   filter.SetupName,
+		Timeframe:   filter.Timeframe,
+	}
+
+	overall := newCalibrationAccumulator("overall")
+	bySetup := make(map[string]*calibrationAccumulator)
+	byGate := make(map[string]*calibrationAccumulator)
+	bySymbol := make(map[string]*calibrationAccumulator)
+	byTimeframe := make(map[string]*calibrationAccumulator)
+	byAction := make(map[string]*calibrationAccumulator)
+
+	for _, prediction := range predictions {
+		overall.add(prediction)
+		executionSetup := calibrationSetupName(prediction)
+		calibrationGroup(bySetup, executionSetup).add(prediction)
+		calibrationGroup(bySymbol, prediction.Symbol).add(prediction)
+		calibrationGroup(byTimeframe, calibrationTimeframe(prediction)).add(prediction)
+		calibrationGroup(byAction, prediction.Action).add(prediction)
+		for _, gate := range prediction.Gates {
+			status := "FAIL"
+			if gate.Passed {
+				status = "PASS"
+			}
+			calibrationGroup(byGate, gate.Name+"="+status).add(prediction)
+		}
+	}
+
+	overallStats := overall.stats()
+	report.TotalPredictions = overallStats.TotalPredictions
+	report.Evaluated = overallStats.Evaluated
+	report.Decisive = overallStats.Decisive
+	report.WinRate = overallStats.WinRate
+	report.AvgConfidence = overallStats.AvgConfidence
+	report.AvgPnLPercent = overallStats.AvgPnLPercent
+	report.Expectancy = overallStats.Expectancy
+	report.BySetup = calibrationStatsSlice(bySetup)
+	report.ByGate = calibrationStatsSlice(byGate)
+	report.BySymbol = calibrationStatsSlice(bySymbol)
+	report.ByTimeframe = calibrationStatsSlice(byTimeframe)
+	report.ByAction = calibrationStatsSlice(byAction)
+
+	return report, nil
+}
+
+type calibrationAccumulator struct {
+	key           string
+	total         int
+	evaluated     int
+	right         int
+	wrong         int
+	expired       int
+	confidenceSum float64
+	pnlSum        float64
+	decisivePnL   float64
+}
+
+func newCalibrationAccumulator(key string) *calibrationAccumulator {
+	return &calibrationAccumulator{key: key}
+}
+
+func calibrationGroup(groups map[string]*calibrationAccumulator, key string) *calibrationAccumulator {
+	if key == "" {
+		key = "UNKNOWN"
+	}
+	group, ok := groups[key]
+	if !ok {
+		group = newCalibrationAccumulator(key)
+		groups[key] = group
+	}
+	return group
+}
+
+func (a *calibrationAccumulator) add(prediction models.PaperPrediction) {
+	a.total++
+	a.confidenceSum += prediction.Confidence
+	if !prediction.Evaluated {
+		return
+	}
+	a.evaluated++
+	a.pnlSum += prediction.PnLPercent
+	switch prediction.Outcome {
+	case "RIGHT":
+		a.right++
+		a.decisivePnL += prediction.PnLPercent
+	case "WRONG":
+		a.wrong++
+		a.decisivePnL += prediction.PnLPercent
+	case "EXPIRED":
+		a.expired++
+	}
+}
+
+func (a *calibrationAccumulator) stats() models.CalibrationGroupStats {
+	stats := models.CalibrationGroupStats{
+		Key:                a.key,
+		TotalPredictions:   a.total,
+		Evaluated:          a.evaluated,
+		RightPredictions:   a.right,
+		WrongPredictions:   a.wrong,
+		ExpiredPredictions: a.expired,
+	}
+	stats.Decisive = stats.RightPredictions + stats.WrongPredictions
+	if a.total > 0 {
+		stats.AvgConfidence = a.confidenceSum / float64(a.total)
+	}
+	if stats.Evaluated > 0 {
+		stats.AvgPnLPercent = a.pnlSum / float64(stats.Evaluated)
+	}
+	if stats.Decisive > 0 {
+		stats.WinRate = float64(stats.RightPredictions) / float64(stats.Decisive) * 100
+		stats.Expectancy = a.decisivePnL / float64(stats.Decisive)
+	}
+	return stats
+}
+
+func calibrationStatsSlice(groups map[string]*calibrationAccumulator) []models.CalibrationGroupStats {
+	result := make([]models.CalibrationGroupStats, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, group.stats())
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Decisive == result[j].Decisive {
+			return result[i].Key < result[j].Key
+		}
+		return result[i].Decisive > result[j].Decisive
+	})
+	return result
+}
+
+func calibrationSetupName(prediction models.PaperPrediction) string {
+	if prediction.SetupName != "" {
+		return prediction.SetupName
+	}
+	return "legacy_unknown"
+}
+
+func calibrationTimeframe(prediction models.PaperPrediction) string {
+	if prediction.Timeframe != "" {
+		return prediction.Timeframe
+	}
+	if prediction.TimeWindow > 0 {
+		return prediction.TimeWindow.String()
+	}
+	return "UNKNOWN"
 }
 
 type paperPredictionAccumulator struct {

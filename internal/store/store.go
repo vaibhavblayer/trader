@@ -40,6 +40,7 @@ type DataStore interface {
 	SavePaperPrediction(ctx context.Context, prediction *models.PaperPrediction) error
 	GetPaperPredictions(ctx context.Context, filter PaperPredictionFilter) ([]models.PaperPrediction, error)
 	GetPaperPredictionReport(ctx context.Context, filter PaperPredictionFilter) (*models.PaperPredictionReport, error)
+	GetHistoricalCalibrationReport(ctx context.Context, filter PaperPredictionFilter) (*models.HistoricalCalibrationReport, error)
 
 	// Autonomous daemon runtime state
 	SaveDaemonState(ctx context.Context, state *models.DaemonState) error
@@ -120,6 +121,8 @@ type DecisionFilter struct {
 // PaperPredictionFilter represents filters for querying paper predictions.
 type PaperPredictionFilter struct {
 	Symbol    string
+	SetupName string
+	Timeframe string
 	StartDate time.Time
 	EndDate   time.Time
 	Evaluated *bool

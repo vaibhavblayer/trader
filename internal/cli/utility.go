@@ -22,6 +22,7 @@ import (
 // Requirements: 37, 57.1-57.4
 func addUtilityCommands(rootCmd *cobra.Command, app *App) {
 	rootCmd.AddCommand(newBacktestCmd(app))
+	rootCmd.AddCommand(newCalibrationCmd(app))
 	rootCmd.AddCommand(newExecutionCmd(app))
 	rootCmd.AddCommand(newExportCmd(app))
 	rootCmd.AddCommand(newAPICmd(app))

@@ -81,6 +81,9 @@ func TestParsePredictionResponseAcceptsValidTrade(t *testing.T) {
 	if prediction.TimeWindow != 5*time.Minute {
 		t.Fatalf("expected 5m hold duration, got %s", prediction.TimeWindow)
 	}
+	if prediction.SetupName != "llm_simple" || prediction.Timeframe != "5m" {
+		t.Fatalf("expected simple setup metadata, got %#v", prediction)
+	}
 }
 
 func TestParsePredictionResponseWithGatesRequiresAllGatesAndValidRisk(t *testing.T) {
@@ -114,6 +117,9 @@ func TestParsePredictionResponseWithGatesRequiresAllGatesAndValidRisk(t *testing
 	}
 	if prediction == nil {
 		t.Fatal("expected valid gated prediction")
+	}
+	if prediction.SetupName != "llm_hard_gates" || prediction.Timeframe != "10m" || len(prediction.Gates) != 5 {
+		t.Fatalf("expected gated setup metadata, got %#v", prediction)
 	}
 
 	invalidGate := `{

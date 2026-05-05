@@ -15,12 +15,22 @@ type PaperPrediction struct {
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
 	Reasoning   string
+	SetupName   string
+	Timeframe   string
+	Gates       []PaperPredictionGate
 
 	// Outcome tracking
 	Evaluated  bool
 	ExitPrice  float64
 	Outcome    string // RIGHT, WRONG, EXPIRED
 	PnLPercent float64
+}
+
+// PaperPredictionGate records one setup gate state at prediction time.
+type PaperPredictionGate struct {
+	Name   string
+	Passed bool
+	Reason string
 }
 
 // PaperPredictionStats holds prediction accuracy statistics.
@@ -88,4 +98,41 @@ type CalibrationWarning struct {
 	WinRate       float64
 	Gap           float64
 	SampleSize    int
+}
+
+// HistoricalCalibrationReport summarizes expectancy across setup dimensions.
+type HistoricalCalibrationReport struct {
+	GeneratedAt      time.Time
+	StartDate        time.Time
+	EndDate          time.Time
+	Symbol           string
+	SetupName        string
+	Timeframe        string
+	TotalPredictions int
+	Evaluated        int
+	Decisive         int
+	WinRate          float64
+	AvgConfidence    float64
+	AvgPnLPercent    float64
+	Expectancy       float64
+	BySetup          []CalibrationGroupStats
+	ByGate           []CalibrationGroupStats
+	BySymbol         []CalibrationGroupStats
+	ByTimeframe      []CalibrationGroupStats
+	ByAction         []CalibrationGroupStats
+}
+
+// CalibrationGroupStats summarizes calibration for one setup grouping.
+type CalibrationGroupStats struct {
+	Key                string
+	TotalPredictions   int
+	Evaluated          int
+	Decisive           int
+	RightPredictions   int
+	WrongPredictions   int
+	ExpiredPredictions int
+	WinRate            float64
+	AvgConfidence      float64
+	AvgPnLPercent      float64
+	Expectancy         float64
 }
