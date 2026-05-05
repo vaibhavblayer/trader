@@ -21,9 +21,6 @@ type DefaultPortfolioAnalyzer struct {
 
 	// Sector mappings (symbol -> sector)
 	sectorMap map[string]string
-
-	// Index data for beta calculation
-	indexReturns map[string][]float64
 }
 
 // NewPortfolioAnalyzer creates a new portfolio analyzer.
@@ -32,7 +29,6 @@ func NewPortfolioAnalyzer(b broker.Broker, pm *DefaultPositionManager) *DefaultP
 		broker:          b,
 		positionManager: pm,
 		sectorMap:       make(map[string]string),
-		indexReturns:    make(map[string][]float64),
 	}
 }
 
@@ -150,213 +146,27 @@ func (pa *DefaultPortfolioAnalyzer) GetSectorExposure(ctx context.Context) (map[
 	return exposure, nil
 }
 
-// GetPortfolioGreeks calculates portfolio-level Greeks for options positions.
-// Requirement 51.2: THE CLI SHALL calculate portfolio Greeks for options positions
+// GetPortfolioGreeks returns portfolio-level Greeks only when data-backed inputs are available.
 func (pa *DefaultPortfolioAnalyzer) GetPortfolioGreeks(ctx context.Context) (*PortfolioGreeks, error) {
-	positions, err := pa.positionManager.GetPositions(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("fetching positions: %w", err)
-	}
-
-	greeks := &PortfolioGreeks{}
-
-	for _, pos := range positions {
-		// Only F&O positions have Greeks
-		if pos.Exchange != models.NFO {
-			continue
-		}
-
-		// Get option chain to fetch Greeks
-		// Note: In a real implementation, we'd fetch Greeks from the broker
-		// For now, we'll use placeholder logic
-		optionGreeks := pa.estimateGreeks(pos)
-
-		qty := float64(pos.Quantity)
-		greeks.Delta += optionGreeks.Delta * qty
-		greeks.Gamma += optionGreeks.Gamma * qty
-		greeks.Theta += optionGreeks.Theta * qty
-		greeks.Vega += optionGreeks.Vega * qty
-	}
-
-	return greeks, nil
+	return nil, fmt.Errorf("portfolio Greeks require data-backed option Greeks; this workflow is disabled until broker Greeks or validated option-chain inputs are wired")
 }
 
-// estimateGreeks estimates Greeks for a position (placeholder implementation).
-func (pa *DefaultPortfolioAnalyzer) estimateGreeks(pos models.Position) models.OptionGreeks {
-	// In a real implementation, this would fetch actual Greeks from the broker
-	// or calculate them using Black-Scholes
-	return models.OptionGreeks{
-		Delta: 0.5,  // Placeholder
-		Gamma: 0.05, // Placeholder
-		Theta: -0.1, // Placeholder
-		Vega:  0.2,  // Placeholder
-	}
-}
-
-// GetPortfolioBeta calculates portfolio beta relative to an index.
-// Requirement 51.3: THE CLI SHALL calculate portfolio beta and correlation with indices
+// GetPortfolioBeta returns portfolio beta only when historical return data is available.
 func (pa *DefaultPortfolioAnalyzer) GetPortfolioBeta(ctx context.Context) (float64, error) {
-	positions, err := pa.positionManager.GetPositions(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("fetching positions: %w", err)
-	}
-
-	holdings, err := pa.broker.GetHoldings(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("fetching holdings: %w", err)
-	}
-
-	// Calculate weighted average beta
-	var totalValue float64
-	var weightedBeta float64
-
-	// Process positions
-	for _, pos := range positions {
-		if pos.Quantity == 0 {
-			continue
-		}
-		value := pos.Value
-		if value < 0 {
-			value = -value
-		}
-		beta := pa.getStockBeta(pos.Symbol)
-		weightedBeta += beta * value
-		totalValue += value
-	}
-
-	// Process holdings
-	for _, hold := range holdings {
-		if hold.Quantity == 0 {
-			continue
-		}
-		beta := pa.getStockBeta(hold.Symbol)
-		weightedBeta += beta * hold.CurrentValue
-		totalValue += hold.CurrentValue
-	}
-
-	if totalValue == 0 {
-		return 1.0, nil // Default beta
-	}
-
-	return weightedBeta / totalValue, nil
+	return 0, fmt.Errorf("portfolio beta requires historical portfolio and benchmark returns; this workflow is disabled until data-backed beta is implemented")
 }
 
-// getStockBeta returns the beta for a stock (placeholder implementation).
-func (pa *DefaultPortfolioAnalyzer) getStockBeta(symbol string) float64 {
-	// In a real implementation, this would fetch historical beta
-	// or calculate it from price data
-	// For now, return a default beta of 1.0
-	return 1.0
-}
-
-// GetVaR calculates Value at Risk for the portfolio.
-// Requirement 51.5: THE CLI SHALL calculate portfolio VaR (Value at Risk)
+// GetVaR returns Value at Risk only when historical return data is available.
 func (pa *DefaultPortfolioAnalyzer) GetVaR(ctx context.Context, confidence float64) (float64, error) {
 	if confidence <= 0 || confidence >= 1 {
 		return 0, fmt.Errorf("confidence must be between 0 and 1")
 	}
-
-	summary, err := pa.GetPortfolioSummary(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("getting portfolio summary: %w", err)
-	}
-
-	// Get portfolio volatility (simplified calculation)
-	volatility := pa.estimatePortfolioVolatility(ctx)
-
-	// Calculate VaR using parametric method
-	// VaR = Portfolio Value * Z-score * Volatility * sqrt(time horizon)
-	// Assuming 1-day VaR
-	zScore := pa.getZScore(confidence)
-	var1Day := summary.TotalValue * zScore * volatility
-
-	return var1Day, nil
+	return 0, fmt.Errorf("portfolio VaR requires historical portfolio returns; this workflow is disabled until data-backed VaR is implemented")
 }
 
-// estimatePortfolioVolatility estimates portfolio volatility.
-func (pa *DefaultPortfolioAnalyzer) estimatePortfolioVolatility(ctx context.Context) float64 {
-	// Simplified: assume 2% daily volatility
-	// In a real implementation, this would calculate from historical returns
-	return 0.02
-}
-
-// getZScore returns the Z-score for a given confidence level.
-func (pa *DefaultPortfolioAnalyzer) getZScore(confidence float64) float64 {
-	// Common Z-scores
-	switch {
-	case confidence >= 0.99:
-		return 2.326
-	case confidence >= 0.95:
-		return 1.645
-	case confidence >= 0.90:
-		return 1.282
-	default:
-		return 1.0
-	}
-}
-
-// SuggestHedges suggests hedging opportunities for the portfolio.
-// Requirement 51.7: THE CLI SHALL identify portfolio hedging opportunities
+// SuggestHedges returns hedge ideas only when beta, volatility, and instrument inputs are data-backed.
 func (pa *DefaultPortfolioAnalyzer) SuggestHedges(ctx context.Context) ([]HedgeSuggestion, error) {
-	var suggestions []HedgeSuggestion
-
-	// Get portfolio summary
-	summary, err := pa.GetPortfolioSummary(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting portfolio summary: %w", err)
-	}
-
-	// Get portfolio beta
-	beta, err := pa.GetPortfolioBeta(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting portfolio beta: %w", err)
-	}
-
-	// Get sector exposure
-	sectorExposure, err := pa.GetSectorExposure(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting sector exposure: %w", err)
-	}
-
-	// Suggest index hedge if portfolio is significantly long
-	if summary.TotalValue > 100000 && beta > 0.5 {
-		hedgeValue := summary.TotalValue * beta * 0.5 // Hedge 50% of beta exposure
-		suggestions = append(suggestions, HedgeSuggestion{
-			Type:         "index_put",
-			Symbol:       "NIFTY",
-			Action:       "BUY PUT",
-			Quantity:     int(hedgeValue / 50), // Approximate lot value
-			Reason:       fmt.Sprintf("Portfolio beta of %.2f suggests index hedge", beta),
-			ExpectedCost: hedgeValue * 0.02, // Approximate premium
-		})
-	}
-
-	// Suggest sector hedges for concentrated positions
-	for sector, exposure := range sectorExposure {
-		if exposure > 30 { // More than 30% in one sector
-			suggestions = append(suggestions, HedgeSuggestion{
-				Type:         "sector_diversification",
-				Symbol:       sector,
-				Action:       "REDUCE",
-				Quantity:     0,
-				Reason:       fmt.Sprintf("Sector %s has %.1f%% exposure, consider diversifying", sector, exposure),
-				ExpectedCost: 0,
-			})
-		}
-	}
-
-	// Suggest VIX hedge during low volatility
-	// In a real implementation, we'd check actual VIX levels
-	suggestions = append(suggestions, HedgeSuggestion{
-		Type:         "volatility_hedge",
-		Symbol:       "INDIAVIX",
-		Action:       "MONITOR",
-		Quantity:     0,
-		Reason:       "Consider VIX calls when volatility is low for tail risk protection",
-		ExpectedCost: 0,
-	})
-
-	return suggestions, nil
+	return nil, fmt.Errorf("hedge suggestions require data-backed beta, volatility, and hedge instrument pricing; this workflow is disabled until those inputs are implemented")
 }
 
 // SetSectorMapping sets the sector mapping for a symbol.
@@ -493,7 +303,6 @@ type RiskMetrics struct {
 func (pa *DefaultPortfolioAnalyzer) GetRiskMetrics(ctx context.Context) (*RiskMetrics, error) {
 	metrics := &RiskMetrics{}
 
-	// Get beta
 	beta, err := pa.GetPortfolioBeta(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("calculating beta: %w", err)

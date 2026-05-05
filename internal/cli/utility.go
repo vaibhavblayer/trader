@@ -26,7 +26,6 @@ func addUtilityCommands(rootCmd *cobra.Command, app *App) {
 	rootCmd.AddCommand(newExecutionCmd(app))
 	rootCmd.AddCommand(newPostTradeReviewCmd(app))
 	rootCmd.AddCommand(newExportCmd(app))
-	rootCmd.AddCommand(newAPICmd(app))
 	rootCmd.AddCommand(newNotifyTestCmd(app))
 }
 
@@ -687,74 +686,6 @@ func newExportCmd(app *App) *cobra.Command {
 	cmd.PersistentFlags().StringP("output", "o", "", "Output file path")
 	cmd.PersistentFlags().Int("days", 30, "Number of days to export")
 	cmd.PersistentFlags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
-
-	return cmd
-}
-
-func newAPICmd(app *App) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "api",
-		Short: "REST API server",
-		Long:  "REST API server commands for external integrations.",
-	}
-
-	cmd.AddCommand(&cobra.Command{
-		Use:   "start",
-		Short: "Start the API server",
-		Long: `Start a REST API server for external integrations.
-
-This server is not implemented yet. Planned endpoints:
-  GET  /api/quote/:symbol     - Get quote
-  GET  /api/positions         - Get positions
-  GET  /api/orders            - Get orders
-  POST /api/order             - Place order
-  GET  /api/analysis/:symbol  - Get analysis
-  GET  /api/health            - Health check`,
-		Example: `  trader api start
-  trader api start --port 8080
-  trader api start --key myapikey`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			output := NewOutput(cmd)
-
-			err := fmt.Errorf("api server is not implemented in this version")
-			output.Error("%v", err)
-
-			output.Bold("Planned Endpoints")
-			endpoints := []struct {
-				method string
-				path   string
-				desc   string
-			}{
-				{"GET", "/api/quote/:symbol", "Get real-time quote"},
-				{"GET", "/api/positions", "Get open positions"},
-				{"GET", "/api/holdings", "Get holdings"},
-				{"GET", "/api/orders", "Get orders"},
-				{"POST", "/api/order", "Place order"},
-				{"DELETE", "/api/order/:id", "Cancel order"},
-				{"GET", "/api/analysis/:symbol", "Get technical analysis"},
-				{"GET", "/api/signal/:symbol", "Get signal score"},
-				{"GET", "/api/health", "Health check"},
-			}
-
-			for _, e := range endpoints {
-				methodColor := ColorGreen
-				if e.method == "POST" {
-					methodColor = ColorYellow
-				} else if e.method == "DELETE" {
-					methodColor = ColorRed
-				}
-				output.Printf("  %s %-25s %s\n",
-					output.ColoredString(methodColor, PadRight(e.method, 6)),
-					e.path,
-					output.DimText(e.desc))
-			}
-
-			return err
-		},
-	})
-
-	cmd.PersistentFlags().Int("port", 8080, "Server port")
-	cmd.PersistentFlags().String("key", "", "API key for authentication")
 
 	return cmd
 }

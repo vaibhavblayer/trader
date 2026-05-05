@@ -159,7 +159,6 @@ func newCommandsCmd(app *App) *cobra.Command {
 						{"backtest", "Strategy backtesting"},
 						{"export candles/trades/journal", "Data export"},
 						{"config show/edit/validate", "Configuration"},
-						{"api start", "REST API server"},
 					},
 				},
 				{
