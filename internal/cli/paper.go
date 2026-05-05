@@ -13,6 +13,7 @@ import (
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
 	"zerodha-trader/internal/store"
+	"zerodha-trader/internal/trading"
 )
 
 // addPaperCommands adds paper trading commands.
@@ -518,9 +519,424 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	cmd.AddCommand(newPaperCandidateReviewCmd(app))
 	cmd.AddCommand(newPaperEvaluateCmd(app))
 	cmd.AddCommand(newPaperSoakRunCmd(app))
+	cmd.AddCommand(newPaperExperimentsCmd(app))
 	cmd.AddCommand(newPaperStatsCmd(app))
 
 	return cmd
+}
+
+func newPaperExperimentsCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "experiments",
+		Short: "Show paper soak experiment run ledger",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if app.Store == nil {
+				output.Warning("Paper experiment store is not available")
+				return nil
+			}
+
+			limit, _ := cmd.Flags().GetInt("limit")
+			days, _ := cmd.Flags().GetInt("days")
+			symbol, _ := cmd.Flags().GetString("symbol")
+			strategy, _ := cmd.Flags().GetString("strategy")
+			regimeMode, _ := cmd.Flags().GetString("regime-mode")
+			source, _ := cmd.Flags().GetString("source")
+			summary, _ := cmd.Flags().GetBool("summary")
+			compare, _ := cmd.Flags().GetBool("compare")
+			minOutcomeDecisive, _ := cmd.Flags().GetInt("min-outcome-decisive")
+			minWinRate, _ := cmd.Flags().GetFloat64("min-win-rate")
+			minExpectancy, _ := cmd.Flags().GetFloat64("min-expectancy")
+
+			filter := models.PaperExperimentRunFilter{
+				Symbol:     strings.ToUpper(strings.TrimSpace(symbol)),
+				Strategy:   trading.NormalizeStrategyName(strategy),
+				RegimeMode: strings.ToLower(strings.TrimSpace(regimeMode)),
+				Source:     strings.ToLower(strings.TrimSpace(source)),
+				Limit:      limit,
+			}
+			if filter.RegimeMode != "" {
+				parsedMode, err := parseCandidateRegimeMode(filter.RegimeMode)
+				if err != nil {
+					return err
+				}
+				filter.RegimeMode = parsedMode
+			}
+			if days > 0 {
+				filter.StartDate = time.Now().AddDate(0, 0, -days)
+				filter.EndDate = time.Now()
+			}
+
+			runs, err := app.Store.GetPaperExperimentRuns(ctx, filter)
+			if err != nil {
+				output.Error("Failed to get paper experiments: %v", err)
+				return err
+			}
+			if compare {
+				predictions, err := app.Store.GetPaperPredictions(ctx, store.PaperPredictionFilter{
+					Symbol:    filter.Symbol,
+					StartDate: filter.StartDate,
+					EndDate:   filter.EndDate,
+				})
+				if err != nil {
+					output.Error("Failed to get paper predictions: %v", err)
+					return err
+				}
+				comparison := comparePaperExperimentCohorts(runs, predictions, paperExperimentComparisonOptions{
+					MinOutcomeDecisive: minOutcomeDecisive,
+					MinWinRate:         minWinRate,
+					MinExpectancy:      minExpectancy,
+				})
+				if output.IsJSON() {
+					return output.JSON(comparison)
+				}
+				displayPaperExperimentComparison(output, comparison)
+				return nil
+			}
+			if summary {
+				summaries := summarizePaperExperimentRuns(runs)
+				if output.IsJSON() {
+					return output.JSON(summaries)
+				}
+				displayPaperExperimentSummary(output, summaries)
+				return nil
+			}
+			if output.IsJSON() {
+				return output.JSON(runs)
+			}
+			displayPaperExperimentRuns(output, runs)
+			return nil
+		},
+	}
+	cmd.Flags().Int("limit", 50, "Maximum experiment runs to show")
+	cmd.Flags().Int("days", 30, "Number of recent days to include")
+	cmd.Flags().String("symbol", "", "Filter by symbol")
+	cmd.Flags().String("strategy", "", "Filter by strategy")
+	cmd.Flags().String("regime-mode", "", "Filter by regime mode: strict, allow-unknown, or explore")
+	cmd.Flags().String("source", "", "Filter by source, for example cli or daemon")
+	cmd.Flags().Bool("summary", false, "Group experiment runs by source and regime mode")
+	cmd.Flags().Bool("compare", false, "Compare experiment cohorts using run flow and realized paper outcomes")
+	cmd.Flags().Int("min-outcome-decisive", 5, "Minimum decisive paper outcomes before judging a cohort")
+	cmd.Flags().Float64("min-win-rate", 50, "Minimum paper win rate for a leading cohort")
+	cmd.Flags().Float64("min-expectancy", 0, "Minimum paper expectancy for a leading cohort")
+	return cmd
+}
+
+type paperExperimentSummary struct {
+	Source                 string  `json:"source"`
+	RegimeMode             string  `json:"regime_mode"`
+	Runs                   int     `json:"runs"`
+	DryRuns                int     `json:"dry_runs"`
+	CandidatesChecked      int     `json:"candidates_checked"`
+	PredictionsCreated     int     `json:"predictions_created"`
+	OutcomesEvaluated      int     `json:"outcomes_evaluated"`
+	Blocked                int     `json:"blocked"`
+	NoSignal               int     `json:"no_signal"`
+	Errors                 int     `json:"errors"`
+	CandidatesPaused       int     `json:"candidates_paused"`
+	CandidatesReady        int     `json:"candidates_ready"`
+	TrustedPredictions     int     `json:"trusted_predictions"`
+	ExploratoryPredictions int     `json:"exploratory_predictions"`
+	TrustedDecisive        int     `json:"trusted_decisive"`
+	ExploratoryDecisive    int     `json:"exploratory_decisive"`
+	PredictionRate         float64 `json:"prediction_rate"`
+	BlockRate              float64 `json:"block_rate"`
+	NoSignalRate           float64 `json:"no_signal_rate"`
+	ErrorRate              float64 `json:"error_rate"`
+}
+
+type paperExperimentComparisonOptions struct {
+	MinOutcomeDecisive int
+	MinWinRate         float64
+	MinExpectancy      float64
+}
+
+type paperExperimentCohortComparison struct {
+	Source                 string  `json:"source"`
+	RegimeMode             string  `json:"regime_mode"`
+	Runs                   int     `json:"runs"`
+	DryRuns                int     `json:"dry_runs"`
+	CandidatesChecked      int     `json:"candidates_checked"`
+	PredictionsCreated     int     `json:"predictions_created"`
+	PredictionRate         float64 `json:"prediction_rate"`
+	BlockRate              float64 `json:"block_rate"`
+	NoSignalRate           float64 `json:"no_signal_rate"`
+	ErrorRate              float64 `json:"error_rate"`
+	TrustedPredictions     int     `json:"trusted_predictions"`
+	ExploratoryPredictions int     `json:"exploratory_predictions"`
+	PaperPredictions       int     `json:"paper_predictions"`
+	PaperEvaluated         int     `json:"paper_evaluated"`
+	PaperDecisive          int     `json:"paper_decisive"`
+	PaperWinRate           float64 `json:"paper_win_rate"`
+	PaperExpectancy        float64 `json:"paper_expectancy"`
+	PaperProfitFactor      float64 `json:"paper_profit_factor"`
+	PaperExpiredRate       float64 `json:"paper_expired_rate"`
+	Score                  float64 `json:"score"`
+	Verdict                string  `json:"verdict"`
+	Reason                 string  `json:"reason"`
+}
+
+func summarizePaperExperimentRuns(runs []models.PaperExperimentRun) []paperExperimentSummary {
+	byKey := make(map[string]*paperExperimentSummary)
+	order := make([]string, 0)
+	for _, run := range runs {
+		key := run.Source + "|" + run.RegimeMode
+		item, ok := byKey[key]
+		if !ok {
+			item = &paperExperimentSummary{Source: run.Source, RegimeMode: run.RegimeMode}
+			byKey[key] = item
+			order = append(order, key)
+		}
+		item.Runs++
+		if run.DryRun {
+			item.DryRuns++
+		}
+		item.CandidatesChecked += run.CandidatesChecked
+		item.PredictionsCreated += run.PredictionsCreated
+		item.OutcomesEvaluated += run.OutcomesEvaluated
+		item.Blocked += run.Blocked
+		item.NoSignal += run.NoSignal
+		item.Errors += run.Errors
+		item.CandidatesPaused += run.CandidatesPaused
+		item.CandidatesReady += run.CandidatesReady
+		item.TrustedPredictions += run.TrustedPredictions
+		item.ExploratoryPredictions += run.ExploratoryPredictions
+		item.TrustedDecisive += run.TrustedDecisive
+		item.ExploratoryDecisive += run.ExploratoryDecisive
+	}
+	result := make([]paperExperimentSummary, 0, len(order))
+	for _, key := range order {
+		item := byKey[key]
+		if item.CandidatesChecked > 0 {
+			denominator := float64(item.CandidatesChecked)
+			item.PredictionRate = float64(item.PredictionsCreated) / denominator * 100
+			item.BlockRate = float64(item.Blocked) / denominator * 100
+			item.NoSignalRate = float64(item.NoSignal) / denominator * 100
+			item.ErrorRate = float64(item.Errors) / denominator * 100
+		}
+		result = append(result, *item)
+	}
+	return result
+}
+
+func comparePaperExperimentCohorts(runs []models.PaperExperimentRun, predictions []models.PaperPrediction, opts paperExperimentComparisonOptions) []paperExperimentCohortComparison {
+	if opts.MinOutcomeDecisive <= 0 {
+		opts.MinOutcomeDecisive = 5
+	}
+	if opts.MinWinRate <= 0 {
+		opts.MinWinRate = 50
+	}
+	summaries := summarizePaperExperimentRuns(runs)
+	byModePredictions := groupCandidatePredictionsByRegimeMode(predictions)
+	result := make([]paperExperimentCohortComparison, 0, len(summaries))
+	bestIndex := -1
+	bestScore := 0.0
+	for _, summary := range summaries {
+		modePredictions := byModePredictions[summary.RegimeMode]
+		stats := calculatePaperCandidateOutcomeStats(modePredictions)
+		item := paperExperimentCohortComparison{
+			Source:                 summary.Source,
+			RegimeMode:             summary.RegimeMode,
+			Runs:                   summary.Runs,
+			DryRuns:                summary.DryRuns,
+			CandidatesChecked:      summary.CandidatesChecked,
+			PredictionsCreated:     summary.PredictionsCreated,
+			PredictionRate:         summary.PredictionRate,
+			BlockRate:              summary.BlockRate,
+			NoSignalRate:           summary.NoSignalRate,
+			ErrorRate:              summary.ErrorRate,
+			TrustedPredictions:     summary.TrustedPredictions,
+			ExploratoryPredictions: summary.ExploratoryPredictions,
+			PaperPredictions:       stats.total,
+			PaperEvaluated:         stats.evaluated,
+			PaperDecisive:          stats.decisive,
+			PaperWinRate:           stats.winRate,
+			PaperExpectancy:        stats.expectancy,
+			PaperProfitFactor:      stats.profitFactor,
+			PaperExpiredRate:       stats.expiredRate,
+		}
+		item.Score = paperExperimentCohortScore(item, opts)
+		item.Verdict, item.Reason = paperExperimentCohortVerdict(item, opts)
+		if item.Verdict == "PROMISING" && (bestIndex == -1 || item.Score > bestScore) {
+			bestIndex = len(result)
+			bestScore = item.Score
+		}
+		result = append(result, item)
+	}
+	if bestIndex >= 0 {
+		result[bestIndex].Verdict = "LEADING"
+		result[bestIndex].Reason = "best flow-adjusted cohort with acceptable realized evidence"
+	}
+	return result
+}
+
+func groupCandidatePredictionsByRegimeMode(predictions []models.PaperPrediction) map[string][]models.PaperPrediction {
+	result := make(map[string][]models.PaperPrediction)
+	for _, prediction := range predictions {
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(prediction.SetupName)), "candidate:") {
+			continue
+		}
+		mode := paperPredictionRegimeMode(prediction)
+		if mode == "" {
+			mode = regimeModeStrict
+		}
+		result[mode] = append(result[mode], prediction)
+	}
+	return result
+}
+
+func paperPredictionRegimeMode(prediction models.PaperPrediction) string {
+	for _, gate := range prediction.Gates {
+		if strings.EqualFold(gate.Name, "regime_mode") {
+			mode, err := parseCandidateRegimeMode(gate.Reason)
+			if err == nil {
+				return mode
+			}
+			return strings.ToLower(strings.TrimSpace(gate.Reason))
+		}
+	}
+	return ""
+}
+
+func paperExperimentCohortScore(item paperExperimentCohortComparison, opts paperExperimentComparisonOptions) float64 {
+	if item.CandidatesChecked == 0 || item.ErrorRate > 0 {
+		return 0
+	}
+	flow := item.PredictionRate - item.ErrorRate*2
+	if item.PaperDecisive < opts.MinOutcomeDecisive {
+		return flow * 0.25
+	}
+	outcome := item.PaperExpectancy*20 + item.PaperWinRate - item.PaperExpiredRate*0.25
+	if item.PaperProfitFactor > 0 && item.PaperProfitFactor < 1 {
+		outcome -= (1 - item.PaperProfitFactor) * 25
+	}
+	return flow + outcome
+}
+
+func paperExperimentCohortVerdict(item paperExperimentCohortComparison, opts paperExperimentComparisonOptions) (string, string) {
+	switch {
+	case item.Runs == 0:
+		return "NO_RUNS", "no experiment runs in the selected period"
+	case item.CandidatesChecked == 0:
+		return "NO_FLOW", "no candidates checked"
+	case item.ErrorRate > 0:
+		return "INVESTIGATE", fmt.Sprintf("error rate %.1f%%", item.ErrorRate)
+	case item.PredictionsCreated == 0:
+		return "LOW_FLOW", "no predictions created by this cohort"
+	case item.PaperDecisive < opts.MinOutcomeDecisive:
+		return "COLLECT_EVIDENCE", fmt.Sprintf("need at least %d decisive outcomes, got %d", opts.MinOutcomeDecisive, item.PaperDecisive)
+	case item.PaperWinRate < opts.MinWinRate:
+		return "WEAK_OUTCOME", fmt.Sprintf("win rate %.1f%% < %.1f%%", item.PaperWinRate, opts.MinWinRate)
+	case item.PaperExpectancy < opts.MinExpectancy:
+		return "WEAK_OUTCOME", fmt.Sprintf("expectancy %.2f%% < %.2f%%", item.PaperExpectancy, opts.MinExpectancy)
+	case item.PaperProfitFactor > 0 && item.PaperProfitFactor < 1:
+		return "WEAK_OUTCOME", fmt.Sprintf("profit factor %.2f < 1.00", item.PaperProfitFactor)
+	default:
+		return "PROMISING", "flow and realized outcomes meet thresholds"
+	}
+}
+
+func displayPaperExperimentRuns(output *Output, runs []models.PaperExperimentRun) {
+	output.Bold("Paper Experiment Runs")
+	output.Println()
+	if len(runs) == 0 {
+		output.Info("No paper experiment runs found")
+		return
+	}
+	table := NewTable(output, "Time", "Source", "Mode", "Symbol", "Strategy", "Dry", "Cand", "Pred", "Block", "NoSig", "Eval", "Pause", "Ready", "Xplr", "Readiness")
+	for _, run := range runs {
+		dryRun := "NO"
+		if run.DryRun {
+			dryRun = "YES"
+		}
+		table.AddRow(
+			FormatDateTime(run.StartedAt),
+			run.Source,
+			run.RegimeMode,
+			emptyDash(run.Symbol),
+			emptyDash(run.Strategy),
+			dryRun,
+			fmt.Sprintf("%d", run.CandidatesChecked),
+			fmt.Sprintf("%d", run.PredictionsCreated),
+			fmt.Sprintf("%d", run.Blocked),
+			fmt.Sprintf("%d", run.NoSignal),
+			fmt.Sprintf("%d", run.OutcomesEvaluated),
+			fmt.Sprintf("%d", run.CandidatesPaused),
+			fmt.Sprintf("%d", run.CandidatesReady),
+			fmt.Sprintf("%d", run.ExploratoryPredictions),
+			emptyDash(run.ReadinessDecision),
+		)
+	}
+	table.Render()
+}
+
+func displayPaperExperimentSummary(output *Output, summaries []paperExperimentSummary) {
+	output.Bold("Paper Experiment Summary")
+	output.Println()
+	if len(summaries) == 0 {
+		output.Info("No paper experiment runs found")
+		return
+	}
+	table := NewTable(output, "Source", "Mode", "Runs", "Dry", "Cand", "Pred", "Pred%", "Block%", "NoSig%", "Err%", "Eval", "Ready", "Xplr")
+	for _, summary := range summaries {
+		table.AddRow(
+			summary.Source,
+			summary.RegimeMode,
+			fmt.Sprintf("%d", summary.Runs),
+			fmt.Sprintf("%d", summary.DryRuns),
+			fmt.Sprintf("%d", summary.CandidatesChecked),
+			fmt.Sprintf("%d", summary.PredictionsCreated),
+			fmt.Sprintf("%.1f%%", summary.PredictionRate),
+			fmt.Sprintf("%.1f%%", summary.BlockRate),
+			fmt.Sprintf("%.1f%%", summary.NoSignalRate),
+			fmt.Sprintf("%.1f%%", summary.ErrorRate),
+			fmt.Sprintf("%d", summary.OutcomesEvaluated),
+			fmt.Sprintf("%d", summary.CandidatesReady),
+			fmt.Sprintf("%d", summary.ExploratoryPredictions),
+		)
+	}
+	table.Render()
+}
+
+func displayPaperExperimentComparison(output *Output, comparisons []paperExperimentCohortComparison) {
+	output.Bold("Paper Experiment Cohort Comparison")
+	output.Println()
+	if len(comparisons) == 0 {
+		output.Info("No paper experiment runs found")
+		return
+	}
+	table := NewTable(output, "Verdict", "Source", "Mode", "Runs", "Cand", "Pred%", "Block%", "NoSig%", "Paper", "Dec", "Win", "Expect", "PF", "Score", "Reason")
+	for _, item := range comparisons {
+		table.AddRow(
+			item.Verdict,
+			item.Source,
+			item.RegimeMode,
+			fmt.Sprintf("%d", item.Runs),
+			fmt.Sprintf("%d", item.CandidatesChecked),
+			fmt.Sprintf("%.1f%%", item.PredictionRate),
+			fmt.Sprintf("%.1f%%", item.BlockRate),
+			fmt.Sprintf("%.1f%%", item.NoSignalRate),
+			fmt.Sprintf("%d", item.PaperPredictions),
+			fmt.Sprintf("%d", item.PaperDecisive),
+			fmt.Sprintf("%.1f%%", item.PaperWinRate),
+			FormatPercent(item.PaperExpectancy),
+			fmt.Sprintf("%.2f", item.PaperProfitFactor),
+			fmt.Sprintf("%.1f", item.Score),
+			item.Reason,
+		)
+	}
+	table.Render()
+}
+
+func emptyDash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func newPaperCandidatesCmd(app *App) *cobra.Command {

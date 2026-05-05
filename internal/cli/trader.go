@@ -372,7 +372,7 @@ The daemon will:
 	cmd.Flags().String("soak-strategy", "", "Filter scheduled paper soak to one strategy")
 	cmd.Flags().String("soak-regime-mode", regimeModeStrict, "Scheduled paper soak regime guardrail mode: strict, allow-unknown, or explore")
 	cmd.Flags().String("soak-window", "24h", "Paper prediction evaluation window for scheduled soak runs")
-	cmd.Flags().Bool("soak-dry-run", false, "Run scheduled paper soak without saving predictions, outcomes, or review changes")
+	cmd.Flags().Bool("soak-dry-run", false, "Run scheduled paper soak without saving predictions, outcomes, or review changes; experiment run is still recorded")
 	cmd.Flags().Bool("soak-apply-review", false, "Apply candidate PAUSED status during scheduled review")
 	cmd.Flags().Int("soak-limit", 100, "Maximum candidates and predictions per scheduled soak run")
 
@@ -444,6 +444,8 @@ func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, s
 		MinReviewedTrades: 0,
 		MinWinRate:        50,
 		MinExpectancy:     0,
+		Source:            "daemon",
+		Command:           scheduledPaperSoakCommandSummary(opts),
 	})
 	now := time.Now()
 	state.LastPaperSoakRunAt = now
@@ -466,6 +468,32 @@ func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, s
 	}
 	output.Success("Paper soak run complete: %s", state.LastPaperSoakSummary)
 	return nil
+}
+
+func scheduledPaperSoakCommandSummary(opts daemonPaperSoakOptions) string {
+	parts := []string{"trader start --paper-soak"}
+	if opts.Only {
+		parts = []string{"trader start --paper-soak-only"}
+	}
+	if opts.Symbol != "" {
+		parts = append(parts, "--soak-symbol "+opts.Symbol)
+	}
+	if strings.TrimSpace(opts.Strategy) != "" {
+		parts = append(parts, "--soak-strategy "+strings.TrimSpace(opts.Strategy))
+	}
+	if opts.RegimeMode != "" {
+		parts = append(parts, "--soak-regime-mode "+opts.RegimeMode)
+	}
+	if opts.DryRun {
+		parts = append(parts, "--soak-dry-run")
+	}
+	if opts.ApplyReview {
+		parts = append(parts, "--soak-apply-review")
+	}
+	if opts.Limit > 0 {
+		parts = append(parts, fmt.Sprintf("--soak-limit %d", opts.Limit))
+	}
+	return strings.Join(parts, " ")
 }
 
 func newTraderStopCmd(app *App) *cobra.Command {

@@ -323,6 +323,46 @@ func (s *SQLiteStore) initSchema() error {
 		updated_at DATETIME NOT NULL
 	);
 
+	-- Structured paper-soak experiment ledger
+	CREATE TABLE IF NOT EXISTS paper_experiment_runs (
+		id TEXT PRIMARY KEY,
+		source TEXT NOT NULL,
+		command TEXT,
+		started_at DATETIME NOT NULL,
+		finished_at DATETIME NOT NULL,
+		symbol TEXT,
+		strategy TEXT,
+		status TEXT,
+		regime_mode TEXT NOT NULL,
+		dry_run INTEGER DEFAULT 0,
+		apply_review INTEGER DEFAULT 0,
+		limit_count INTEGER DEFAULT 0,
+		candidate_days INTEGER DEFAULT 0,
+		min_candles INTEGER DEFAULT 0,
+		regime_window INTEGER DEFAULT 0,
+		time_window_ns INTEGER DEFAULT 0,
+		evaluate_days INTEGER DEFAULT 0,
+		review_days INTEGER DEFAULT 0,
+		candidates_loaded INTEGER DEFAULT 0,
+		candidates_checked INTEGER DEFAULT 0,
+		predictions_created INTEGER DEFAULT 0,
+		open_predictions INTEGER DEFAULT 0,
+		blocked INTEGER DEFAULT 0,
+		no_signal INTEGER DEFAULT 0,
+		errors INTEGER DEFAULT 0,
+		outcomes_evaluated INTEGER DEFAULT 0,
+		candidates_paused INTEGER DEFAULT 0,
+		candidates_ready INTEGER DEFAULT 0,
+		trusted_predictions INTEGER DEFAULT 0,
+		exploratory_predictions INTEGER DEFAULT 0,
+		trusted_decisive INTEGER DEFAULT 0,
+		exploratory_decisive INTEGER DEFAULT 0,
+		readiness_decision TEXT,
+		readiness_reasons TEXT NOT NULL DEFAULT '[]',
+		notes TEXT,
+		created_at DATETIME NOT NULL
+	);
+
 	-- Durable autonomous daemon state and control gates
 	CREATE TABLE IF NOT EXISTS daemon_state (
 		id TEXT PRIMARY KEY,
@@ -372,6 +412,10 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_paper_candidates_symbol ON paper_candidates(symbol);
 	CREATE INDEX IF NOT EXISTS idx_paper_candidates_status ON paper_candidates(status);
 	CREATE INDEX IF NOT EXISTS idx_paper_candidates_strategy ON paper_candidates(strategy);
+	CREATE INDEX IF NOT EXISTS idx_paper_experiment_runs_started ON paper_experiment_runs(started_at);
+	CREATE INDEX IF NOT EXISTS idx_paper_experiment_runs_symbol ON paper_experiment_runs(symbol);
+	CREATE INDEX IF NOT EXISTS idx_paper_experiment_runs_regime ON paper_experiment_runs(regime_mode);
+	CREATE INDEX IF NOT EXISTS idx_paper_experiment_runs_source ON paper_experiment_runs(source);
 	CREATE INDEX IF NOT EXISTS idx_daemon_events_timestamp ON daemon_events(timestamp);
 	`
 
@@ -2365,6 +2409,206 @@ func (s *SQLiteStore) GetPaperCandidates(ctx context.Context, filter models.Pape
 		candidates = append(candidates, candidate)
 	}
 	return candidates, rows.Err()
+}
+
+// SavePaperExperimentRun inserts or updates a paper-soak experiment run.
+func (s *SQLiteStore) SavePaperExperimentRun(ctx context.Context, run *models.PaperExperimentRun) error {
+	if run == nil {
+		return fmt.Errorf("paper experiment run is required")
+	}
+	if strings.TrimSpace(run.ID) == "" {
+		run.ID = fmt.Sprintf("PAPER_EXP_%d", time.Now().UnixNano())
+	}
+	if run.StartedAt.IsZero() {
+		run.StartedAt = time.Now()
+	}
+	if run.FinishedAt.IsZero() {
+		run.FinishedAt = run.StartedAt
+	}
+	if strings.TrimSpace(run.Source) == "" {
+		run.Source = "paper_soak"
+	}
+	if strings.TrimSpace(run.RegimeMode) == "" {
+		run.RegimeMode = "strict"
+	}
+	if run.CreatedAt.IsZero() {
+		run.CreatedAt = time.Now()
+	}
+	reasonsJSON, err := json.Marshal(run.ReadinessReasons)
+	if err != nil {
+		return fmt.Errorf("failed to encode readiness reasons: %w", err)
+	}
+	dryRun := 0
+	if run.DryRun {
+		dryRun = 1
+	}
+	applyReview := 0
+	if run.ApplyReview {
+		applyReview = 1
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO paper_experiment_runs (
+			id, source, command, started_at, finished_at, symbol, strategy, status, regime_mode,
+			dry_run, apply_review, limit_count, candidate_days, min_candles, regime_window,
+			time_window_ns, evaluate_days, review_days, candidates_loaded, candidates_checked,
+			predictions_created, open_predictions, blocked, no_signal, errors, outcomes_evaluated,
+			candidates_paused, candidates_ready, trusted_predictions, exploratory_predictions,
+			trusted_decisive, exploratory_decisive, readiness_decision, readiness_reasons, notes, created_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			source = excluded.source,
+			command = excluded.command,
+			started_at = excluded.started_at,
+			finished_at = excluded.finished_at,
+			symbol = excluded.symbol,
+			strategy = excluded.strategy,
+			status = excluded.status,
+			regime_mode = excluded.regime_mode,
+			dry_run = excluded.dry_run,
+			apply_review = excluded.apply_review,
+			limit_count = excluded.limit_count,
+			candidate_days = excluded.candidate_days,
+			min_candles = excluded.min_candles,
+			regime_window = excluded.regime_window,
+			time_window_ns = excluded.time_window_ns,
+			evaluate_days = excluded.evaluate_days,
+			review_days = excluded.review_days,
+			candidates_loaded = excluded.candidates_loaded,
+			candidates_checked = excluded.candidates_checked,
+			predictions_created = excluded.predictions_created,
+			open_predictions = excluded.open_predictions,
+			blocked = excluded.blocked,
+			no_signal = excluded.no_signal,
+			errors = excluded.errors,
+			outcomes_evaluated = excluded.outcomes_evaluated,
+			candidates_paused = excluded.candidates_paused,
+			candidates_ready = excluded.candidates_ready,
+			trusted_predictions = excluded.trusted_predictions,
+			exploratory_predictions = excluded.exploratory_predictions,
+			trusted_decisive = excluded.trusted_decisive,
+			exploratory_decisive = excluded.exploratory_decisive,
+			readiness_decision = excluded.readiness_decision,
+			readiness_reasons = excluded.readiness_reasons,
+			notes = excluded.notes
+	`, run.ID, run.Source, run.Command, run.StartedAt, run.FinishedAt, run.Symbol, run.Strategy,
+		run.Status, run.RegimeMode, dryRun, applyReview, run.Limit, run.CandidateDays,
+		run.MinCandles, run.RegimeWindow, int64(run.TimeWindow), run.EvaluateDays, run.ReviewDays,
+		run.CandidatesLoaded, run.CandidatesChecked, run.PredictionsCreated, run.OpenPredictions,
+		run.Blocked, run.NoSignal, run.Errors, run.OutcomesEvaluated, run.CandidatesPaused,
+		run.CandidatesReady, run.TrustedPredictions, run.ExploratoryPredictions, run.TrustedDecisive,
+		run.ExploratoryDecisive, run.ReadinessDecision, string(reasonsJSON), run.Notes, run.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save paper experiment run: %w", err)
+	}
+	return nil
+}
+
+// GetPaperExperimentRuns returns paper-soak experiment runs.
+func (s *SQLiteStore) GetPaperExperimentRuns(ctx context.Context, filter models.PaperExperimentRunFilter) ([]models.PaperExperimentRun, error) {
+	query := `
+		SELECT id, source, COALESCE(command, ''), started_at, finished_at, COALESCE(symbol, ''),
+			COALESCE(strategy, ''), COALESCE(status, ''), regime_mode, dry_run, apply_review,
+			limit_count, candidate_days, min_candles, regime_window, time_window_ns, evaluate_days,
+			review_days, candidates_loaded, candidates_checked, predictions_created, open_predictions,
+			blocked, no_signal, errors, outcomes_evaluated, candidates_paused, candidates_ready,
+			trusted_predictions, exploratory_predictions, trusted_decisive, exploratory_decisive,
+			COALESCE(readiness_decision, ''), readiness_reasons, COALESCE(notes, ''), created_at
+		FROM paper_experiment_runs WHERE 1=1
+	`
+	args := []interface{}{}
+	if filter.Symbol != "" {
+		query += " AND symbol = ?"
+		args = append(args, filter.Symbol)
+	}
+	if filter.Strategy != "" {
+		query += " AND strategy = ?"
+		args = append(args, filter.Strategy)
+	}
+	if filter.RegimeMode != "" {
+		query += " AND regime_mode = ?"
+		args = append(args, filter.RegimeMode)
+	}
+	if filter.Source != "" {
+		query += " AND source = ?"
+		args = append(args, filter.Source)
+	}
+	if !filter.StartDate.IsZero() {
+		query += " AND started_at >= ?"
+		args = append(args, filter.StartDate)
+	}
+	if !filter.EndDate.IsZero() {
+		query += " AND started_at <= ?"
+		args = append(args, filter.EndDate)
+	}
+	query += " ORDER BY started_at DESC"
+	if filter.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, filter.Limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query paper experiment runs: %w", err)
+	}
+	defer rows.Close()
+
+	runs := make([]models.PaperExperimentRun, 0)
+	for rows.Next() {
+		var run models.PaperExperimentRun
+		var dryRun, applyReview int
+		var timeWindowNS int64
+		var reasonsJSON string
+		if err := rows.Scan(
+			&run.ID,
+			&run.Source,
+			&run.Command,
+			&run.StartedAt,
+			&run.FinishedAt,
+			&run.Symbol,
+			&run.Strategy,
+			&run.Status,
+			&run.RegimeMode,
+			&dryRun,
+			&applyReview,
+			&run.Limit,
+			&run.CandidateDays,
+			&run.MinCandles,
+			&run.RegimeWindow,
+			&timeWindowNS,
+			&run.EvaluateDays,
+			&run.ReviewDays,
+			&run.CandidatesLoaded,
+			&run.CandidatesChecked,
+			&run.PredictionsCreated,
+			&run.OpenPredictions,
+			&run.Blocked,
+			&run.NoSignal,
+			&run.Errors,
+			&run.OutcomesEvaluated,
+			&run.CandidatesPaused,
+			&run.CandidatesReady,
+			&run.TrustedPredictions,
+			&run.ExploratoryPredictions,
+			&run.TrustedDecisive,
+			&run.ExploratoryDecisive,
+			&run.ReadinessDecision,
+			&reasonsJSON,
+			&run.Notes,
+			&run.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan paper experiment run: %w", err)
+		}
+		run.DryRun = dryRun == 1
+		run.ApplyReview = applyReview == 1
+		run.TimeWindow = time.Duration(timeWindowNS)
+		if err := json.Unmarshal([]byte(reasonsJSON), &run.ReadinessReasons); err != nil {
+			return nil, fmt.Errorf("failed to decode readiness reasons for %s: %w", run.ID, err)
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
 }
 
 type calibrationAccumulator struct {

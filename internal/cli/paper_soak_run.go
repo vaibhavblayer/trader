@@ -14,9 +14,15 @@ import (
 )
 
 type paperSoakRunReport struct {
+	ExperimentID       string                          `json:"experiment_id,omitempty"`
 	GeneratedAt        time.Time                       `json:"generated_at"`
+	StartedAt          time.Time                       `json:"started_at"`
+	FinishedAt         time.Time                       `json:"finished_at"`
+	Source             string                          `json:"source,omitempty"`
+	Command            string                          `json:"command,omitempty"`
 	Symbol             string                          `json:"symbol,omitempty"`
 	Strategy           string                          `json:"strategy,omitempty"`
+	Status             string                          `json:"status,omitempty"`
 	RegimeMode         string                          `json:"regime_mode"`
 	DryRun             bool                            `json:"dry_run"`
 	ApplyReview        bool                            `json:"apply_review"`
@@ -59,6 +65,8 @@ type paperSoakRunOptions struct {
 	MinReviewedTrades int
 	MinWinRate        float64
 	MinExpectancy     float64
+	Source            string
+	Command           string
 }
 
 func newPaperSoakRunCmd(app *App) *cobra.Command {
@@ -88,7 +96,7 @@ evidence for pause/ready status, and optionally prints autonomy readiness.`,
 	cmd.Flags().String("eval-timeframe", "", "Historical candle timeframe for outcome evaluation")
 	cmd.Flags().Int("review-days", 90, "Number of recent days to review candidate outcomes")
 	cmd.Flags().Bool("apply-review", false, "Apply PAUSED status to candidates that fail review")
-	cmd.Flags().Bool("dry-run", false, "Run without saving new predictions, outcomes, or candidate pauses")
+	cmd.Flags().Bool("dry-run", false, "Run without saving predictions, outcomes, or candidate pauses; experiment run is still recorded")
 	cmd.Flags().Bool("readiness", true, "Include autonomy readiness after the soak cycle")
 	cmd.Flags().Int("readiness-days", 30, "Number of recent days for readiness checks")
 	cmd.Flags().Int("min-decisive", 20, "Minimum decisive paper predictions for readiness")
@@ -162,6 +170,8 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 		MinReviewedTrades: minReviewedTrades,
 		MinWinRate:        minWinRate,
 		MinExpectancy:     minExpectancy,
+		Source:            "cli",
+		Command:           paperSoakRunCommandSummary(symbol, strategy, regimeMode, dryRun, limit),
 	})
 	if err != nil {
 		return err
@@ -193,6 +203,9 @@ func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions
 	if opts.TimeWindow <= 0 {
 		opts.TimeWindow = 24 * time.Hour
 	}
+	if opts.Source == "" {
+		opts.Source = "paper_soak"
+	}
 	regimeMode, err := parseCandidateRegimeMode(opts.RegimeMode)
 	if err != nil {
 		return paperSoakRunReport{}, err
@@ -201,10 +214,15 @@ func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions
 
 	symbol := strings.ToUpper(strings.TrimSpace(opts.Symbol))
 	normalizedStrategy := trading.NormalizeStrategyName(opts.Strategy)
+	startedAt := time.Now()
 	report := paperSoakRunReport{
-		GeneratedAt: time.Now(),
+		GeneratedAt: startedAt,
+		StartedAt:   startedAt,
+		Source:      opts.Source,
+		Command:     opts.Command,
 		Symbol:      symbol,
 		Strategy:    normalizedStrategy,
+		Status:      strings.ToUpper(strings.TrimSpace(opts.Status)),
 		RegimeMode:  opts.RegimeMode,
 		DryRun:      opts.DryRun,
 		ApplyReview: opts.ApplyReview && !opts.DryRun,
@@ -288,7 +306,93 @@ func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions
 		report.Readiness = readiness
 		report.ReadinessDecision = string(readiness.Decision)
 	}
+	report.FinishedAt = time.Now()
+	experimentRun := paperExperimentRunFromSoakReport(report, opts)
+	if err := app.Store.SavePaperExperimentRun(ctx, &experimentRun); err != nil {
+		return report, err
+	}
+	report.ExperimentID = experimentRun.ID
 	return report, nil
+}
+
+func paperSoakRunCommandSummary(symbol string, strategy string, regimeMode string, dryRun bool, limit int) string {
+	parts := []string{"paper soak-run"}
+	if strings.TrimSpace(symbol) != "" {
+		parts = append(parts, "--symbol "+strings.ToUpper(strings.TrimSpace(symbol)))
+	}
+	if strings.TrimSpace(strategy) != "" {
+		parts = append(parts, "--strategy "+trading.NormalizeStrategyName(strategy))
+	}
+	parts = append(parts, "--regime-mode "+regimeMode)
+	if dryRun {
+		parts = append(parts, "--dry-run")
+	}
+	if limit > 0 {
+		parts = append(parts, fmt.Sprintf("--limit %d", limit))
+	}
+	return strings.Join(parts, " ")
+}
+
+func paperExperimentRunFromSoakReport(report paperSoakRunReport, opts paperSoakRunOptions) models.PaperExperimentRun {
+	trustedPredictions := 0
+	exploratoryPredictions := 0
+	trustedDecisive := 0
+	exploratoryDecisive := 0
+	for _, review := range report.CandidateReview {
+		trustedPredictions += review.TrustedPredictions
+		exploratoryPredictions += review.ExploratoryPredictions
+		trustedDecisive += review.Decisive
+		exploratoryDecisive += review.ExploratoryDecisive
+	}
+	finishedAt := report.FinishedAt
+	if finishedAt.IsZero() {
+		finishedAt = time.Now()
+	}
+	id := report.ExperimentID
+	if id == "" {
+		id = fmt.Sprintf("PAPER_SOAK_%d", report.StartedAt.UnixNano())
+	}
+	readinessReasons := []string{}
+	if report.Readiness != nil {
+		readinessReasons = append(readinessReasons, report.Readiness.Reasons...)
+	}
+	return models.PaperExperimentRun{
+		ID:                     id,
+		Source:                 report.Source,
+		Command:                report.Command,
+		StartedAt:              report.StartedAt,
+		FinishedAt:             finishedAt,
+		Symbol:                 report.Symbol,
+		Strategy:               report.Strategy,
+		Status:                 report.Status,
+		RegimeMode:             report.RegimeMode,
+		DryRun:                 report.DryRun,
+		ApplyReview:            report.ApplyReview,
+		Limit:                  opts.Limit,
+		CandidateDays:          opts.CandidateDays,
+		MinCandles:             opts.MinCandles,
+		RegimeWindow:           opts.RegimeWindow,
+		TimeWindow:             opts.TimeWindow,
+		EvaluateDays:           opts.EvaluateDays,
+		ReviewDays:             opts.ReviewDays,
+		CandidatesLoaded:       report.CandidatesLoaded,
+		CandidatesChecked:      report.CandidatesChecked,
+		PredictionsCreated:     report.PredictionsCreated,
+		OpenPredictions:        report.OpenPredictions,
+		Blocked:                report.Blocked,
+		NoSignal:               report.NoSignal,
+		Errors:                 report.Errors,
+		OutcomesEvaluated:      report.OutcomesEvaluated,
+		CandidatesPaused:       report.CandidatesPaused,
+		CandidatesReady:        report.CandidatesReady,
+		TrustedPredictions:     trustedPredictions,
+		ExploratoryPredictions: exploratoryPredictions,
+		TrustedDecisive:        trustedDecisive,
+		ExploratoryDecisive:    exploratoryDecisive,
+		ReadinessDecision:      report.ReadinessDecision,
+		ReadinessReasons:       readinessReasons,
+		CreatedAt:              time.Now(),
+	}
 }
 
 func countCandidateRunStatus(results []candidateRunResult, status string) int {
@@ -333,6 +437,9 @@ func displayPaperSoakRunReport(output *Output, report paperSoakRunReport) {
 	}
 	if report.Strategy != "" {
 		output.Printf("  Strategy:    %s\n", report.Strategy)
+	}
+	if report.ExperimentID != "" {
+		output.Printf("  Experiment:  %s\n", report.ExperimentID)
 	}
 	output.Printf("  Regime Mode: %s\n", report.RegimeMode)
 	output.Printf("  Candidates:  %d loaded | %d checked\n", report.CandidatesLoaded, report.CandidatesChecked)
