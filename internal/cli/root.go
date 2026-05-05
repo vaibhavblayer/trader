@@ -31,6 +31,7 @@ const (
 type App struct {
 	Config    *config.Config
 	Logger    zerolog.Logger
+	Zerodha   *broker.ZerodhaBroker
 	Broker    broker.Broker
 	Ticker    broker.Ticker
 	Store     store.DataStore
@@ -76,6 +77,7 @@ func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 			APISecret: cfg.Credentials.Zerodha.APISecret,
 			UserID:    cfg.Credentials.Zerodha.UserID,
 		})
+		app.Zerodha = zerodhaBroker
 		logger.Debug().Msg("Zerodha broker initialized")
 		if cfg.IsPaperMode() {
 			app.Broker = broker.NewPaperBroker(broker.PaperBrokerConfig{

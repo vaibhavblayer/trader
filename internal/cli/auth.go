@@ -18,6 +18,17 @@ import (
 	"zerodha-trader/internal/models"
 )
 
+func zerodhaAuthBroker(app *App) (*broker.ZerodhaBroker, bool) {
+	if app == nil {
+		return nil, false
+	}
+	if app.Zerodha != nil {
+		return app.Zerodha, true
+	}
+	zb, ok := app.Broker.(*broker.ZerodhaBroker)
+	return zb, ok
+}
+
 // addAuthCommands adds authentication commands.
 // Requirements: 1.1, 1.3
 func addAuthCommands(rootCmd *cobra.Command, app *App) {
@@ -46,13 +57,14 @@ Otherwise, it will open a browser window for OAuth authentication.`,
 			defer cancel()
 
 			// Check if broker is configured
-			if app.Broker == nil {
+			zb, ok := zerodhaAuthBroker(app)
+			if !ok {
 				output.Error("Broker not configured. Please check your credentials.toml")
 				return fmt.Errorf("broker not configured")
 			}
 
 			// Check if already authenticated
-			if app.Broker.IsAuthenticated() {
+			if zb.IsAuthenticated() {
 				return showLoginStatus(ctx, app, output)
 			}
 
@@ -64,15 +76,14 @@ Otherwise, it will open a browser window for OAuth authentication.`,
 
 			// Check if --browser flag is explicitly set to force browser flow
 			forceBrowser, _ := cmd.Flags().GetBool("browser")
-			
+
 			// Try auto-login first if credentials are configured and not forcing browser
 			password := app.Config.Credentials.Zerodha.Password
 			totpSecret := app.Config.Credentials.Zerodha.TOTPSecret
-			
+
 			if !forceBrowser && password != "" && totpSecret != "" {
 				output.Info("Auto-login credentials found, attempting auto-login...")
-				
-				zb, ok := app.Broker.(*broker.ZerodhaBroker)
+
 				if ok {
 					if err := zb.AutoLogin(ctx, password, totpSecret); err == nil {
 						output.Success("✓ Login successful!")
@@ -86,7 +97,7 @@ Otherwise, it will open a browser window for OAuth authentication.`,
 			}
 
 			// Fall back to browser OAuth flow
-			err := app.Broker.Login(ctx)
+			err := zb.Login(ctx)
 			if err == nil {
 				output.Success("✓ Already logged in!")
 				return nil
@@ -149,7 +160,7 @@ func completeLogin(ctx context.Context, app *App, output *Output, token string) 
 	output.Info("Completing login with token...")
 
 	// Get the Zerodha broker to call CompleteLogin
-	zb, ok := app.Broker.(*broker.ZerodhaBroker)
+	zb, ok := zerodhaAuthBroker(app)
 	if !ok {
 		output.Error("Broker is not Zerodha broker")
 		return fmt.Errorf("invalid broker type")
@@ -169,41 +180,59 @@ func showLoginStatus(ctx context.Context, app *App, output *Output) error {
 	output.Println()
 	output.Bold("Account Info")
 	output.Printf("  User ID:    %s\n", app.Config.Credentials.Zerodha.UserID)
-	
+
 	// Fetch balance, positions, holdings in parallel
 	type result struct {
 		balance   *models.Balance
 		positions []models.Position
 		holdings  []models.Holding
 	}
-	
+
 	res := result{}
 	var wg sync.WaitGroup
 	wg.Add(3)
-	
+
 	go func() {
 		defer wg.Done()
-		if b, err := app.Broker.GetBalance(ctx); err == nil {
-			res.balance = b
+		if zb, ok := zerodhaAuthBroker(app); ok {
+			if b, err := zb.GetBalance(ctx); err == nil {
+				res.balance = b
+			}
+		} else if app.Broker != nil {
+			if b, err := app.Broker.GetBalance(ctx); err == nil {
+				res.balance = b
+			}
 		}
 	}()
-	
+
 	go func() {
 		defer wg.Done()
-		if p, err := app.Broker.GetPositions(ctx); err == nil {
-			res.positions = p
+		if zb, ok := zerodhaAuthBroker(app); ok {
+			if p, err := zb.GetPositions(ctx); err == nil {
+				res.positions = p
+			}
+		} else if app.Broker != nil {
+			if p, err := app.Broker.GetPositions(ctx); err == nil {
+				res.positions = p
+			}
 		}
 	}()
-	
+
 	go func() {
 		defer wg.Done()
-		if h, err := app.Broker.GetHoldings(ctx); err == nil {
-			res.holdings = h
+		if zb, ok := zerodhaAuthBroker(app); ok {
+			if h, err := zb.GetHoldings(ctx); err == nil {
+				res.holdings = h
+			}
+		} else if app.Broker != nil {
+			if h, err := app.Broker.GetHoldings(ctx); err == nil {
+				res.holdings = h
+			}
 		}
 	}()
-	
+
 	wg.Wait()
-	
+
 	// Display results
 	if res.balance != nil {
 		output.Printf("  Cash:       %s\n", FormatIndianCurrency(res.balance.AvailableCash))
@@ -214,17 +243,17 @@ func showLoginStatus(ctx context.Context, app *App, output *Output) error {
 			output.Printf("  Used Margin: %s\n", FormatIndianCurrency(res.balance.UsedMargin))
 		}
 	}
-	
+
 	if len(res.positions) > 0 {
 		output.Printf("  Positions:  %d open\n", len(res.positions))
 	}
-	
+
 	if len(res.holdings) > 0 {
 		output.Printf("  Holdings:   %d stocks\n", len(res.holdings))
 	}
-	
+
 	output.Println()
-	
+
 	// Session expiry info
 	now := time.Now()
 	loc, _ := time.LoadLocation("Asia/Kolkata")
@@ -233,19 +262,19 @@ func showLoginStatus(ctx context.Context, app *App, output *Output) error {
 		expiry = time.Date(now.Year(), now.Month(), now.Day(), 6, 0, 0, 0, loc)
 	}
 	remaining := expiry.Sub(now)
-	
+
 	output.Bold("Session")
-	output.Printf("  Expires:    %s (%s remaining)\n", 
-		expiry.Format("02 Jan 2006, 03:04 PM"), 
+	output.Printf("  Expires:    %s (%s remaining)\n",
+		expiry.Format("02 Jan 2006, 03:04 PM"),
 		formatDuration(remaining))
-	
+
 	// Auto-login status
 	if app.Config.Credentials.Zerodha.Password != "" && app.Config.Credentials.Zerodha.TOTPSecret != "" {
 		output.Printf("  Auto-login: %s\n", output.Green("configured"))
 	} else {
 		output.Printf("  Auto-login: %s\n", output.Yellow("not configured"))
 	}
-	
+
 	return nil
 }
 
@@ -279,13 +308,14 @@ You will need to login again to use trading features.`,
 			defer cancel()
 
 			// Check if broker is configured
-			if app.Broker == nil {
+			zb, ok := zerodhaAuthBroker(app)
+			if !ok {
 				output.Warning("No active session found.")
 				return nil
 			}
 
 			// Check if authenticated
-			if !app.Broker.IsAuthenticated() {
+			if !zb.IsAuthenticated() {
 				output.Warning("Not currently logged in.")
 				return nil
 			}
@@ -293,7 +323,7 @@ You will need to login again to use trading features.`,
 			output.Info("Logging out...")
 
 			// Perform logout
-			if err := app.Broker.Logout(ctx); err != nil {
+			if err := zb.Logout(ctx); err != nil {
 				output.Error("Logout failed: %v", err)
 				return err
 			}
@@ -340,13 +370,14 @@ To get your TOTP secret:
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 
-			if app.Broker == nil {
+			zb, ok := zerodhaAuthBroker(app)
+			if !ok {
 				output.Error("Broker not configured. Check credentials.toml")
 				return fmt.Errorf("broker not configured")
 			}
 
 			// Check if already authenticated
-			if app.Broker.IsAuthenticated() {
+			if zb.IsAuthenticated() {
 				return showLoginStatus(ctx, app, output)
 			}
 
@@ -369,12 +400,6 @@ To get your TOTP secret:
 
 			output.Info("Performing auto-login...")
 
-			zb, ok := app.Broker.(*broker.ZerodhaBroker)
-			if !ok {
-				output.Error("Auto-login only works with Zerodha broker")
-				return fmt.Errorf("invalid broker type")
-			}
-
 			if err := zb.AutoLogin(ctx, password, totpSecret); err != nil {
 				output.Error("Auto-login failed: %v", err)
 				output.Println()
@@ -396,12 +421,13 @@ func newAuthStatusCmd(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 
-			if app.Broker == nil {
+			zb, ok := zerodhaAuthBroker(app)
+			if !ok {
 				output.Error("Broker not configured")
 				return nil
 			}
 
-			if !app.Broker.IsAuthenticated() {
+			if !zb.IsAuthenticated() {
 				output.Warning("Not authenticated")
 				output.Println()
 				output.Info("Run 'trader login' or 'trader autologin' to authenticate")
@@ -415,7 +441,7 @@ func newAuthStatusCmd(app *App) *cobra.Command {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
-			balance, err := app.Broker.GetBalance(ctx)
+			balance, err := zb.GetBalance(ctx)
 			if err != nil {
 				output.Warning("Session may be expired: %v", err)
 				output.Info("Run 'trader login' or 'trader autologin' to re-authenticate")
@@ -438,8 +464,8 @@ func newAuthStatusCmd(app *App) *cobra.Command {
 			}
 			remaining := expiry.Sub(now)
 
-			output.Printf("  Session expires: %s (%s remaining)\n", 
-				expiry.Format("02 Jan 15:04"), 
+			output.Printf("  Session expires: %s (%s remaining)\n",
+				expiry.Format("02 Jan 15:04"),
 				formatDuration(remaining))
 
 			// Check if auto-login is configured
