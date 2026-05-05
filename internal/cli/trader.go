@@ -96,6 +96,7 @@ The daemon will:
 			soakSymbol, _ := cmd.Flags().GetString("soak-symbol")
 			soakStrategy, _ := cmd.Flags().GetString("soak-strategy")
 			soakRegimeModeFlag, _ := cmd.Flags().GetString("soak-regime-mode")
+			soakRegimeRotationFlag, _ := cmd.Flags().GetString("soak-regime-rotation")
 			soakWindowFlag, _ := cmd.Flags().GetString("soak-window")
 			soakDryRun, _ := cmd.Flags().GetBool("soak-dry-run")
 			soakApplyReview, _ := cmd.Flags().GetBool("soak-apply-review")
@@ -104,6 +105,10 @@ The daemon will:
 				paperSoak = true
 			}
 			soakRegimeMode, err := parseCandidateRegimeMode(soakRegimeModeFlag)
+			if err != nil {
+				return err
+			}
+			soakRegimeRotation, err := parseCandidateRegimeRotation(soakRegimeRotationFlag)
 			if err != nil {
 				return err
 			}
@@ -122,16 +127,17 @@ The daemon will:
 				soakWindow = 24 * time.Hour
 			}
 			soakOpts := daemonPaperSoakOptions{
-				Enabled:     paperSoak,
-				Only:        paperSoakOnly,
-				Interval:    soakInterval,
-				Symbol:      strings.ToUpper(strings.TrimSpace(soakSymbol)),
-				Strategy:    soakStrategy,
-				RegimeMode:  soakRegimeMode,
-				Window:      soakWindow,
-				DryRun:      soakDryRun,
-				ApplyReview: soakApplyReview,
-				Limit:       soakLimit,
+				Enabled:        paperSoak,
+				Only:           paperSoakOnly,
+				Interval:       soakInterval,
+				Symbol:         strings.ToUpper(strings.TrimSpace(soakSymbol)),
+				Strategy:       soakStrategy,
+				RegimeMode:     soakRegimeMode,
+				RegimeRotation: soakRegimeRotation,
+				Window:         soakWindow,
+				DryRun:         soakDryRun,
+				ApplyReview:    soakApplyReview,
+				Limit:          soakLimit,
 			}
 			controlCtx, controlCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer controlCancel()
@@ -199,6 +205,9 @@ The daemon will:
 					output.Printf("  Soak Symbol:      %s\n", soakOpts.Symbol)
 				}
 				output.Printf("  Soak Regime Mode: %s\n", soakOpts.RegimeMode)
+				if len(soakOpts.RegimeRotation) > 0 {
+					output.Printf("  Soak Rotation:    %s\n", strings.Join(soakOpts.RegimeRotation, ","))
+				}
 			}
 			output.Println()
 
@@ -234,28 +243,32 @@ The daemon will:
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			startedAt := time.Now()
+			soakRegimeIndex := initialPaperSoakRegimeIndex(persistedState, soakOpts.RegimeRotation)
 			runtimeState := &models.DaemonState{
-				ID:                 defaultDaemonStateID,
-				Status:             models.DaemonStatusRunning,
-				PID:                os.Getpid(),
-				Hostname:           daemonHostname(),
-				StartedAt:          startedAt,
-				UpdatedAt:          startedAt,
-				LastHeartbeatAt:    startedAt,
-				Watchlist:          watchlist,
-				Symbols:            symbols,
-				DryRun:             dryRun,
-				IntervalSeconds:    interval,
-				PaperSoakEnabled:   paperSoak,
-				PaperSoakOnly:      paperSoakOnly,
-				PaperSoakInterval:  soakInterval,
-				PaperSoakSymbol:    soakOpts.Symbol,
-				PaperSoakStrategy:  soakStrategy,
-				PaperSoakDryRun:    soakDryRun,
-				NextPaperSoakRunAt: nextPaperSoakRunAt(paperSoak, startedAt),
-				Mode:               app.Config.Agents.AutonomousMode,
-				SafetyProfile:      app.Config.SafetyProfile(),
-				Message:            "daemon started",
+				ID:                      defaultDaemonStateID,
+				Status:                  models.DaemonStatusRunning,
+				PID:                     os.Getpid(),
+				Hostname:                daemonHostname(),
+				StartedAt:               startedAt,
+				UpdatedAt:               startedAt,
+				LastHeartbeatAt:         startedAt,
+				Watchlist:               watchlist,
+				Symbols:                 symbols,
+				DryRun:                  dryRun,
+				IntervalSeconds:         interval,
+				PaperSoakEnabled:        paperSoak,
+				PaperSoakOnly:           paperSoakOnly,
+				PaperSoakInterval:       soakInterval,
+				PaperSoakSymbol:         soakOpts.Symbol,
+				PaperSoakStrategy:       soakStrategy,
+				PaperSoakRegimeMode:     soakOpts.RegimeMode,
+				PaperSoakRegimeRotation: soakOpts.RegimeRotation,
+				PaperSoakRegimeIndex:    soakRegimeIndex,
+				PaperSoakDryRun:         soakDryRun,
+				NextPaperSoakRunAt:      nextPaperSoakRunAt(paperSoak, startedAt),
+				Mode:                    app.Config.Agents.AutonomousMode,
+				SafetyProfile:           app.Config.SafetyProfile(),
+				Message:                 "daemon started",
 			}
 			if err := saveDaemonStateWithEvent(ctx, app, runtimeState, "START", "daemon started"); err != nil {
 				output.Error("Failed to persist daemon state: %v", err)
@@ -292,43 +305,72 @@ The daemon will:
 			output.Dim("Press Ctrl+C to stop")
 			output.Println()
 
-			// Main trading loop
-			ticker := time.NewTicker(time.Duration(interval) * time.Second)
-			defer ticker.Stop()
+			// Main trading loop. Paper-soak scheduling is independent from the
+			// market scan interval so soak experiments can run on their own cadence.
+			scanTicker := time.NewTicker(time.Duration(interval) * time.Second)
+			defer scanTicker.Stop()
+			var soakTicker *time.Ticker
+			var soakC <-chan time.Time
+			if paperSoak {
+				soakTicker = time.NewTicker(soakTickerInterval(soakOpts.Interval))
+				defer soakTicker.Stop()
+				soakC = soakTicker.C
+			}
 
 			scanCount := 0
 			lastControlMessage := ""
+			refreshControl := func() (bool, bool) {
+				controlState, stopRequested, blocked, message, err := refreshDaemonRuntimeState(ctx, app, runtimeState)
+				if err != nil {
+					output.Warning("Failed to refresh daemon state: %v", err)
+				} else if controlState != nil {
+					runtimeState = controlState
+				}
+				if stopRequested {
+					output.Info("Stop requested; daemon exiting")
+					return true, blocked
+				}
+				if blocked {
+					if message != "" && message != lastControlMessage {
+						output.Warning("%s", message)
+						lastControlMessage = message
+					}
+					return false, true
+				}
+				lastControlMessage = ""
+				return false, false
+			}
+			runDuePaperSoak := func() {
+				if paperSoak && duePaperSoakRun(runtimeState, time.Now()) {
+					if err := runScheduledPaperSoakCycle(ctx, app, output, runtimeState, soakOpts); err != nil {
+						output.Warning("Paper soak run failed: %v", err)
+						runtimeState.LastPaperSoakSummary = "error: " + err.Error()
+						runtimeState.NextPaperSoakRunAt = time.Now().Add(soakOpts.Interval)
+						_ = saveDaemonStateWithEvent(ctx, app, runtimeState, "PAPER_SOAK_ERROR", runtimeState.LastPaperSoakSummary)
+					}
+				}
+			}
 			for {
 				select {
 				case <-ctx.Done():
 					output.Info("Daemon stopped")
 					return nil
-				case <-ticker.C:
-					controlState, stopRequested, blocked, message, err := refreshDaemonRuntimeState(ctx, app, runtimeState)
-					if err != nil {
-						output.Warning("Failed to refresh daemon state: %v", err)
-					} else if controlState != nil {
-						runtimeState = controlState
-					}
+				case <-soakC:
+					stopRequested, blocked := refreshControl()
 					if stopRequested {
-						output.Info("Stop requested; daemon exiting")
 						return nil
 					}
 					if blocked {
-						if message != "" && message != lastControlMessage {
-							output.Warning("%s", message)
-							lastControlMessage = message
-						}
 						continue
 					}
-					lastControlMessage = ""
-					if paperSoak && duePaperSoakRun(runtimeState, time.Now()) {
-						if err := runScheduledPaperSoakCycle(ctx, app, output, runtimeState, soakOpts); err != nil {
-							output.Warning("Paper soak run failed: %v", err)
-							runtimeState.LastPaperSoakSummary = "error: " + err.Error()
-							runtimeState.NextPaperSoakRunAt = time.Now().Add(soakOpts.Interval)
-							_ = saveDaemonStateWithEvent(ctx, app, runtimeState, "PAPER_SOAK_ERROR", runtimeState.LastPaperSoakSummary)
-						}
+					runDuePaperSoak()
+				case <-scanTicker.C:
+					stopRequested, blocked := refreshControl()
+					if stopRequested {
+						return nil
+					}
+					if blocked {
+						continue
 					}
 					if paperSoakOnly {
 						continue
@@ -371,6 +413,7 @@ The daemon will:
 	cmd.Flags().String("soak-symbol", "", "Filter scheduled paper soak to one symbol")
 	cmd.Flags().String("soak-strategy", "", "Filter scheduled paper soak to one strategy")
 	cmd.Flags().String("soak-regime-mode", regimeModeStrict, "Scheduled paper soak regime guardrail mode: strict, allow-unknown, or explore")
+	cmd.Flags().String("soak-regime-rotation", "", "Comma-separated scheduled paper soak regime rotation, or 'all'; overrides static regime mode")
 	cmd.Flags().String("soak-window", "24h", "Paper prediction evaluation window for scheduled soak runs")
 	cmd.Flags().Bool("soak-dry-run", false, "Run scheduled paper soak without saving predictions, outcomes, or review changes; experiment run is still recorded")
 	cmd.Flags().Bool("soak-apply-review", false, "Apply candidate PAUSED status during scheduled review")
@@ -380,16 +423,17 @@ The daemon will:
 }
 
 type daemonPaperSoakOptions struct {
-	Enabled     bool
-	Only        bool
-	Interval    time.Duration
-	Symbol      string
-	Strategy    string
-	RegimeMode  string
-	Window      time.Duration
-	DryRun      bool
-	ApplyReview bool
-	Limit       int
+	Enabled        bool
+	Only           bool
+	Interval       time.Duration
+	Symbol         string
+	Strategy       string
+	RegimeMode     string
+	RegimeRotation []string
+	Window         time.Duration
+	DryRun         bool
+	ApplyReview    bool
+	Limit          int
 }
 
 func nextPaperSoakRunAt(enabled bool, now time.Time) time.Time {
@@ -406,6 +450,98 @@ func duePaperSoakRun(state *models.DaemonState, now time.Time) bool {
 	return state.NextPaperSoakRunAt.IsZero() || !now.Before(state.NextPaperSoakRunAt)
 }
 
+func soakTickerInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return time.Hour
+	}
+	if interval < time.Second {
+		return interval
+	}
+	return time.Second
+}
+
+func parseCandidateRegimeRotation(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+	if strings.EqualFold(value, "all") {
+		return []string{regimeModeStrict, regimeModeAllowUnknown, regimeModeExplore}, nil
+	}
+	parts := strings.Split(value, ",")
+	rotation := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
+		mode, err := parseCandidateRegimeMode(part)
+		if err != nil {
+			return nil, err
+		}
+		rotation = append(rotation, mode)
+	}
+	if len(rotation) == 0 {
+		return nil, nil
+	}
+	return rotation, nil
+}
+
+func initialPaperSoakRegimeIndex(persisted *models.DaemonState, rotation []string) int {
+	if persisted == nil || len(rotation) == 0 {
+		return 0
+	}
+	if !sameStringSlice(persisted.PaperSoakRegimeRotation, rotation) {
+		return 0
+	}
+	return normalizedPaperSoakRegimeIndex(persisted.PaperSoakRegimeIndex, rotation)
+}
+
+func scheduledPaperSoakRegimeMode(state *models.DaemonState, opts daemonPaperSoakOptions) string {
+	if len(opts.RegimeRotation) == 0 {
+		mode, err := parseCandidateRegimeMode(opts.RegimeMode)
+		if err != nil {
+			return regimeModeStrict
+		}
+		return mode
+	}
+	index := 0
+	if state != nil {
+		index = normalizedPaperSoakRegimeIndex(state.PaperSoakRegimeIndex, opts.RegimeRotation)
+	}
+	return opts.RegimeRotation[index]
+}
+
+func advancePaperSoakRegimeRotation(state *models.DaemonState, rotation []string) {
+	if state == nil || len(rotation) == 0 {
+		return
+	}
+	index := normalizedPaperSoakRegimeIndex(state.PaperSoakRegimeIndex, rotation)
+	state.PaperSoakRegimeIndex = (index + 1) % len(rotation)
+}
+
+func normalizedPaperSoakRegimeIndex(index int, rotation []string) int {
+	if len(rotation) == 0 {
+		return 0
+	}
+	index %= len(rotation)
+	if index < 0 {
+		index += len(rotation)
+	}
+	return index
+}
+
+func sameStringSlice(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, state *models.DaemonState, opts daemonPaperSoakOptions) error {
 	if state == nil {
 		return fmt.Errorf("daemon state is required")
@@ -419,8 +555,11 @@ func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, s
 	if opts.Limit <= 0 {
 		opts.Limit = 100
 	}
+	selectedRegimeMode := scheduledPaperSoakRegimeMode(state, opts)
+	runOpts := opts
+	runOpts.RegimeMode = selectedRegimeMode
 
-	output.Dim("[%s] Paper soak run starting...", time.Now().Format("15:04:05"))
+	output.Dim("[%s] Paper soak run starting (%s)...", time.Now().Format("15:04:05"), selectedRegimeMode)
 	runCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 	defer cancel()
 	report, err := executePaperSoakRun(runCtx, app, paperSoakRunOptions{
@@ -432,7 +571,7 @@ func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, s
 		CandidateDays:     120,
 		MinCandles:        80,
 		RegimeWindow:      50,
-		RegimeMode:        opts.RegimeMode,
+		RegimeMode:        selectedRegimeMode,
 		TimeWindow:        opts.Window,
 		EvaluateDays:      30,
 		ReviewDays:        90,
@@ -445,7 +584,7 @@ func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, s
 		MinWinRate:        50,
 		MinExpectancy:     0,
 		Source:            "daemon",
-		Command:           scheduledPaperSoakCommandSummary(opts),
+		Command:           scheduledPaperSoakCommandSummary(runOpts),
 	})
 	now := time.Now()
 	state.LastPaperSoakRunAt = now
@@ -453,8 +592,13 @@ func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, s
 	if err != nil {
 		return err
 	}
+	state.LastPaperSoakRegimeMode = selectedRegimeMode
+	state.PaperSoakRegimeMode = opts.RegimeMode
+	state.PaperSoakRegimeRotation = opts.RegimeRotation
+	advancePaperSoakRegimeRotation(state, opts.RegimeRotation)
 	state.LastPaperSoakSummary = fmt.Sprintf(
-		"candidates=%d predictions=%d outcomes=%d paused=%d ready=%d readiness=%s",
+		"mode=%s candidates=%d predictions=%d outcomes=%d paused=%d ready=%d readiness=%s",
+		selectedRegimeMode,
 		report.CandidatesChecked,
 		report.PredictionsCreated,
 		report.OutcomesEvaluated,
@@ -483,6 +627,9 @@ func scheduledPaperSoakCommandSummary(opts daemonPaperSoakOptions) string {
 	}
 	if opts.RegimeMode != "" {
 		parts = append(parts, "--soak-regime-mode "+opts.RegimeMode)
+	}
+	if len(opts.RegimeRotation) > 0 {
+		parts = append(parts, "--soak-regime-rotation "+strings.Join(opts.RegimeRotation, ","))
 	}
 	if opts.DryRun {
 		parts = append(parts, "--soak-dry-run")
@@ -613,6 +760,16 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 				output.Printf("  Soak Interval:  %s\n", state.PaperSoakInterval)
 				if state.PaperSoakSymbol != "" {
 					output.Printf("  Soak Symbol:    %s\n", state.PaperSoakSymbol)
+				}
+				if state.PaperSoakRegimeMode != "" {
+					output.Printf("  Soak Regime:    %s\n", state.PaperSoakRegimeMode)
+				}
+				if len(state.PaperSoakRegimeRotation) > 0 {
+					nextIndex := normalizedPaperSoakRegimeIndex(state.PaperSoakRegimeIndex, state.PaperSoakRegimeRotation)
+					output.Printf("  Soak Rotation:  %s (next %s)\n", strings.Join(state.PaperSoakRegimeRotation, ","), state.PaperSoakRegimeRotation[nextIndex])
+				}
+				if state.LastPaperSoakRegimeMode != "" {
+					output.Printf("  Last Soak Mode: %s\n", state.LastPaperSoakRegimeMode)
 				}
 				if !state.LastPaperSoakRunAt.IsZero() {
 					output.Printf("  Last Soak:      %s\n", FormatDateTime(state.LastPaperSoakRunAt))

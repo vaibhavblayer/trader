@@ -547,7 +547,10 @@ func newPaperExperimentsCmd(app *App) *cobra.Command {
 			source, _ := cmd.Flags().GetString("source")
 			summary, _ := cmd.Flags().GetBool("summary")
 			compare, _ := cmd.Flags().GetBool("compare")
+			candidateActions, _ := cmd.Flags().GetBool("candidate-actions")
+			applyCandidateActions, _ := cmd.Flags().GetBool("apply-candidate-actions")
 			minOutcomeDecisive, _ := cmd.Flags().GetInt("min-outcome-decisive")
+			minCandidateDecisive, _ := cmd.Flags().GetInt("min-candidate-decisive")
 			minWinRate, _ := cmd.Flags().GetFloat64("min-win-rate")
 			minExpectancy, _ := cmd.Flags().GetFloat64("min-expectancy")
 
@@ -575,7 +578,7 @@ func newPaperExperimentsCmd(app *App) *cobra.Command {
 				output.Error("Failed to get paper experiments: %v", err)
 				return err
 			}
-			if compare {
+			if compare || candidateActions || applyCandidateActions {
 				predictions, err := app.Store.GetPaperPredictions(ctx, store.PaperPredictionFilter{
 					Symbol:    filter.Symbol,
 					StartDate: filter.StartDate,
@@ -590,6 +593,33 @@ func newPaperExperimentsCmd(app *App) *cobra.Command {
 					MinWinRate:         minWinRate,
 					MinExpectancy:      minExpectancy,
 				})
+				if candidateActions || applyCandidateActions {
+					candidates, err := app.Store.GetPaperCandidates(ctx, models.PaperCandidateFilter{
+						Symbol:   filter.Symbol,
+						Strategy: filter.Strategy,
+						Status:   models.PaperCandidateStatusActive,
+						Limit:    1000,
+					})
+					if err != nil {
+						output.Error("Failed to get paper candidates: %v", err)
+						return err
+					}
+					actions := buildPaperExperimentCandidateActions(candidates, predictions, comparison, paperExperimentCandidateActionOptions{
+						MinCandidateDecisive: minCandidateDecisive,
+						MinWinRate:           minWinRate,
+						MinExpectancy:        minExpectancy,
+					})
+					if applyCandidateActions {
+						if err := applyPaperExperimentCandidateActions(ctx, app.Store, candidates, actions); err != nil {
+							return err
+						}
+					}
+					if output.IsJSON() {
+						return output.JSON(actions)
+					}
+					displayPaperExperimentCandidateActions(output, actions, applyCandidateActions)
+					return nil
+				}
 				if output.IsJSON() {
 					return output.JSON(comparison)
 				}
@@ -619,7 +649,10 @@ func newPaperExperimentsCmd(app *App) *cobra.Command {
 	cmd.Flags().String("source", "", "Filter by source, for example cli or daemon")
 	cmd.Flags().Bool("summary", false, "Group experiment runs by source and regime mode")
 	cmd.Flags().Bool("compare", false, "Compare experiment cohorts using run flow and realized paper outcomes")
+	cmd.Flags().Bool("candidate-actions", false, "Recommend candidate allow/block/pause changes from cohort outcome evidence")
+	cmd.Flags().Bool("apply-candidate-actions", false, "Apply safe candidate changes recommended by cohort outcome evidence")
 	cmd.Flags().Int("min-outcome-decisive", 5, "Minimum decisive paper outcomes before judging a cohort")
+	cmd.Flags().Int("min-candidate-decisive", 3, "Minimum decisive candidate-regime outcomes before recommending candidate changes")
 	cmd.Flags().Float64("min-win-rate", 50, "Minimum paper win rate for a leading cohort")
 	cmd.Flags().Float64("min-expectancy", 0, "Minimum paper expectancy for a leading cohort")
 	return cmd
@@ -677,6 +710,29 @@ type paperExperimentCohortComparison struct {
 	Score                  float64 `json:"score"`
 	Verdict                string  `json:"verdict"`
 	Reason                 string  `json:"reason"`
+}
+
+type paperExperimentCandidateActionOptions struct {
+	MinCandidateDecisive int
+	MinWinRate           float64
+	MinExpectancy        float64
+}
+
+type paperExperimentCandidateAction struct {
+	CandidateID  string  `json:"candidate_id"`
+	Symbol       string  `json:"symbol"`
+	Strategy     string  `json:"strategy"`
+	Variant      string  `json:"variant"`
+	Timeframe    string  `json:"timeframe"`
+	RegimeMode   string  `json:"regime_mode"`
+	Regime       string  `json:"regime"`
+	Action       string  `json:"action"`
+	Reason       string  `json:"reason"`
+	Decisive     int     `json:"decisive"`
+	WinRate      float64 `json:"win_rate"`
+	Expectancy   float64 `json:"expectancy"`
+	ProfitFactor float64 `json:"profit_factor"`
+	Applied      bool    `json:"applied,omitempty"`
 }
 
 func summarizePaperExperimentRuns(runs []models.PaperExperimentRun) []paperExperimentSummary {
@@ -839,6 +895,163 @@ func paperExperimentCohortVerdict(item paperExperimentCohortComparison, opts pap
 	}
 }
 
+func buildPaperExperimentCandidateActions(candidates []models.PaperCandidate, predictions []models.PaperPrediction, comparisons []paperExperimentCohortComparison, opts paperExperimentCandidateActionOptions) []paperExperimentCandidateAction {
+	if opts.MinCandidateDecisive <= 0 {
+		opts.MinCandidateDecisive = 3
+	}
+	if opts.MinWinRate <= 0 {
+		opts.MinWinRate = 50
+	}
+	candidatesByID := make(map[string]models.PaperCandidate, len(candidates))
+	for _, candidate := range candidates {
+		candidatesByID[candidate.ID] = candidate
+	}
+	comparisonByMode := make(map[string]paperExperimentCohortComparison)
+	for _, comparison := range comparisons {
+		comparisonByMode[comparison.RegimeMode] = comparison
+	}
+	grouped := make(map[string][]models.PaperPrediction)
+	groupOrder := make([]string, 0)
+	for _, prediction := range predictions {
+		candidateID := paperPredictionCandidateID(prediction)
+		if candidateID == "" {
+			continue
+		}
+		candidate, ok := candidatesByID[candidateID]
+		if !ok || !strings.EqualFold(candidate.Status, models.PaperCandidateStatusActive) {
+			continue
+		}
+		mode := paperPredictionRegimeMode(prediction)
+		if mode == "" {
+			mode = regimeModeStrict
+		}
+		regime := paperPredictionRegime(prediction)
+		if regime == "" {
+			regime = "unknown"
+		}
+		key := candidateID + "|" + mode + "|" + regime
+		if _, ok := grouped[key]; !ok {
+			groupOrder = append(groupOrder, key)
+		}
+		grouped[key] = append(grouped[key], prediction)
+	}
+	actions := make([]paperExperimentCandidateAction, 0)
+	for _, key := range groupOrder {
+		parts := strings.Split(key, "|")
+		if len(parts) != 3 {
+			continue
+		}
+		candidate := candidatesByID[parts[0]]
+		mode := parts[1]
+		regime := parts[2]
+		stats := calculatePaperCandidateOutcomeStats(grouped[key])
+		if stats.decisive < opts.MinCandidateDecisive {
+			continue
+		}
+		action := ""
+		reason := ""
+		weak := stats.winRate < opts.MinWinRate || stats.expectancy < opts.MinExpectancy || (stats.profitFactor > 0 && stats.profitFactor < 1)
+		cohort := comparisonByMode[mode]
+		cohortStrong := cohort.Verdict == "LEADING" || cohort.Verdict == "PROMISING"
+		switch {
+		case weak && mode == regimeModeExplore:
+			action = "BLOCK_REGIME"
+			reason = "exploratory regime evidence is weak"
+		case weak:
+			action = "PAUSE_CANDIDATE"
+			reason = "trusted candidate evidence is weak"
+		case cohortStrong && mode != regimeModeStrict && regime != "unknown" && !candidateRegimeAllowed(candidate, regime):
+			action = "ALLOW_REGIME"
+			reason = "candidate-regime evidence is strong in a leading cohort"
+		}
+		if action == "" {
+			continue
+		}
+		actions = append(actions, paperExperimentCandidateAction{
+			CandidateID:  candidate.ID,
+			Symbol:       candidate.Symbol,
+			Strategy:     candidate.Strategy,
+			Variant:      candidate.ParamVariant,
+			Timeframe:    candidate.Timeframe,
+			RegimeMode:   mode,
+			Regime:       regime,
+			Action:       action,
+			Reason:       reason,
+			Decisive:     stats.decisive,
+			WinRate:      stats.winRate,
+			Expectancy:   stats.expectancy,
+			ProfitFactor: stats.profitFactor,
+		})
+	}
+	return actions
+}
+
+func paperPredictionCandidateID(prediction models.PaperPrediction) string {
+	setup := strings.TrimSpace(prediction.SetupName)
+	if !strings.HasPrefix(strings.ToLower(setup), "candidate:") {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(setup, "candidate:"))
+}
+
+func candidateRegimeAllowed(candidate models.PaperCandidate, regime string) bool {
+	return isRegimeListed(candidate.AllowedRegimes, regime) && !isRegimeListed(candidate.BlockedRegimes, regime)
+}
+
+func applyPaperExperimentCandidateActions(ctx context.Context, dataStore store.DataStore, candidates []models.PaperCandidate, actions []paperExperimentCandidateAction) error {
+	candidatesByID := make(map[string]models.PaperCandidate, len(candidates))
+	for _, candidate := range candidates {
+		candidatesByID[candidate.ID] = candidate
+	}
+	for i := range actions {
+		action := &actions[i]
+		candidate, ok := candidatesByID[action.CandidateID]
+		if !ok {
+			continue
+		}
+		switch action.Action {
+		case "PAUSE_CANDIDATE":
+			candidate.Status = models.PaperCandidateStatusPaused
+			candidate.Reason = appendCandidateReviewReason(candidate.Reason, []string{"experiment_pause:" + action.RegimeMode + ":" + action.Regime})
+		case "BLOCK_REGIME":
+			candidate.BlockedRegimes = addUniqueRegime(candidate.BlockedRegimes, action.Regime)
+			candidate.AllowedRegimes = removeRegime(candidate.AllowedRegimes, action.Regime)
+			candidate.Reason = appendCandidateReviewReason(candidate.Reason, []string{"experiment_block_regime:" + action.Regime})
+		case "ALLOW_REGIME":
+			candidate.AllowedRegimes = addUniqueRegime(candidate.AllowedRegimes, action.Regime)
+			candidate.BlockedRegimes = removeRegime(candidate.BlockedRegimes, action.Regime)
+			candidate.Reason = appendCandidateReviewReason(candidate.Reason, []string{"experiment_allow_regime:" + action.Regime})
+		default:
+			continue
+		}
+		if err := dataStore.SavePaperCandidate(ctx, &candidate); err != nil {
+			return err
+		}
+		candidatesByID[action.CandidateID] = candidate
+		action.Applied = true
+	}
+	return nil
+}
+
+func addUniqueRegime(regimes []string, regime string) []string {
+	regime = strings.ToLower(strings.TrimSpace(regime))
+	if regime == "" || regime == "unknown" || isRegimeListed(regimes, regime) {
+		return regimes
+	}
+	return append(regimes, regime)
+}
+
+func removeRegime(regimes []string, regime string) []string {
+	result := make([]string, 0, len(regimes))
+	for _, item := range regimes {
+		if strings.EqualFold(item, regime) {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
 func displayPaperExperimentRuns(output *Output, runs []models.PaperExperimentRun) {
 	output.Bold("Paper Experiment Runs")
 	output.Println()
@@ -926,6 +1139,41 @@ func displayPaperExperimentComparison(output *Output, comparisons []paperExperim
 			fmt.Sprintf("%.2f", item.PaperProfitFactor),
 			fmt.Sprintf("%.1f", item.Score),
 			item.Reason,
+		)
+	}
+	table.Render()
+}
+
+func displayPaperExperimentCandidateActions(output *Output, actions []paperExperimentCandidateAction, apply bool) {
+	title := "Paper Experiment Candidate Actions"
+	if apply {
+		title += " (apply)"
+	}
+	output.Bold(title)
+	output.Println()
+	if len(actions) == 0 {
+		output.Info("No candidate actions met thresholds")
+		return
+	}
+	table := NewTable(output, "Action", "Symbol", "Strategy", "Variant", "Mode", "Regime", "Dec", "Win", "Expect", "PF", "Applied", "Reason")
+	for _, action := range actions {
+		applied := "NO"
+		if action.Applied {
+			applied = "YES"
+		}
+		table.AddRow(
+			action.Action,
+			action.Symbol,
+			action.Strategy,
+			action.Variant,
+			action.RegimeMode,
+			action.Regime,
+			fmt.Sprintf("%d", action.Decisive),
+			fmt.Sprintf("%.1f%%", action.WinRate),
+			FormatPercent(action.Expectancy),
+			fmt.Sprintf("%.2f", action.ProfitFactor),
+			applied,
+			action.Reason,
 		)
 	}
 	table.Render()

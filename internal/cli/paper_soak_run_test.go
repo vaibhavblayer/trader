@@ -141,6 +141,53 @@ func TestComparePaperExperimentCohortsUsesCandidateRegimeOutcomes(t *testing.T) 
 	}
 }
 
+func TestBuildPaperExperimentCandidateActionsPromotesLeadingExploreRegime(t *testing.T) {
+	now := time.Date(2026, 5, 5, 10, 0, 0, 0, time.UTC)
+	candidate := models.PaperCandidate{
+		ID:             "C1",
+		Status:         models.PaperCandidateStatusActive,
+		Symbol:         "HDFCBANK",
+		Strategy:       "multi_indicator",
+		ParamVariant:   "fast",
+		Timeframe:      "1day",
+		BlockedRegimes: []string{"range"},
+	}
+	predictions := []models.PaperPrediction{
+		candidateCohortPrediction("P1", "C1", now.Add(-3*time.Hour), regimeModeExplore, "range", "RIGHT", 2),
+		candidateCohortPrediction("P2", "C1", now.Add(-2*time.Hour), regimeModeExplore, "range", "RIGHT", 1),
+		candidateCohortPrediction("P3", "C1", now.Add(-time.Hour), regimeModeExplore, "range", "WRONG", -0.5),
+	}
+	actions := buildPaperExperimentCandidateActions([]models.PaperCandidate{candidate}, predictions, []paperExperimentCohortComparison{
+		{RegimeMode: regimeModeExplore, Verdict: "LEADING"},
+	}, paperExperimentCandidateActionOptions{MinCandidateDecisive: 3, MinWinRate: 50})
+	if len(actions) != 1 || actions[0].Action != "ALLOW_REGIME" || actions[0].Regime != "range" {
+		t.Fatalf("expected allow regime action, got %#v", actions)
+	}
+}
+
+func TestBuildPaperExperimentCandidateActionsBlocksWeakExploreRegime(t *testing.T) {
+	now := time.Date(2026, 5, 5, 10, 0, 0, 0, time.UTC)
+	candidate := models.PaperCandidate{
+		ID:           "C1",
+		Status:       models.PaperCandidateStatusActive,
+		Symbol:       "HDFCBANK",
+		Strategy:     "multi_indicator",
+		ParamVariant: "fast",
+		Timeframe:    "1day",
+	}
+	predictions := []models.PaperPrediction{
+		candidateCohortPrediction("P1", "C1", now.Add(-3*time.Hour), regimeModeExplore, "trend_down", "WRONG", -2),
+		candidateCohortPrediction("P2", "C1", now.Add(-2*time.Hour), regimeModeExplore, "trend_down", "WRONG", -1),
+		candidateCohortPrediction("P3", "C1", now.Add(-time.Hour), regimeModeExplore, "trend_down", "RIGHT", 0.2),
+	}
+	actions := buildPaperExperimentCandidateActions([]models.PaperCandidate{candidate}, predictions, []paperExperimentCohortComparison{
+		{RegimeMode: regimeModeExplore, Verdict: "WEAK_OUTCOME"},
+	}, paperExperimentCandidateActionOptions{MinCandidateDecisive: 3, MinWinRate: 50})
+	if len(actions) != 1 || actions[0].Action != "BLOCK_REGIME" || actions[0].Regime != "trend_down" {
+		t.Fatalf("expected block regime action, got %#v", actions)
+	}
+}
+
 func cohortPrediction(id string, created time.Time, regimeMode string, outcome string, pnl float64) models.PaperPrediction {
 	return models.PaperPrediction{
 		ID:          id,
@@ -162,4 +209,11 @@ func cohortPrediction(id string, created time.Time, regimeMode string, outcome s
 		Outcome:    outcome,
 		PnLPercent: pnl,
 	}
+}
+
+func candidateCohortPrediction(id string, candidateID string, created time.Time, regimeMode string, regime string, outcome string, pnl float64) models.PaperPrediction {
+	prediction := cohortPrediction(id, created, regimeMode, outcome, pnl)
+	prediction.SetupName = "candidate:" + candidateID
+	prediction.Gates = append(prediction.Gates, models.PaperPredictionGate{Name: "regime_allowed", Passed: regimeMode == regimeModeStrict, Reason: regime})
+	return prediction
 }

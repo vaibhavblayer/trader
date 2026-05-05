@@ -20,32 +20,36 @@ func TestSQLiteDaemonStateRoundTrip(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	killAt := now.Add(time.Minute)
 	state := &models.DaemonState{
-		Status:                models.DaemonStatusPaused,
-		PID:                   1234,
-		Hostname:              "test-host",
-		StartedAt:             now,
-		UpdatedAt:             now,
-		LastHeartbeatAt:       now,
-		Watchlist:             "momentum",
-		Symbols:               []string{"RELIANCE", "INFY"},
-		DryRun:                true,
-		IntervalSeconds:       30,
-		PaperSoakEnabled:      true,
-		PaperSoakOnly:         true,
-		PaperSoakInterval:     time.Hour,
-		PaperSoakSymbol:       "HDFCBANK",
-		PaperSoakDryRun:       true,
-		LastPaperSoakRunAt:    now.Add(-time.Hour),
-		NextPaperSoakRunAt:    now.Add(time.Hour),
-		LastPaperSoakSummary:  "candidates=1",
-		Mode:                  "FULL_AUTO",
-		SafetyProfile:         "paper",
-		Paused:                true,
-		KillSwitchActive:      true,
-		KillSwitchReason:      "test halt",
-		KillSwitchActivatedAt: &killAt,
-		KillSwitchActivatedBy: "tester",
-		Message:               "paused",
+		Status:                  models.DaemonStatusPaused,
+		PID:                     1234,
+		Hostname:                "test-host",
+		StartedAt:               now,
+		UpdatedAt:               now,
+		LastHeartbeatAt:         now,
+		Watchlist:               "momentum",
+		Symbols:                 []string{"RELIANCE", "INFY"},
+		DryRun:                  true,
+		IntervalSeconds:         30,
+		PaperSoakEnabled:        true,
+		PaperSoakOnly:           true,
+		PaperSoakInterval:       time.Hour,
+		PaperSoakSymbol:         "HDFCBANK",
+		PaperSoakRegimeMode:     "strict",
+		PaperSoakRegimeRotation: []string{"strict", "allow-unknown", "explore"},
+		PaperSoakRegimeIndex:    2,
+		LastPaperSoakRegimeMode: "allow-unknown",
+		PaperSoakDryRun:         true,
+		LastPaperSoakRunAt:      now.Add(-time.Hour),
+		NextPaperSoakRunAt:      now.Add(time.Hour),
+		LastPaperSoakSummary:    "candidates=1",
+		Mode:                    "FULL_AUTO",
+		SafetyProfile:           "paper",
+		Paused:                  true,
+		KillSwitchActive:        true,
+		KillSwitchReason:        "test halt",
+		KillSwitchActivatedAt:   &killAt,
+		KillSwitchActivatedBy:   "tester",
+		Message:                 "paused",
 	}
 
 	if err := store.SaveDaemonState(ctx, state); err != nil {
@@ -66,6 +70,12 @@ func TestSQLiteDaemonStateRoundTrip(t *testing.T) {
 	}
 	if !got.PaperSoakEnabled || !got.PaperSoakOnly || got.PaperSoakInterval != time.Hour || got.PaperSoakSymbol != "HDFCBANK" {
 		t.Fatalf("paper soak state not restored: %#v", got)
+	}
+	if got.PaperSoakRegimeMode != "strict" || got.PaperSoakRegimeIndex != 2 || got.LastPaperSoakRegimeMode != "allow-unknown" {
+		t.Fatalf("paper soak regime state not restored: %#v", got)
+	}
+	if len(got.PaperSoakRegimeRotation) != 3 || got.PaperSoakRegimeRotation[1] != "allow-unknown" {
+		t.Fatalf("paper soak rotation not restored: %#v", got.PaperSoakRegimeRotation)
 	}
 }
 

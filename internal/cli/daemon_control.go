@@ -157,6 +157,10 @@ func refreshDaemonRuntimeState(ctx context.Context, app *App, current *models.Da
 		state.PaperSoakInterval = current.PaperSoakInterval
 		state.PaperSoakSymbol = current.PaperSoakSymbol
 		state.PaperSoakStrategy = current.PaperSoakStrategy
+		state.PaperSoakRegimeMode = current.PaperSoakRegimeMode
+		state.PaperSoakRegimeRotation = current.PaperSoakRegimeRotation
+		state.PaperSoakRegimeIndex = current.PaperSoakRegimeIndex
+		state.LastPaperSoakRegimeMode = current.LastPaperSoakRegimeMode
 		state.PaperSoakDryRun = current.PaperSoakDryRun
 		state.LastPaperSoakRunAt = current.LastPaperSoakRunAt
 		state.NextPaperSoakRunAt = current.NextPaperSoakRunAt
