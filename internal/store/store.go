@@ -50,6 +50,7 @@ type DataStore interface {
 
 	// Execution quality reporting
 	GetExecutionQualityReport(ctx context.Context, filter models.ExecutionQualityFilter) (*models.ExecutionQualityReport, error)
+	GetPostTradeReviewReport(ctx context.Context, filter models.PostTradeReviewFilter) (*models.PostTradeReviewReport, error)
 
 	// Watchlist
 	AddToWatchlist(ctx context.Context, symbol, listName string) error

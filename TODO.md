@@ -10,10 +10,10 @@ None.
 
 - [ ] Implement broker-backed REST API server or remove the public `api start` surface.
 - [ ] Replace portfolio beta, VaR, Greeks, and hedge placeholders with data-backed analytics before exposing them in active workflows.
-- [ ] Post-trade review workflow that links setup, order, fill, exit, and P&L.
 
 ## Done
 
+- [x] Post-trade review workflow that links setup, order, fill, exit, execution quality, and P&L.
 - [x] Paper prediction calibration and expectancy reports by confidence, action, and symbol.
 - [x] Historical calibration and per-gate expectancy reports by setup, gate, symbol, timeframe, and action.
 - [x] Kill-switch command and persistent daemon state.

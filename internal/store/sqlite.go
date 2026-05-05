@@ -1568,6 +1568,304 @@ func sideAdjustedSlippageBp(side string, expected, actual float64) float64 {
 	return (actual - expected) / expected * 10000
 }
 
+// GetPostTradeReviewReport links completed trades with prediction and execution context.
+func (s *SQLiteStore) GetPostTradeReviewReport(ctx context.Context, filter models.PostTradeReviewFilter) (*models.PostTradeReviewReport, error) {
+	if filter.Limit <= 0 {
+		filter.Limit = 50
+	}
+	report := &models.PostTradeReviewReport{
+		GeneratedAt: time.Now(),
+		StartDate:   filter.StartDate,
+		EndDate:     filter.EndDate,
+		Symbol:      filter.Symbol,
+		Trades:      []models.PostTradeReviewTrade{},
+	}
+
+	trades, err := s.GetTrades(ctx, TradeFilter{
+		Symbol:    filter.Symbol,
+		StartDate: filter.StartDate,
+		EndDate:   filter.EndDate,
+		IsPaper:   filter.IsPaper,
+		Limit:     filter.Limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	predictions, err := s.GetPaperPredictions(ctx, PaperPredictionFilter{
+		Symbol:    filter.Symbol,
+		StartDate: predictionReviewStart(filter.StartDate),
+		EndDate:   predictionReviewEnd(filter.EndDate),
+		Limit:     filter.Limit * 5,
+	})
+	if err != nil {
+		return nil, err
+	}
+	orders, err := s.loadPaperExecutionOrders(ctx, models.ExecutionQualityFilter{
+		Symbol:    filter.Symbol,
+		StartDate: filter.StartDate,
+		EndDate:   filter.EndDate,
+	})
+	if err != nil {
+		return nil, err
+	}
+	ordersByID := make(map[string]executionQualityOrder, len(orders))
+	for _, order := range orders {
+		ordersByID[order.OrderID] = order
+	}
+
+	overall := newPostTradeReviewAccumulator("overall")
+	bySetup := make(map[string]*postTradeReviewAccumulator)
+	bySymbol := make(map[string]*postTradeReviewAccumulator)
+	byStrategy := make(map[string]*postTradeReviewAccumulator)
+
+	for _, trade := range trades {
+		review := buildPostTradeReviewTrade(trade, matchTradePrediction(trade, predictions), ordersByID)
+		report.Trades = append(report.Trades, review)
+		overall.add(review)
+		postTradeReviewGroup(bySetup, reviewSetupKey(review)).add(review)
+		postTradeReviewGroup(bySymbol, review.Symbol).add(review)
+		postTradeReviewGroup(byStrategy, reviewStrategyKey(review)).add(review)
+	}
+
+	stats := overall.stats()
+	report.TotalTrades = stats.Trades
+	report.ReviewedTrades = len(report.Trades)
+	report.Winners = stats.Winners
+	report.Losers = stats.Losers
+	report.NetPnL = stats.NetPnL
+	report.AvgPnLPercent = stats.AvgPnLPercent
+	report.WithPrediction = stats.WithPrediction
+	report.WithExecution = stats.WithExecution
+	report.MissingPrediction = stats.MissingPrediction
+	report.MissingExecution = stats.MissingExecution
+	report.AvgSlippageBp = stats.AvgSlippageBp
+	report.TotalCosts = stats.TotalCosts
+	report.BySetup = postTradeReviewStatsSlice(bySetup)
+	report.BySymbol = postTradeReviewStatsSlice(bySymbol)
+	report.ByStrategy = postTradeReviewStatsSlice(byStrategy)
+
+	return report, nil
+}
+
+func predictionReviewStart(start time.Time) time.Time {
+	if start.IsZero() {
+		return start
+	}
+	return start.Add(-24 * time.Hour)
+}
+
+func predictionReviewEnd(end time.Time) time.Time {
+	if end.IsZero() {
+		return end
+	}
+	return end.Add(24 * time.Hour)
+}
+
+func matchTradePrediction(trade models.Trade, predictions []models.PaperPrediction) *models.PaperPrediction {
+	var best *models.PaperPrediction
+	for i := range predictions {
+		prediction := &predictions[i]
+		if !strings.EqualFold(prediction.Symbol, trade.Symbol) {
+			continue
+		}
+		if !strings.EqualFold(prediction.Action, string(trade.Side)) {
+			continue
+		}
+		if prediction.CreatedAt.After(trade.Timestamp) {
+			continue
+		}
+		if !prediction.ExpiresAt.IsZero() && trade.Timestamp.After(prediction.ExpiresAt.Add(5*time.Minute)) {
+			continue
+		}
+		if best == nil || prediction.CreatedAt.After(best.CreatedAt) {
+			best = prediction
+		}
+	}
+	return best
+}
+
+func buildPostTradeReviewTrade(trade models.Trade, prediction *models.PaperPrediction, ordersByID map[string]executionQualityOrder) models.PostTradeReviewTrade {
+	review := models.PostTradeReviewTrade{
+		TradeID:     trade.ID,
+		Timestamp:   trade.Timestamp,
+		Symbol:      trade.Symbol,
+		Side:        string(trade.Side),
+		Strategy:    trade.Strategy,
+		Quantity:    trade.Quantity,
+		EntryPrice:  trade.EntryPrice,
+		ExitPrice:   trade.ExitPrice,
+		PnL:         trade.PnL,
+		PnLPercent:  trade.PnLPercent,
+		IsPaper:     trade.IsPaper,
+		DecisionID:  trade.DecisionID,
+		OrderIDs:    append([]string(nil), trade.OrderIDs...),
+		ReviewFlags: make([]string, 0),
+	}
+	if prediction != nil {
+		review.PredictionID = prediction.ID
+		review.SetupName = prediction.SetupName
+		review.Timeframe = prediction.Timeframe
+		review.PredictionConfidence = prediction.Confidence
+		review.PredictionOutcome = prediction.Outcome
+		review.GatesTotal = len(prediction.Gates)
+		for _, gate := range prediction.Gates {
+			if gate.Passed {
+				review.GatesPassed++
+			}
+		}
+		if prediction.Outcome != "" && trade.PnLPercent != 0 {
+			if prediction.Outcome == "RIGHT" && trade.PnLPercent < 0 {
+				review.ReviewFlags = append(review.ReviewFlags, "prediction_right_trade_lost")
+			}
+			if prediction.Outcome == "WRONG" && trade.PnLPercent > 0 {
+				review.ReviewFlags = append(review.ReviewFlags, "prediction_wrong_trade_won")
+			}
+		}
+	} else {
+		review.ReviewFlags = append(review.ReviewFlags, "missing_prediction")
+	}
+
+	var slippageSum float64
+	for _, orderID := range trade.OrderIDs {
+		order, ok := ordersByID[orderID]
+		if !ok {
+			continue
+		}
+		review.ExecutionOrders++
+		review.ExecutionCosts += order.Costs
+		if order.Filled() {
+			review.FilledOrders++
+			slippageSum += order.SlippageBp
+		}
+		if order.Status == "PARTIAL" {
+			review.PartialFills++
+		}
+	}
+	if review.FilledOrders > 0 {
+		review.AvgSlippageBp = slippageSum / float64(review.FilledOrders)
+	}
+	if len(trade.OrderIDs) > 0 && review.ExecutionOrders == 0 {
+		review.ReviewFlags = append(review.ReviewFlags, "missing_execution")
+	}
+	if review.PartialFills > 0 {
+		review.ReviewFlags = append(review.ReviewFlags, "partial_fill")
+	}
+	if review.AvgSlippageBp >= 50 {
+		review.ReviewFlags = append(review.ReviewFlags, "high_slippage")
+	}
+	return review
+}
+
+func reviewSetupKey(review models.PostTradeReviewTrade) string {
+	if review.SetupName == "" {
+		return "NO_PREDICTION"
+	}
+	return review.SetupName
+}
+
+func reviewStrategyKey(review models.PostTradeReviewTrade) string {
+	if review.Strategy == "" {
+		return "UNKNOWN"
+	}
+	return review.Strategy
+}
+
+type postTradeReviewAccumulator struct {
+	key           string
+	trades        int
+	winners       int
+	losers        int
+	pnl           float64
+	pnlPercent    float64
+	predictions   int
+	confidenceSum float64
+	executions    int
+	missingPred   int
+	missingExec   int
+	slippageSum   float64
+	costs         float64
+}
+
+func newPostTradeReviewAccumulator(key string) *postTradeReviewAccumulator {
+	return &postTradeReviewAccumulator{key: key}
+}
+
+func postTradeReviewGroup(groups map[string]*postTradeReviewAccumulator, key string) *postTradeReviewAccumulator {
+	if key == "" {
+		key = "UNKNOWN"
+	}
+	group, ok := groups[key]
+	if !ok {
+		group = newPostTradeReviewAccumulator(key)
+		groups[key] = group
+	}
+	return group
+}
+
+func (a *postTradeReviewAccumulator) add(review models.PostTradeReviewTrade) {
+	a.trades++
+	a.pnl += review.PnL
+	a.pnlPercent += review.PnLPercent
+	if review.PnL > 0 || review.PnLPercent > 0 {
+		a.winners++
+	} else if review.PnL < 0 || review.PnLPercent < 0 {
+		a.losers++
+	}
+	if review.PredictionID != "" {
+		a.predictions++
+		a.confidenceSum += review.PredictionConfidence
+	} else {
+		a.missingPred++
+	}
+	if review.ExecutionOrders > 0 {
+		a.executions++
+		a.slippageSum += review.AvgSlippageBp
+	} else {
+		a.missingExec++
+	}
+	a.costs += review.ExecutionCosts
+}
+
+func (a *postTradeReviewAccumulator) stats() models.PostTradeReviewGroup {
+	stats := models.PostTradeReviewGroup{
+		Key:               a.key,
+		Trades:            a.trades,
+		Winners:           a.winners,
+		Losers:            a.losers,
+		NetPnL:            a.pnl,
+		WithPrediction:    a.predictions,
+		WithExecution:     a.executions,
+		TotalCosts:        a.costs,
+		MissingPrediction: a.missingPred,
+		MissingExecution:  a.missingExec,
+	}
+	if a.trades > 0 {
+		stats.WinRate = float64(a.winners) / float64(a.trades) * 100
+		stats.AvgPnLPercent = a.pnlPercent / float64(a.trades)
+	}
+	if a.predictions > 0 {
+		stats.AvgConfidence = a.confidenceSum / float64(a.predictions)
+	}
+	if a.executions > 0 {
+		stats.AvgSlippageBp = a.slippageSum / float64(a.executions)
+	}
+	return stats
+}
+
+func postTradeReviewStatsSlice(groups map[string]*postTradeReviewAccumulator) []models.PostTradeReviewGroup {
+	result := make([]models.PostTradeReviewGroup, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, group.stats())
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Trades == result[j].Trades {
+			return result[i].Key < result[j].Key
+		}
+		return result[i].Trades > result[j].Trades
+	})
+	return result
+}
+
 // SavePaperPrediction inserts or updates a paper prediction.
 func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *models.PaperPrediction) error {
 	if prediction == nil {
