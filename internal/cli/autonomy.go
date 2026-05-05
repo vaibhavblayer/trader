@@ -223,9 +223,22 @@ func buildAutonomyReadinessReport(ctx context.Context, app *App, opts autonomyRe
 		report.Summary.AutonomousMode = app.Config.Agents.AutonomousMode
 		addSafetyProfileCheck(report, opts, app.Config.Trading.Mode, app.Config.SafetyProfile())
 		capabilities := app.Config.SafetyCapabilities()
-		if opts.Phase == autonomyPhaseLiveTrading && !capabilities.AutoTrade {
-			addReadinessCheck(report, "auto_trade_capability", models.AutonomyReadinessFail, "safety profile does not permit autonomous live order placement", nil)
-		} else {
+		switch opts.Phase {
+		case autonomyPhaseLiveReadOnly:
+			if capabilities.BrokerOrders || capabilities.AutoTrade || capabilities.LLMOrderAuthority {
+				addReadinessCheck(report, "live_readonly_boundary", models.AutonomyReadinessFail, "live-readonly requires broker orders, auto trading, and LLM order authority disabled", map[string]interface{}{"broker_orders": capabilities.BrokerOrders, "auto_trade": capabilities.AutoTrade, "llm_order_authority": capabilities.LLMOrderAuthority})
+			} else {
+				addReadinessCheck(report, "live_readonly_boundary", models.AutonomyReadinessPass, "live-readonly boundary blocks all order authority", map[string]interface{}{"broker_orders": capabilities.BrokerOrders, "auto_trade": capabilities.AutoTrade, "llm_order_authority": capabilities.LLMOrderAuthority})
+			}
+		case autonomyPhaseLiveTrading:
+			if !capabilities.AutoTrade {
+				addReadinessCheck(report, "auto_trade_capability", models.AutonomyReadinessFail, "safety profile does not permit autonomous live order placement", nil)
+			} else if capabilities.LLMOrderAuthority {
+				addReadinessCheck(report, "llm_order_boundary", models.AutonomyReadinessFail, "LLM direct order authority must stay disabled for live trading", nil)
+			} else {
+				addReadinessCheck(report, "auto_trade_capability", models.AutonomyReadinessPass, "safety profile capability is compatible with requested phase", map[string]interface{}{"auto_trade": capabilities.AutoTrade})
+			}
+		default:
 			addReadinessCheck(report, "auto_trade_capability", models.AutonomyReadinessPass, "safety profile capability is compatible with requested phase", map[string]interface{}{"auto_trade": capabilities.AutoTrade})
 		}
 	}
@@ -400,8 +413,13 @@ func addExecutionQualityCheck(report *models.AutonomyReadinessReport, opts auton
 	status := models.AutonomyReadinessPass
 	message := "execution quality meets thresholds"
 	if execReport.TotalOrders == 0 {
-		status = missingEvidenceStatus(opts.Phase)
-		message = "no execution samples found"
+		if opts.Phase == autonomyPhaseLiveReadOnly {
+			status = models.AutonomyReadinessPass
+			message = "execution samples are not required for live-readonly monitoring"
+		} else {
+			status = missingEvidenceStatus(opts.Phase)
+			message = "no execution samples found"
+		}
 	} else if execReport.RejectionRate > opts.MaxRejectionRate {
 		status = models.AutonomyReadinessFail
 		message = fmt.Sprintf("rejection rate %.1f%% exceeds %.1f%%", execReport.RejectionRate, opts.MaxRejectionRate)
@@ -422,8 +440,13 @@ func addPostTradeReviewCheck(report *models.AutonomyReadinessReport, opts autono
 		missingExecutionRate = float64(review.MissingExecution) / float64(review.ReviewedTrades) * 100
 	}
 	if review.ReviewedTrades < opts.MinReviewedTrades {
-		status = missingEvidenceStatus(opts.Phase)
-		message = fmt.Sprintf("need at least %d reviewed trades, got %d", opts.MinReviewedTrades, review.ReviewedTrades)
+		if opts.Phase == autonomyPhaseLiveReadOnly {
+			status = models.AutonomyReadinessPass
+			message = "post-trade reviews are not required for live-readonly monitoring"
+		} else {
+			status = missingEvidenceStatus(opts.Phase)
+			message = fmt.Sprintf("need at least %d reviewed trades, got %d", opts.MinReviewedTrades, review.ReviewedTrades)
+		}
 	} else if missingPredictionRate > opts.MaxMissingLinkRate {
 		status = models.AutonomyReadinessFail
 		message = fmt.Sprintf("missing prediction links %.1f%% exceeds %.1f%%", missingPredictionRate, opts.MaxMissingLinkRate)

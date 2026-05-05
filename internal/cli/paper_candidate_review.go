@@ -15,43 +15,65 @@ import (
 )
 
 type paperCandidateReviewResult struct {
-	CandidateID       string   `json:"candidate_id"`
-	Symbol            string   `json:"symbol"`
-	Strategy          string   `json:"strategy"`
-	Variant           string   `json:"variant"`
-	Status            string   `json:"status"`
-	Action            string   `json:"action"`
-	Reason            string   `json:"reason"`
-	TotalPredictions  int      `json:"total_predictions"`
-	ActivePredictions int      `json:"active_predictions"`
-	Evaluated         int      `json:"evaluated"`
-	Decisive          int      `json:"decisive"`
-	Right             int      `json:"right"`
-	Wrong             int      `json:"wrong"`
-	Expired           int      `json:"expired"`
-	WinRate           float64  `json:"win_rate"`
-	Expectancy        float64  `json:"expectancy"`
-	ProfitFactor      float64  `json:"profit_factor"`
-	ExpiredRate       float64  `json:"expired_rate"`
-	LossStreak        int      `json:"loss_streak"`
-	PaperDrawdown     float64  `json:"paper_drawdown"`
-	Flags             []string `json:"flags,omitempty"`
-	GraduationReady   bool     `json:"graduation_ready"`
-	GraduationReason  string   `json:"graduation_reason,omitempty"`
-	Applied           bool     `json:"applied,omitempty"`
+	CandidateID       string                            `json:"candidate_id"`
+	Symbol            string                            `json:"symbol"`
+	Strategy          string                            `json:"strategy"`
+	Variant           string                            `json:"variant"`
+	Status            string                            `json:"status"`
+	Action            string                            `json:"action"`
+	Reason            string                            `json:"reason"`
+	TotalPredictions  int                               `json:"total_predictions"`
+	ActivePredictions int                               `json:"active_predictions"`
+	Evaluated         int                               `json:"evaluated"`
+	Decisive          int                               `json:"decisive"`
+	Right             int                               `json:"right"`
+	Wrong             int                               `json:"wrong"`
+	Expired           int                               `json:"expired"`
+	WinRate           float64                           `json:"win_rate"`
+	Expectancy        float64                           `json:"expectancy"`
+	ProfitFactor      float64                           `json:"profit_factor"`
+	ExpiredRate       float64                           `json:"expired_rate"`
+	LossStreak        int                               `json:"loss_streak"`
+	PaperDrawdown     float64                           `json:"paper_drawdown"`
+	Flags             []string                          `json:"flags,omitempty"`
+	RegimeStats       []paperCandidateRegimeReviewStats `json:"regime_stats,omitempty"`
+	RegimeFlags       []string                          `json:"regime_flags,omitempty"`
+	GraduationReady   bool                              `json:"graduation_ready"`
+	GraduationReason  string                            `json:"graduation_reason,omitempty"`
+	Applied           bool                              `json:"applied,omitempty"`
+}
+
+type paperCandidateRegimeReviewStats struct {
+	Regime             string  `json:"regime"`
+	TotalPredictions   int     `json:"total_predictions"`
+	ActivePredictions  int     `json:"active_predictions"`
+	Evaluated          int     `json:"evaluated"`
+	Decisive           int     `json:"decisive"`
+	Right              int     `json:"right"`
+	Wrong              int     `json:"wrong"`
+	Expired            int     `json:"expired"`
+	WinRate            float64 `json:"win_rate"`
+	Expectancy         float64 `json:"expectancy"`
+	ProfitFactor       float64 `json:"profit_factor"`
+	ExpiredRate        float64 `json:"expired_rate"`
+	LossStreak         int     `json:"loss_streak"`
+	PaperDrawdown      float64 `json:"paper_drawdown"`
+	ForwardAllowed     bool    `json:"forward_allowed"`
+	ForwardBlockReason string  `json:"forward_block_reason,omitempty"`
 }
 
 type paperCandidateReviewOptions struct {
-	Days           int
-	MinEvaluated   int
-	MinDecisive    int
-	MinExpectancy  float64
-	MinPF          float64
-	MaxExpiredRate float64
-	MaxLossStreak  int
-	MaxDDMultiple  float64
-	Graduate       paperCandidateGraduationOptions
-	Apply          bool
+	Days              int
+	MinEvaluated      int
+	MinDecisive       int
+	MinExpectancy     float64
+	MinPF             float64
+	MaxExpiredRate    float64
+	MaxLossStreak     int
+	MaxDDMultiple     float64
+	MinRegimeDecisive int
+	Graduate          paperCandidateGraduationOptions
+	Apply             bool
 }
 
 type paperCandidateGraduationOptions struct {
@@ -88,6 +110,7 @@ flags candidates that should be paused. It is report-only unless --apply is set.
 	cmd.Flags().Float64("max-expired-rate", 60, "Maximum expired percentage after min-evaluated")
 	cmd.Flags().Int("max-loss-streak", 5, "Maximum consecutive WRONG predictions before pause")
 	cmd.Flags().Float64("max-dd-multiple", 1.5, "Pause if paper drawdown exceeds historical drawdown times this multiple")
+	cmd.Flags().Int("min-regime-decisive", 3, "Minimum decisive predictions before flagging a weak forward regime")
 	cmd.Flags().Int("graduate-min-evaluated", 30, "Minimum evaluated predictions for graduation readiness")
 	cmd.Flags().Int("graduate-min-decisive", 20, "Minimum decisive predictions for graduation readiness")
 	cmd.Flags().Float64("graduate-min-expectancy", 0.2, "Minimum decisive expectancy percent for graduation readiness")
@@ -119,6 +142,7 @@ func runPaperCandidateReview(cmd *cobra.Command, app *App) error {
 	maxExpiredRate, _ := cmd.Flags().GetFloat64("max-expired-rate")
 	maxLossStreak, _ := cmd.Flags().GetInt("max-loss-streak")
 	maxDDMultiple, _ := cmd.Flags().GetFloat64("max-dd-multiple")
+	minRegimeDecisive, _ := cmd.Flags().GetInt("min-regime-decisive")
 	graduateMinEvaluated, _ := cmd.Flags().GetInt("graduate-min-evaluated")
 	graduateMinDecisive, _ := cmd.Flags().GetInt("graduate-min-decisive")
 	graduateMinExpectancy, _ := cmd.Flags().GetFloat64("graduate-min-expectancy")
@@ -138,14 +162,15 @@ func runPaperCandidateReview(cmd *cobra.Command, app *App) error {
 	}
 
 	results, err := reviewPaperCandidates(ctx, app.Store, candidates, paperCandidateReviewOptions{
-		Days:           days,
-		MinEvaluated:   minEvaluated,
-		MinDecisive:    minDecisive,
-		MinExpectancy:  minExpectancy,
-		MinPF:          minPF,
-		MaxExpiredRate: maxExpiredRate,
-		MaxLossStreak:  maxLossStreak,
-		MaxDDMultiple:  maxDDMultiple,
+		Days:              days,
+		MinEvaluated:      minEvaluated,
+		MinDecisive:       minDecisive,
+		MinExpectancy:     minExpectancy,
+		MinPF:             minPF,
+		MaxExpiredRate:    maxExpiredRate,
+		MaxLossStreak:     maxLossStreak,
+		MaxDDMultiple:     maxDDMultiple,
+		MinRegimeDecisive: minRegimeDecisive,
 		Graduate: paperCandidateGraduationOptions{
 			MinEvaluated:   graduateMinEvaluated,
 			MinDecisive:    graduateMinDecisive,
@@ -184,6 +209,9 @@ func reviewPaperCandidates(ctx context.Context, dataStore store.DataStore, candi
 	}
 	if opts.MaxDDMultiple <= 0 {
 		opts.MaxDDMultiple = 1.5
+	}
+	if opts.MinRegimeDecisive <= 0 {
+		opts.MinRegimeDecisive = 3
 	}
 	opts.Graduate = normalizeGraduationOptions(opts.Graduate)
 
@@ -240,6 +268,12 @@ func buildPaperCandidateReview(candidate models.PaperCandidate, predictions []mo
 	result.ExpiredRate = stats.expiredRate
 	result.LossStreak = stats.lossStreak
 	result.PaperDrawdown = stats.maxDrawdown
+	result.RegimeStats = buildPaperCandidateRegimeStats(predictions, opts)
+	for _, regime := range result.RegimeStats {
+		if !regime.ForwardAllowed {
+			result.RegimeFlags = append(result.RegimeFlags, regime.Regime+": "+regime.ForwardBlockReason)
+		}
+	}
 
 	if result.Evaluated == 0 {
 		return result
@@ -408,6 +442,72 @@ func calculatePaperCandidateOutcomeStats(predictions []models.PaperPrediction) p
 	return stats
 }
 
+func buildPaperCandidateRegimeStats(predictions []models.PaperPrediction, opts paperCandidateReviewOptions) []paperCandidateRegimeReviewStats {
+	byRegime := make(map[string][]models.PaperPrediction)
+	for _, prediction := range predictions {
+		regime := paperPredictionRegime(prediction)
+		if regime == "" {
+			regime = "unknown"
+		}
+		byRegime[regime] = append(byRegime[regime], prediction)
+	}
+	result := make([]paperCandidateRegimeReviewStats, 0, len(byRegime))
+	for regime, regimePredictions := range byRegime {
+		stats := calculatePaperCandidateOutcomeStats(regimePredictions)
+		item := paperCandidateRegimeReviewStats{
+			Regime:             regime,
+			TotalPredictions:   stats.total,
+			ActivePredictions:  stats.active,
+			Evaluated:          stats.evaluated,
+			Decisive:           stats.decisive,
+			Right:              stats.right,
+			Wrong:              stats.wrong,
+			Expired:            stats.expired,
+			WinRate:            stats.winRate,
+			Expectancy:         stats.expectancy,
+			ProfitFactor:       stats.profitFactor,
+			ExpiredRate:        stats.expiredRate,
+			LossStreak:         stats.lossStreak,
+			PaperDrawdown:      stats.maxDrawdown,
+			ForwardAllowed:     true,
+			ForwardBlockReason: "",
+		}
+		reasons := make([]string, 0)
+		if item.Decisive >= opts.MinRegimeDecisive {
+			if item.Expectancy < opts.MinExpectancy {
+				reasons = append(reasons, fmt.Sprintf("expectancy %.2f < %.2f", item.Expectancy, opts.MinExpectancy))
+			}
+			if item.ProfitFactor < opts.MinPF {
+				reasons = append(reasons, fmt.Sprintf("profit_factor %.2f < %.2f", item.ProfitFactor, opts.MinPF))
+			}
+		}
+		if item.LossStreak >= opts.MaxLossStreak {
+			reasons = append(reasons, fmt.Sprintf("loss_streak %d >= %d", item.LossStreak, opts.MaxLossStreak))
+		}
+		if len(reasons) > 0 {
+			item.ForwardAllowed = false
+			item.ForwardBlockReason = strings.Join(reasons, "; ")
+		}
+		result = append(result, item)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Decisive == result[j].Decisive {
+			return result[i].Regime < result[j].Regime
+		}
+		return result[i].Decisive > result[j].Decisive
+	})
+	return result
+}
+
+func paperPredictionRegime(prediction models.PaperPrediction) string {
+	for _, gate := range prediction.Gates {
+		if strings.EqualFold(gate.Name, "regime_allowed") {
+			return strings.ToLower(strings.TrimSpace(gate.Reason))
+		}
+	}
+	return ""
+}
+
 func appendCandidateReviewReason(existing string, flags []string) string {
 	reason := "auto_pause"
 	if len(flags) > 0 {
@@ -452,6 +552,44 @@ func displayPaperCandidateReviewResults(output *Output, results []paperCandidate
 			FormatPercent(result.PaperDrawdown),
 			graduation,
 			result.Reason,
+		)
+	}
+	table.Render()
+	printPaperCandidateRegimeReview(output, results)
+}
+
+func printPaperCandidateRegimeReview(output *Output, results []paperCandidateReviewResult) {
+	rows := make([]paperCandidateRegimeReviewStats, 0)
+	for _, result := range results {
+		for _, regime := range result.RegimeStats {
+			if regime.Decisive == 0 && regime.Evaluated == 0 {
+				continue
+			}
+			rows = append(rows, regime)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	output.Println()
+	output.Bold("Forward Regime Review")
+	table := NewTable(output, "Regime", "Eval", "Dec", "Win", "Exp", "PF", "Expect", "DD", "Gate", "Reason")
+	for _, regime := range rows {
+		gate := "ALLOW"
+		if !regime.ForwardAllowed {
+			gate = "BLOCK"
+		}
+		table.AddRow(
+			regime.Regime,
+			fmt.Sprintf("%d", regime.Evaluated),
+			fmt.Sprintf("%d", regime.Decisive),
+			fmt.Sprintf("%.1f%%", regime.WinRate),
+			fmt.Sprintf("%.1f%%", regime.ExpiredRate),
+			fmt.Sprintf("%.2f", regime.ProfitFactor),
+			FormatPercent(regime.Expectancy),
+			FormatPercent(regime.PaperDrawdown),
+			gate,
+			regime.ForwardBlockReason,
 		)
 	}
 	table.Render()

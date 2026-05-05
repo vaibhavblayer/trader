@@ -92,6 +92,89 @@ func TestBuildAutonomyReadinessReportBlocksKillSwitch(t *testing.T) {
 	}
 }
 
+func TestBuildAutonomyReadinessLiveReadonlyBoundary(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := storepkg.NewSQLiteStore(filepath.Join(t.TempDir(), "readiness_live_readonly.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer dataStore.Close()
+	now := time.Now()
+	app := &App{
+		Config: &config.Config{
+			Trading: config.TradingConfig{Mode: "live", SafetyProfile: config.SafetyProfileLiveReadOnly},
+			Agents:  config.AgentConfig{AutonomousMode: "MANUAL"},
+		},
+		Store:     dataStore,
+		Broker:    broker.NewPaperBroker(broker.PaperBrokerConfig{}),
+		LLMClient: testLLMClient{},
+	}
+	seedReadinessData(t, ctx, dataStore, now)
+
+	report, err := buildAutonomyReadinessReport(ctx, app, autonomyReadinessOptions{
+		Days:               30,
+		Phase:              autonomyPhaseLiveReadOnly,
+		MinDecisive:        1,
+		MinReviewedTrades:  0,
+		MinWinRate:         50,
+		MinExpectancy:      0,
+		MaxSlippageBp:      50,
+		MaxRejectionRate:   10,
+		MaxMissingLinkRate: 20,
+	})
+	if err != nil {
+		t.Fatalf("readiness: %v", err)
+	}
+	if report.Decision == models.AutonomyDecisionBlocked {
+		t.Fatalf("expected live-readonly not blocked, got %#v", report)
+	}
+	if check := readinessCheckByName(report, "live_readonly_boundary"); check == nil || check.Status != models.AutonomyReadinessPass {
+		t.Fatalf("expected live_readonly_boundary pass, got %#v", check)
+	}
+}
+
+func TestBuildAutonomyReadinessLiveReadonlyBlocksOrderAuthority(t *testing.T) {
+	ctx := context.Background()
+	dataStore, err := storepkg.NewSQLiteStore(filepath.Join(t.TempDir(), "readiness_live_readonly_block.db"))
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer dataStore.Close()
+	app := &App{
+		Config: &config.Config{
+			Trading: config.TradingConfig{Mode: "paper", SafetyProfile: config.SafetyProfilePaper},
+			Agents:  config.AgentConfig{AutonomousMode: "MANUAL"},
+		},
+		Store:     dataStore,
+		Broker:    broker.NewPaperBroker(broker.PaperBrokerConfig{}),
+		LLMClient: testLLMClient{},
+	}
+
+	report, err := buildAutonomyReadinessReport(ctx, app, autonomyReadinessOptions{
+		Days:        30,
+		Phase:       autonomyPhaseLiveReadOnly,
+		MinDecisive: 1,
+	})
+	if err != nil {
+		t.Fatalf("readiness: %v", err)
+	}
+	if report.Decision != models.AutonomyDecisionBlocked {
+		t.Fatalf("expected live-readonly blocked by paper order authority, got %#v", report)
+	}
+	if check := readinessCheckByName(report, "live_readonly_boundary"); check == nil || check.Status != models.AutonomyReadinessFail {
+		t.Fatalf("expected live_readonly_boundary fail, got %#v", check)
+	}
+}
+
+func readinessCheckByName(report *models.AutonomyReadinessReport, name string) *models.AutonomyReadinessCheck {
+	for i := range report.Checks {
+		if report.Checks[i].Name == name {
+			return &report.Checks[i]
+		}
+	}
+	return nil
+}
+
 func seedReadinessData(t *testing.T, ctx context.Context, dataStore storepkg.DataStore, now time.Time) {
 	t.Helper()
 	prediction := &models.PaperPrediction{

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -18,10 +19,10 @@ func TestBuildPaperCandidateReviewPausesNegativeForwardEdge(t *testing.T) {
 		MaxDrawdownPct: 5,
 	}
 	predictions := []models.PaperPrediction{
-		reviewPrediction("P1", now.Add(-4*time.Hour), "RIGHT", 1.0),
-		reviewPrediction("P2", now.Add(-3*time.Hour), "WRONG", -2.0),
-		reviewPrediction("P3", now.Add(-2*time.Hour), "WRONG", -1.5),
-		reviewPrediction("P4", now.Add(-time.Hour), "WRONG", -1.0),
+		reviewPrediction("P1", now.Add(-4*time.Hour), "RIGHT", 1.0, "range"),
+		reviewPrediction("P2", now.Add(-3*time.Hour), "WRONG", -2.0, "range"),
+		reviewPrediction("P3", now.Add(-2*time.Hour), "WRONG", -1.5, "range"),
+		reviewPrediction("P4", now.Add(-time.Hour), "WRONG", -1.0, "range"),
 	}
 
 	result := buildPaperCandidateReview(candidate, predictions, paperCandidateReviewOptions{
@@ -52,7 +53,7 @@ func TestBuildPaperCandidateReviewKeepsInsufficientSample(t *testing.T) {
 		ParamVariant: "fast",
 	}
 	predictions := []models.PaperPrediction{
-		reviewPrediction("P1", now.Add(-time.Hour), "WRONG", -2.0),
+		reviewPrediction("P1", now.Add(-time.Hour), "WRONG", -2.0, "range"),
 	}
 
 	result := buildPaperCandidateReview(candidate, predictions, paperCandidateReviewOptions{
@@ -81,11 +82,11 @@ func TestBuildPaperCandidateReviewMarksGraduationReady(t *testing.T) {
 		MaxDrawdownPct: 5,
 	}
 	predictions := []models.PaperPrediction{
-		reviewPrediction("P1", now.Add(-5*time.Hour), "RIGHT", 1.0),
-		reviewPrediction("P2", now.Add(-4*time.Hour), "RIGHT", 1.2),
-		reviewPrediction("P3", now.Add(-3*time.Hour), "RIGHT", 0.8),
-		reviewPrediction("P4", now.Add(-2*time.Hour), "WRONG", -0.4),
-		reviewPrediction("P5", now.Add(-time.Hour), "RIGHT", 1.0),
+		reviewPrediction("P1", now.Add(-5*time.Hour), "RIGHT", 1.0, "trend_up"),
+		reviewPrediction("P2", now.Add(-4*time.Hour), "RIGHT", 1.2, "trend_up"),
+		reviewPrediction("P3", now.Add(-3*time.Hour), "RIGHT", 0.8, "trend_up"),
+		reviewPrediction("P4", now.Add(-2*time.Hour), "WRONG", -0.4, "trend_up"),
+		reviewPrediction("P5", now.Add(-time.Hour), "RIGHT", 1.0, "trend_up"),
 	}
 
 	result := buildPaperCandidateReview(candidate, predictions, paperCandidateReviewOptions{
@@ -111,7 +112,43 @@ func TestBuildPaperCandidateReviewMarksGraduationReady(t *testing.T) {
 	}
 }
 
-func reviewPrediction(id string, created time.Time, outcome string, pnl float64) models.PaperPrediction {
+func TestBuildPaperCandidateReviewFlagsWeakForwardRegime(t *testing.T) {
+	now := time.Date(2026, 5, 5, 10, 0, 0, 0, time.UTC)
+	candidate := models.PaperCandidate{
+		ID:           "HDFCBANK_multi_fast",
+		Status:       models.PaperCandidateStatusActive,
+		Symbol:       "HDFCBANK",
+		Strategy:     "multi_indicator",
+		ParamVariant: "fast",
+	}
+	predictions := []models.PaperPrediction{
+		reviewPrediction("P1", now.Add(-5*time.Hour), "RIGHT", 1.5, "trend_up"),
+		reviewPrediction("P2", now.Add(-4*time.Hour), "RIGHT", 1.2, "trend_up"),
+		reviewPrediction("P3", now.Add(-3*time.Hour), "WRONG", -1.0, "range"),
+		reviewPrediction("P4", now.Add(-2*time.Hour), "WRONG", -1.0, "range"),
+		reviewPrediction("P5", now.Add(-time.Hour), "WRONG", -1.0, "range"),
+	}
+
+	result := buildPaperCandidateReview(candidate, predictions, paperCandidateReviewOptions{
+		MinDecisive:       10,
+		MinRegimeDecisive: 3,
+		MinEvaluated:      10,
+		MinExpectancy:     0,
+		MinPF:             1,
+		MaxExpiredRate:    60,
+		MaxLossStreak:     5,
+		MaxDDMultiple:     1.5,
+	})
+
+	if len(result.RegimeStats) != 2 {
+		t.Fatalf("expected two regime groups, got %#v", result.RegimeStats)
+	}
+	if len(result.RegimeFlags) != 1 || !strings.Contains(result.RegimeFlags[0], "range") {
+		t.Fatalf("expected range regime flag, got %#v", result.RegimeFlags)
+	}
+}
+
+func reviewPrediction(id string, created time.Time, outcome string, pnl float64, regime string) models.PaperPrediction {
 	return models.PaperPrediction{
 		ID:          id,
 		Symbol:      "HDFCBANK",
@@ -124,9 +161,12 @@ func reviewPrediction(id string, created time.Time, outcome string, pnl float64)
 		ExpiresAt:   created.Add(time.Hour),
 		SetupName:   "candidate:HDFCBANK_multi_fast",
 		Timeframe:   "15min",
-		Evaluated:   true,
-		ExitPrice:   100 + pnl,
-		Outcome:     outcome,
-		PnLPercent:  pnl,
+		Gates: []models.PaperPredictionGate{
+			{Name: "regime_allowed", Passed: true, Reason: regime},
+		},
+		Evaluated:  true,
+		ExitPrice:  100 + pnl,
+		Outcome:    outcome,
+		PnLPercent: pnl,
 	}
 }
