@@ -276,9 +276,9 @@ func (s *SQLiteStore) initSchema() error {
 		created_at DATETIME NOT NULL,
 		expires_at DATETIME NOT NULL,
 		reasoning TEXT,
-		setup_name TEXT,
-		timeframe TEXT,
-		gates TEXT,
+		setup_name TEXT NOT NULL,
+		timeframe TEXT NOT NULL,
+		gates TEXT NOT NULL DEFAULT '[]',
 		evaluated INTEGER DEFAULT 0,
 		exit_price REAL,
 		outcome TEXT,
@@ -338,16 +338,6 @@ func (s *SQLiteStore) initSchema() error {
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
 	}
-	if err := s.ensureColumn("paper_predictions", "setup_name", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("paper_predictions", "timeframe", "TEXT"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("paper_predictions", "gates", "TEXT"); err != nil {
-		return err
-	}
-
 	if _, err := s.db.Exec(`
 		UPDATE alerts
 		SET id = 'ALERT_' || rowid || '_' || strftime('%s', COALESCE(created_at, CURRENT_TIMESTAMP))
@@ -356,36 +346,6 @@ func (s *SQLiteStore) initSchema() error {
 		return fmt.Errorf("failed to backfill alert IDs: %w", err)
 	}
 
-	return nil
-}
-
-func (s *SQLiteStore) ensureColumn(table, column, columnType string) error {
-	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
-		return fmt.Errorf("checking %s.%s column: %w", table, column, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull int
-		var defaultValue interface{}
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			return fmt.Errorf("scanning %s schema: %w", table, err)
-		}
-		if name == column {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_, err = s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType))
-	if err != nil {
-		return fmt.Errorf("adding %s.%s column: %w", table, column, err)
-	}
 	return nil
 }
 
@@ -1616,12 +1576,22 @@ func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *model
 	if strings.TrimSpace(prediction.ID) == "" {
 		return fmt.Errorf("paper prediction ID is required")
 	}
+	if strings.TrimSpace(prediction.SetupName) == "" {
+		return fmt.Errorf("paper prediction setup name is required")
+	}
+	if strings.TrimSpace(prediction.Timeframe) == "" {
+		return fmt.Errorf("paper prediction timeframe is required")
+	}
 
 	evaluated := 0
 	if prediction.Evaluated {
 		evaluated = 1
 	}
-	gatesJSON, err := json.Marshal(prediction.Gates)
+	gates := prediction.Gates
+	if gates == nil {
+		gates = []models.PaperPredictionGate{}
+	}
+	gatesJSON, err := json.Marshal(gates)
 	if err != nil {
 		return fmt.Errorf("failed to encode paper prediction gates: %w", err)
 	}
@@ -1668,7 +1638,7 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 	query := `
 		SELECT id, symbol, action, confidence, entry_price, target_price, stop_loss,
 			time_window_ns, created_at, expires_at, COALESCE(reasoning, ''),
-			COALESCE(setup_name, ''), COALESCE(timeframe, ''), COALESCE(gates, '[]'), evaluated,
+			setup_name, timeframe, gates, evaluated,
 			COALESCE(exit_price, 0), COALESCE(outcome, ''), COALESCE(pnl_percent, 0)
 		FROM paper_predictions WHERE 1=1
 	`
@@ -1743,7 +1713,9 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 		}
 		prediction.TimeWindow = time.Duration(timeWindowNS)
 		prediction.Evaluated = evaluated == 1
-		_ = json.Unmarshal([]byte(gatesJSON), &prediction.Gates)
+		if err := json.Unmarshal([]byte(gatesJSON), &prediction.Gates); err != nil {
+			return nil, fmt.Errorf("failed to decode paper prediction gates for %s: %w", prediction.ID, err)
+		}
 		predictions = append(predictions, prediction)
 	}
 	return predictions, rows.Err()
@@ -1833,10 +1805,9 @@ func (s *SQLiteStore) GetHistoricalCalibrationReport(ctx context.Context, filter
 
 	for _, prediction := range predictions {
 		overall.add(prediction)
-		executionSetup := calibrationSetupName(prediction)
-		calibrationGroup(bySetup, executionSetup).add(prediction)
+		calibrationGroup(bySetup, prediction.SetupName).add(prediction)
 		calibrationGroup(bySymbol, prediction.Symbol).add(prediction)
-		calibrationGroup(byTimeframe, calibrationTimeframe(prediction)).add(prediction)
+		calibrationGroup(byTimeframe, prediction.Timeframe).add(prediction)
 		calibrationGroup(byAction, prediction.Action).add(prediction)
 		for _, gate := range prediction.Gates {
 			status := "FAIL"
@@ -1947,23 +1918,6 @@ func calibrationStatsSlice(groups map[string]*calibrationAccumulator) []models.C
 		return result[i].Decisive > result[j].Decisive
 	})
 	return result
-}
-
-func calibrationSetupName(prediction models.PaperPrediction) string {
-	if prediction.SetupName != "" {
-		return prediction.SetupName
-	}
-	return "legacy_unknown"
-}
-
-func calibrationTimeframe(prediction models.PaperPrediction) string {
-	if prediction.Timeframe != "" {
-		return prediction.Timeframe
-	}
-	if prediction.TimeWindow > 0 {
-		return prediction.TimeWindow.String()
-	}
-	return "UNKNOWN"
 }
 
 type paperPredictionAccumulator struct {

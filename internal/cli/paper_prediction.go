@@ -499,7 +499,6 @@ func parsePredictionResponseWithGates(response string, symbol string, currentPri
 		Action      string `json:"action"`
 		GatesPassed struct {
 			RSIRegime        bool `json:"rsi_regime"`
-			RSIDirection     bool `json:"rsi_direction"` // backward compat
 			VolumeExpansion  bool `json:"volume_expansion"`
 			EMAAlignment     bool `json:"ema_alignment"`
 			VWAPNotExhausted bool `json:"vwap_not_exhausted"`
@@ -508,7 +507,6 @@ func parsePredictionResponseWithGates(response string, symbol string, currentPri
 		SignalQuality struct {
 			RSIValue         float64 `json:"rsi_value"`
 			RSIDirection     string  `json:"rsi_direction"`
-			RSISlope         string  `json:"rsi_slope"` // backward compat
 			VolumeRatio      float64 `json:"volume_ratio"`
 			VWAPDeviationPct float64 `json:"vwap_deviation_pct"`
 			ADXValue         float64 `json:"adx_value"`
@@ -532,10 +530,7 @@ func parsePredictionResponseWithGates(response string, symbol string, currentPri
 	}
 
 	// HARD GATE ENFORCEMENT: All 5 gates must pass
-	// Use RSIRegime if present, fall back to RSIDirection for backward compat
-	rsiGate := result.GatesPassed.RSIRegime || result.GatesPassed.RSIDirection
-
-	allGatesPassed := rsiGate &&
+	allGatesPassed := result.GatesPassed.RSIRegime &&
 		result.GatesPassed.VolumeExpansion &&
 		result.GatesPassed.EMAAlignment &&
 		result.GatesPassed.VWAPNotExhausted &&
@@ -579,7 +574,7 @@ func parsePredictionResponseWithGates(response string, symbol string, currentPri
 		SetupName:   "llm_hard_gates",
 		Timeframe:   predictionTimeframeLabel(holdDuration),
 		Gates: []models.PaperPredictionGate{
-			{Name: "rsi_regime", Passed: rsiGate},
+			{Name: "rsi_regime", Passed: result.GatesPassed.RSIRegime},
 			{Name: "volume_expansion", Passed: result.GatesPassed.VolumeExpansion},
 			{Name: "ema_alignment", Passed: result.GatesPassed.EMAAlignment},
 			{Name: "vwap_not_exhausted", Passed: result.GatesPassed.VWAPNotExhausted},

@@ -31,6 +31,8 @@ func TestPersistentPaperTrackerRestoresPredictionsAndStats(t *testing.T) {
 		TimeWindow:  time.Hour,
 		CreatedAt:   time.Now(),
 		ExpiresAt:   time.Now().Add(time.Hour),
+		SetupName:   "llm_simple",
+		Timeframe:   "1h",
 	})
 
 	active := tracker.GetActivePredictions()

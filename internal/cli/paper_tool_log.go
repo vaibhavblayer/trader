@@ -351,7 +351,6 @@ func extractGateResults(response string) []string {
 	var result struct {
 		GatesPassed struct {
 			RSIRegime        bool `json:"rsi_regime"`
-			RSIDirection     bool `json:"rsi_direction"`
 			VolumeExpansion  bool `json:"volume_expansion"`
 			EMAAlignment     bool `json:"ema_alignment"`
 			VWAPNotExhausted bool `json:"vwap_not_exhausted"`
@@ -377,9 +376,8 @@ func extractGateResults(response string) []string {
 	failIcon := "✗"
 
 	// RSI Regime Gate
-	rsiGate := result.GatesPassed.RSIRegime || result.GatesPassed.RSIDirection
 	icon := failIcon
-	if rsiGate {
+	if result.GatesPassed.RSIRegime {
 		icon = passIcon
 	}
 	lines = append(lines, fmt.Sprintf("[%s] RSI Regime: %.1f %s (need >55↑ for BUY, <45↓ for SELL)",
@@ -418,7 +416,7 @@ func extractGateResults(response string) []string {
 		icon, result.SignalQuality.ADXValue))
 
 	// Summary
-	allPassed := rsiGate &&
+	allPassed := result.GatesPassed.RSIRegime &&
 		result.GatesPassed.VolumeExpansion &&
 		result.GatesPassed.EMAAlignment &&
 		result.GatesPassed.VWAPNotExhausted &&
