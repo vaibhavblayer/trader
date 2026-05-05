@@ -29,6 +29,8 @@ type paperCandidateHealthResult struct {
 	LastEvaluatedAt   time.Time `json:"last_evaluated_at,omitempty"`
 	ProbeStatus       string    `json:"probe_status,omitempty"`
 	ProbeReason       string    `json:"probe_reason,omitempty"`
+	ProbeRegimeMode   string    `json:"probe_regime_mode,omitempty"`
+	ProbeRegimeGate   string    `json:"probe_regime_gate,omitempty"`
 	ProbeRegime       string    `json:"probe_regime,omitempty"`
 	ProbeSignal       string    `json:"probe_signal,omitempty"`
 	Health            string    `json:"health"`
@@ -58,6 +60,7 @@ show whether the candidate is currently blocked, open, no-signal, or tradeable.`
 	cmd.Flags().Int("probe-days", 120, "Historical lookback days for probe")
 	cmd.Flags().Int("probe-min-candles", 80, "Minimum candles required for probe")
 	cmd.Flags().Int("probe-regime-window", 50, "Candles used to classify probe regime")
+	cmd.Flags().String("probe-regime-mode", regimeModeStrict, "Probe regime guardrail mode: strict, allow-unknown, or explore")
 	return cmd
 }
 
@@ -79,6 +82,11 @@ func runPaperCandidateHealth(cmd *cobra.Command, app *App) error {
 	probeDays, _ := cmd.Flags().GetInt("probe-days")
 	probeMinCandles, _ := cmd.Flags().GetInt("probe-min-candles")
 	probeRegimeWindow, _ := cmd.Flags().GetInt("probe-regime-window")
+	probeRegimeModeFlag, _ := cmd.Flags().GetString("probe-regime-mode")
+	probeRegimeMode, err := parseCandidateRegimeMode(probeRegimeModeFlag)
+	if err != nil {
+		return err
+	}
 
 	candidates, err := app.Store.GetPaperCandidates(ctx, models.PaperCandidateFilter{
 		Symbol:   strings.ToUpper(strings.TrimSpace(symbol)),
@@ -99,6 +107,7 @@ func runPaperCandidateHealth(cmd *cobra.Command, app *App) error {
 		ProbeDays:         probeDays,
 		ProbeMinCandles:   probeMinCandles,
 		ProbeRegimeWindow: probeRegimeWindow,
+		ProbeRegimeMode:   probeRegimeMode,
 	})
 	if err != nil {
 		return err
@@ -117,6 +126,7 @@ type paperCandidateHealthOptions struct {
 	ProbeDays         int
 	ProbeMinCandles   int
 	ProbeRegimeWindow int
+	ProbeRegimeMode   string
 }
 
 func buildPaperCandidateHealth(ctx context.Context, app *App, candidates []models.PaperCandidate, opts paperCandidateHealthOptions) ([]paperCandidateHealthResult, error) {
@@ -130,6 +140,7 @@ func buildPaperCandidateHealth(ctx context.Context, app *App, candidates []model
 			Days:         opts.ProbeDays,
 			MinCandles:   opts.ProbeMinCandles,
 			RegimeWindow: opts.ProbeRegimeWindow,
+			RegimeMode:   opts.ProbeRegimeMode,
 			TimeWindow:   24 * time.Hour,
 			DryRun:       true,
 		}) {
@@ -150,6 +161,8 @@ func buildPaperCandidateHealth(ctx context.Context, app *App, candidates []model
 		if probe, ok := probeResults[candidate.ID]; ok {
 			result.ProbeStatus = probe.Status
 			result.ProbeReason = probe.Reason
+			result.ProbeRegimeMode = probe.RegimeMode
+			result.ProbeRegimeGate = probe.RegimeGate
 			result.ProbeRegime = probe.Regime
 			result.ProbeSignal = probe.Signal
 			result.Flags = append(result.Flags, paperCandidateProbeFlags(probe)...)
@@ -241,7 +254,7 @@ func displayPaperCandidateHealth(output *Output, results []paperCandidateHealthR
 		output.Info("No paper candidates matched")
 		return
 	}
-	table := NewTable(output, "Health", "Symbol", "Strategy", "Variant", "Age", "Pred", "Eval", "Dec", "Last Pred", "Probe", "Regime", "Flags")
+	table := NewTable(output, "Health", "Symbol", "Strategy", "Variant", "Age", "Pred", "Eval", "Dec", "Last Pred", "Probe", "Mode", "Regime", "Gate", "Flags")
 	for _, result := range results {
 		table.AddRow(
 			result.Health,
@@ -254,7 +267,9 @@ func displayPaperCandidateHealth(output *Output, results []paperCandidateHealthR
 			fmt.Sprintf("%d", result.Decisive),
 			formatOptionalDateTime(result.LastPredictionAt),
 			result.ProbeStatus,
+			result.ProbeRegimeMode,
 			result.ProbeRegime,
+			result.ProbeRegimeGate,
 			strings.Join(result.Flags, ","),
 		)
 	}

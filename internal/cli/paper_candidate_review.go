@@ -15,32 +15,36 @@ import (
 )
 
 type paperCandidateReviewResult struct {
-	CandidateID       string                            `json:"candidate_id"`
-	Symbol            string                            `json:"symbol"`
-	Strategy          string                            `json:"strategy"`
-	Variant           string                            `json:"variant"`
-	Status            string                            `json:"status"`
-	Action            string                            `json:"action"`
-	Reason            string                            `json:"reason"`
-	TotalPredictions  int                               `json:"total_predictions"`
-	ActivePredictions int                               `json:"active_predictions"`
-	Evaluated         int                               `json:"evaluated"`
-	Decisive          int                               `json:"decisive"`
-	Right             int                               `json:"right"`
-	Wrong             int                               `json:"wrong"`
-	Expired           int                               `json:"expired"`
-	WinRate           float64                           `json:"win_rate"`
-	Expectancy        float64                           `json:"expectancy"`
-	ProfitFactor      float64                           `json:"profit_factor"`
-	ExpiredRate       float64                           `json:"expired_rate"`
-	LossStreak        int                               `json:"loss_streak"`
-	PaperDrawdown     float64                           `json:"paper_drawdown"`
-	Flags             []string                          `json:"flags,omitempty"`
-	RegimeStats       []paperCandidateRegimeReviewStats `json:"regime_stats,omitempty"`
-	RegimeFlags       []string                          `json:"regime_flags,omitempty"`
-	GraduationReady   bool                              `json:"graduation_ready"`
-	GraduationReason  string                            `json:"graduation_reason,omitempty"`
-	Applied           bool                              `json:"applied,omitempty"`
+	CandidateID            string                            `json:"candidate_id"`
+	Symbol                 string                            `json:"symbol"`
+	Strategy               string                            `json:"strategy"`
+	Variant                string                            `json:"variant"`
+	Status                 string                            `json:"status"`
+	Action                 string                            `json:"action"`
+	Reason                 string                            `json:"reason"`
+	TotalPredictions       int                               `json:"total_predictions"`
+	TrustedPredictions     int                               `json:"trusted_predictions"`
+	ExploratoryPredictions int                               `json:"exploratory_predictions"`
+	ActivePredictions      int                               `json:"active_predictions"`
+	Evaluated              int                               `json:"evaluated"`
+	Decisive               int                               `json:"decisive"`
+	ExploratoryEvaluated   int                               `json:"exploratory_evaluated"`
+	ExploratoryDecisive    int                               `json:"exploratory_decisive"`
+	Right                  int                               `json:"right"`
+	Wrong                  int                               `json:"wrong"`
+	Expired                int                               `json:"expired"`
+	WinRate                float64                           `json:"win_rate"`
+	Expectancy             float64                           `json:"expectancy"`
+	ProfitFactor           float64                           `json:"profit_factor"`
+	ExpiredRate            float64                           `json:"expired_rate"`
+	LossStreak             int                               `json:"loss_streak"`
+	PaperDrawdown          float64                           `json:"paper_drawdown"`
+	Flags                  []string                          `json:"flags,omitempty"`
+	RegimeStats            []paperCandidateRegimeReviewStats `json:"regime_stats,omitempty"`
+	RegimeFlags            []string                          `json:"regime_flags,omitempty"`
+	GraduationReady        bool                              `json:"graduation_ready"`
+	GraduationReason       string                            `json:"graduation_reason,omitempty"`
+	Applied                bool                              `json:"applied,omitempty"`
 }
 
 type paperCandidateRegimeReviewStats struct {
@@ -254,21 +258,28 @@ func buildPaperCandidateReview(candidate models.PaperCandidate, predictions []mo
 		Action:      "KEEP",
 		Reason:      "insufficient_forward_evidence",
 	}
-	stats := calculatePaperCandidateOutcomeStats(predictions)
-	result.TotalPredictions = stats.total
-	result.ActivePredictions = stats.active
-	result.Evaluated = stats.evaluated
-	result.Decisive = stats.decisive
-	result.Right = stats.right
-	result.Wrong = stats.wrong
-	result.Expired = stats.expired
-	result.WinRate = stats.winRate
-	result.Expectancy = stats.expectancy
-	result.ProfitFactor = stats.profitFactor
-	result.ExpiredRate = stats.expiredRate
-	result.LossStreak = stats.lossStreak
-	result.PaperDrawdown = stats.maxDrawdown
-	result.RegimeStats = buildPaperCandidateRegimeStats(predictions, opts)
+	trustedPredictions, exploratoryPredictions := splitTrustedPaperCandidatePredictions(predictions)
+	allStats := calculatePaperCandidateOutcomeStats(predictions)
+	trustedStats := calculatePaperCandidateOutcomeStats(trustedPredictions)
+	exploratoryStats := calculatePaperCandidateOutcomeStats(exploratoryPredictions)
+	result.TotalPredictions = allStats.total
+	result.TrustedPredictions = trustedStats.total
+	result.ExploratoryPredictions = exploratoryStats.total
+	result.ActivePredictions = trustedStats.active
+	result.Evaluated = trustedStats.evaluated
+	result.Decisive = trustedStats.decisive
+	result.ExploratoryEvaluated = exploratoryStats.evaluated
+	result.ExploratoryDecisive = exploratoryStats.decisive
+	result.Right = trustedStats.right
+	result.Wrong = trustedStats.wrong
+	result.Expired = trustedStats.expired
+	result.WinRate = trustedStats.winRate
+	result.Expectancy = trustedStats.expectancy
+	result.ProfitFactor = trustedStats.profitFactor
+	result.ExpiredRate = trustedStats.expiredRate
+	result.LossStreak = trustedStats.lossStreak
+	result.PaperDrawdown = trustedStats.maxDrawdown
+	result.RegimeStats = buildPaperCandidateRegimeStats(trustedPredictions, opts)
 	for _, regime := range result.RegimeStats {
 		if !regime.ForwardAllowed {
 			result.RegimeFlags = append(result.RegimeFlags, regime.Regime+": "+regime.ForwardBlockReason)
@@ -442,6 +453,41 @@ func calculatePaperCandidateOutcomeStats(predictions []models.PaperPrediction) p
 	return stats
 }
 
+func splitTrustedPaperCandidatePredictions(predictions []models.PaperPrediction) ([]models.PaperPrediction, []models.PaperPrediction) {
+	trusted := make([]models.PaperPrediction, 0, len(predictions))
+	exploratory := make([]models.PaperPrediction, 0)
+	for _, prediction := range predictions {
+		if isExploratoryPaperPrediction(prediction) {
+			exploratory = append(exploratory, prediction)
+			continue
+		}
+		trusted = append(trusted, prediction)
+	}
+	return trusted, exploratory
+}
+
+func isExploratoryPaperPrediction(prediction models.PaperPrediction) bool {
+	for _, gate := range prediction.Gates {
+		name := strings.ToLower(strings.TrimSpace(gate.Name))
+		reason := strings.ToLower(strings.TrimSpace(gate.Reason))
+		switch name {
+		case "exploratory_regime":
+			if !gate.Passed {
+				return true
+			}
+		case "regime_mode":
+			if reason == regimeModeExplore {
+				return true
+			}
+		case "regime_gate":
+			if strings.HasPrefix(reason, "explore:") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func buildPaperCandidateRegimeStats(predictions []models.PaperPrediction, opts paperCandidateReviewOptions) []paperCandidateRegimeReviewStats {
 	byRegime := make(map[string][]models.PaperPrediction)
 	for _, prediction := range predictions {
@@ -531,7 +577,7 @@ func displayPaperCandidateReviewResults(output *Output, results []paperCandidate
 		output.Info("No paper candidates matched")
 		return
 	}
-	table := NewTable(output, "Action", "Status", "Symbol", "Strategy", "Variant", "Eval", "Dec", "Win", "Exp", "PF", "Expect", "DD", "Grad", "Reason")
+	table := NewTable(output, "Action", "Status", "Symbol", "Strategy", "Variant", "Eval", "Dec", "Xplr", "Win", "Exp", "PF", "Expect", "DD", "Grad", "Reason")
 	for _, result := range results {
 		graduation := "NO"
 		if result.GraduationReady {
@@ -545,6 +591,7 @@ func displayPaperCandidateReviewResults(output *Output, results []paperCandidate
 			result.Variant,
 			fmt.Sprintf("%d", result.Evaluated),
 			fmt.Sprintf("%d", result.Decisive),
+			fmt.Sprintf("%d", result.ExploratoryPredictions),
 			fmt.Sprintf("%.1f%%", result.WinRate),
 			fmt.Sprintf("%.1f%%", result.ExpiredRate),
 			fmt.Sprintf("%.2f", result.ProfitFactor),

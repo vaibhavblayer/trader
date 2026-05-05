@@ -97,6 +97,7 @@ immediately dry-run the promoted candidates through regime guardrails.`,
 			candidateRunDry, _ := cmd.Flags().GetBool("candidate-run-dry")
 			candidateRunDays, _ := cmd.Flags().GetInt("candidate-run-days")
 			candidateRunWindow, _ := cmd.Flags().GetString("candidate-run-window")
+			candidateRunRegimeModeFlag, _ := cmd.Flags().GetString("candidate-run-regime-mode")
 
 			thresholds := backtestGridThresholds{}
 			thresholds.MinTrades, _ = cmd.Flags().GetInt("min-trades")
@@ -205,6 +206,10 @@ immediately dry-run the promoted candidates through regime guardrails.`,
 
 			var candidateResults []candidateRunResult
 			if candidateRun {
+				candidateRunRegimeMode, err := parseCandidateRegimeMode(candidateRunRegimeModeFlag)
+				if err != nil {
+					return err
+				}
 				window, err := time.ParseDuration(candidateRunWindow)
 				if err != nil {
 					return fmt.Errorf("invalid candidate-run-window %q: %w", candidateRunWindow, err)
@@ -213,6 +218,7 @@ immediately dry-run the promoted candidates through regime guardrails.`,
 					Days:         candidateRunDays,
 					MinCandles:   80,
 					RegimeWindow: regimeWindow,
+					RegimeMode:   candidateRunRegimeMode,
 					TimeWindow:   window,
 					DryRun:       candidateRunDry,
 				})
@@ -291,6 +297,7 @@ immediately dry-run the promoted candidates through regime guardrails.`,
 	cmd.Flags().Bool("candidate-run", false, "Run newly promoted candidates through paper guardrails")
 	cmd.Flags().Bool("candidate-run-dry", true, "Candidate-run dry run mode")
 	cmd.Flags().Int("candidate-run-days", 180, "Candidate-run historical lookback days")
+	cmd.Flags().String("candidate-run-regime-mode", regimeModeStrict, "Candidate-run regime guardrail mode: strict, allow-unknown, or explore")
 	cmd.Flags().String("candidate-run-window", "24h", "Candidate paper prediction evaluation window")
 	return cmd
 }

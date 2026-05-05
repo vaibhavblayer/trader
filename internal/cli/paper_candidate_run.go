@@ -23,11 +23,28 @@ type candidateRunResult struct {
 	Timeframe   string  `json:"timeframe"`
 	Setup       string  `json:"setup"`
 	Regime      string  `json:"regime"`
+	RegimeMode  string  `json:"regime_mode,omitempty"`
+	RegimeGate  string  `json:"regime_gate,omitempty"`
+	Exploratory bool    `json:"exploratory,omitempty"`
 	Signal      string  `json:"signal"`
 	Confidence  float64 `json:"confidence"`
 	Status      string  `json:"status"`
 	Reason      string  `json:"reason,omitempty"`
 	Prediction  string  `json:"prediction_id,omitempty"`
+}
+
+const (
+	regimeModeStrict       = "strict"
+	regimeModeAllowUnknown = "allow-unknown"
+	regimeModeExplore      = "explore"
+)
+
+type candidateRegimeDecision struct {
+	Mode        string
+	Gate        string
+	Reason      string
+	Allowed     bool
+	Exploratory bool
 }
 
 func newPaperCandidateRunCmd(app *App) *cobra.Command {
@@ -58,10 +75,15 @@ paper prediction only when the latest candle emits BUY or SELL.`,
 			days, _ := cmd.Flags().GetInt("days")
 			minCandles, _ := cmd.Flags().GetInt("min-candles")
 			regimeWindow, _ := cmd.Flags().GetInt("regime-window")
+			regimeModeFlag, _ := cmd.Flags().GetString("regime-mode")
 			timeWindowStr, _ := cmd.Flags().GetString("window")
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			limit, _ := cmd.Flags().GetInt("limit")
 
+			regimeMode, err := parseCandidateRegimeMode(regimeModeFlag)
+			if err != nil {
+				return err
+			}
 			timeWindow, err := time.ParseDuration(timeWindowStr)
 			if err != nil {
 				return fmt.Errorf("invalid window %q: %w", timeWindowStr, err)
@@ -80,6 +102,7 @@ paper prediction only when the latest candle emits BUY or SELL.`,
 				Days:         days,
 				MinCandles:   minCandles,
 				RegimeWindow: regimeWindow,
+				RegimeMode:   regimeMode,
 				TimeWindow:   timeWindow,
 				DryRun:       dryRun,
 			})
@@ -97,6 +120,7 @@ paper prediction only when the latest candle emits BUY or SELL.`,
 	cmd.Flags().Int("days", 120, "Historical lookback days for signal evaluation")
 	cmd.Flags().Int("min-candles", 80, "Minimum candles required")
 	cmd.Flags().Int("regime-window", 50, "Candles used to classify current regime")
+	cmd.Flags().String("regime-mode", regimeModeStrict, "Regime guardrail mode: strict, allow-unknown, or explore")
 	cmd.Flags().String("window", "24h", "Paper prediction evaluation window")
 	cmd.Flags().Bool("dry-run", false, "Evaluate without saving paper predictions")
 	cmd.Flags().Int("limit", 20, "Maximum candidates to evaluate")
@@ -107,6 +131,7 @@ type candidateRunOptions struct {
 	Days         int
 	MinCandles   int
 	RegimeWindow int
+	RegimeMode   string
 	TimeWindow   time.Duration
 	DryRun       bool
 }
@@ -124,6 +149,11 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 	if opts.TimeWindow <= 0 {
 		opts.TimeWindow = 24 * time.Hour
 	}
+	regimeMode, err := parseCandidateRegimeMode(opts.RegimeMode)
+	if err != nil {
+		regimeMode = regimeModeStrict
+	}
+	opts.RegimeMode = regimeMode
 
 	results := make([]candidateRunResult, 0, len(candidates))
 	engine := trading.NewBacktestEngine(nil)
@@ -143,7 +173,7 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 			continue
 		}
 		if app.Store != nil {
-			active, err := hasActivePaperCandidatePrediction(ctx, app.Store, candidate.ID)
+			active, err := hasActivePaperCandidatePrediction(ctx, app.Store, candidate.ID, opts.RegimeMode == regimeModeExplore)
 			if err != nil {
 				result.Status = "ERROR"
 				result.Reason = err.Error()
@@ -182,15 +212,13 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 			start = 0
 		}
 		result.Regime = classifyBacktestRegime(candles[start:])
-		if isRegimeListed(candidate.BlockedRegimes, result.Regime) {
+		regimeDecision := evaluateCandidateRegime(candidate, result.Regime, opts.RegimeMode)
+		result.RegimeMode = regimeDecision.Mode
+		result.RegimeGate = regimeDecision.Gate
+		result.Exploratory = regimeDecision.Exploratory
+		if !regimeDecision.Allowed {
 			result.Status = "BLOCK"
-			result.Reason = "blocked_regime"
-			results = append(results, result)
-			continue
-		}
-		if len(candidate.AllowedRegimes) > 0 && !isRegimeListed(candidate.AllowedRegimes, result.Regime) {
-			result.Status = "BLOCK"
-			result.Reason = "regime_not_allowed"
+			result.Reason = regimeDecision.Reason
 			results = append(results, result)
 			continue
 		}
@@ -227,7 +255,7 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 			continue
 		}
 
-		prediction := paperPredictionFromCandidate(candidate, candles[len(candles)-1], signal, confidence, result.Regime, opts.TimeWindow)
+		prediction := paperPredictionFromCandidate(candidate, candles[len(candles)-1], signal, confidence, result.Regime, opts.TimeWindow, regimeDecision)
 		if err := app.Store.SavePaperPrediction(ctx, prediction); err != nil {
 			result.Status = "ERROR"
 			result.Reason = err.Error()
@@ -241,9 +269,78 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 	return results
 }
 
+func parseCandidateRegimeMode(value string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	if mode == "" {
+		return regimeModeStrict, nil
+	}
+	switch mode {
+	case regimeModeStrict, regimeModeAllowUnknown, regimeModeExplore:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid regime mode %q: expected strict, allow-unknown, or explore", value)
+	}
+}
+
+func evaluateCandidateRegime(candidate models.PaperCandidate, regime string, mode string) candidateRegimeDecision {
+	normalizedMode, err := parseCandidateRegimeMode(mode)
+	if err != nil {
+		normalizedMode = regimeModeStrict
+	}
+	blocked := isRegimeListed(candidate.BlockedRegimes, regime)
+	hasAllowed := len(candidate.AllowedRegimes) > 0
+	listedAllowed := isRegimeListed(candidate.AllowedRegimes, regime)
+	allowedByRules := !blocked && (!hasAllowed || listedAllowed)
+
+	decision := candidateRegimeDecision{
+		Mode:        normalizedMode,
+		Gate:        "ALLOW",
+		Reason:      "regime_allowed",
+		Allowed:     true,
+		Exploratory: false,
+	}
+	if normalizedMode == regimeModeExplore {
+		decision.Gate = "EXPLORE"
+		decision.Reason = "explore_allowed_regime"
+		decision.Exploratory = true
+		if !allowedByRules {
+			if blocked {
+				decision.Reason = "explore_blocked_regime"
+			} else {
+				decision.Reason = "explore_unlisted_regime"
+			}
+		}
+		return decision
+	}
+	if allowedByRules {
+		return decision
+	}
+
+	reason := "regime_not_allowed"
+	if blocked {
+		reason = "blocked_regime"
+	}
+	switch normalizedMode {
+	case regimeModeStrict:
+		decision.Gate = "BLOCK"
+		decision.Reason = reason
+		decision.Allowed = false
+	case regimeModeAllowUnknown:
+		if blocked {
+			decision.Gate = "BLOCK"
+			decision.Reason = reason
+			decision.Allowed = false
+		} else {
+			decision.Gate = "ALLOW_UNKNOWN"
+			decision.Reason = "regime_unknown_allowed"
+		}
+	}
+	return decision
+}
+
 func hasActivePaperCandidatePrediction(ctx context.Context, dataStore interface {
 	GetPaperPredictions(context.Context, store.PaperPredictionFilter) ([]models.PaperPrediction, error)
-}, candidateID string) (bool, error) {
+}, candidateID string, includeExploratory bool) (bool, error) {
 	if dataStore == nil {
 		return false, nil
 	}
@@ -251,15 +348,20 @@ func hasActivePaperCandidatePrediction(ctx context.Context, dataStore interface 
 	predictions, err := dataStore.GetPaperPredictions(ctx, store.PaperPredictionFilter{
 		SetupName: fmt.Sprintf("candidate:%s", candidateID),
 		Evaluated: &evaluated,
-		Limit:     1,
+		Limit:     100,
 	})
 	if err != nil {
 		return false, err
 	}
-	return len(predictions) > 0, nil
+	for _, prediction := range predictions {
+		if includeExploratory || !isExploratoryPaperPrediction(prediction) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
-func paperPredictionFromCandidate(candidate models.PaperCandidate, candle models.Candle, signal string, confidence float64, regime string, window time.Duration) *models.PaperPrediction {
+func paperPredictionFromCandidate(candidate models.PaperCandidate, candle models.Candle, signal string, confidence float64, regime string, window time.Duration, regimeDecision candidateRegimeDecision) *models.PaperPrediction {
 	entry := candle.Close
 	action := strings.ToUpper(signal)
 	target := entry
@@ -280,6 +382,8 @@ func paperPredictionFromCandidate(candidate models.PaperCandidate, candle models
 		}
 	}
 	now := time.Now()
+	regimeAllowed := regimeDecision.Allowed && !regimeDecision.Exploratory
+	regimeModeGatePassed := regimeDecision.Mode == regimeModeStrict
 	return &models.PaperPrediction{
 		ID:          fmt.Sprintf("CAND_%s_%d", candidate.ID, now.UnixNano()),
 		Symbol:      candidate.Symbol,
@@ -300,7 +404,10 @@ func paperPredictionFromCandidate(candidate models.PaperCandidate, candle models
 		Timeframe: candidate.Timeframe,
 		Gates: []models.PaperPredictionGate{
 			{Name: "candidate_promoted", Passed: true, Reason: candidate.Verdict},
-			{Name: "regime_allowed", Passed: true, Reason: regime},
+			{Name: "regime_allowed", Passed: regimeAllowed, Reason: regime},
+			{Name: "regime_mode", Passed: regimeModeGatePassed, Reason: regimeDecision.Mode},
+			{Name: "regime_gate", Passed: regimeDecision.Allowed, Reason: regimeDecision.Gate + ":" + regimeDecision.Reason},
+			{Name: "exploratory_regime", Passed: !regimeDecision.Exploratory, Reason: regimeDecision.Reason},
 			{Name: "deterministic_signal", Passed: true, Reason: action},
 		},
 	}
@@ -385,7 +492,7 @@ func displayCandidateRunResults(output *Output, results []candidateRunResult, dr
 		output.Info("No candidates matched")
 		return
 	}
-	table := NewTable(output, "Status", "Symbol", "Strategy", "Variant", "TF", "Regime", "Signal", "Conf", "Reason", "Prediction")
+	table := NewTable(output, "Status", "Symbol", "Strategy", "Variant", "TF", "Mode", "Regime", "Gate", "Signal", "Conf", "Reason", "Prediction")
 	for _, result := range results {
 		table.AddRow(
 			result.Status,
@@ -393,7 +500,9 @@ func displayCandidateRunResults(output *Output, results []candidateRunResult, dr
 			result.Strategy,
 			result.Variant,
 			result.Timeframe,
+			result.RegimeMode,
 			result.Regime,
+			result.RegimeGate,
 			result.Signal,
 			FormatConfidence(result.Confidence),
 			result.Reason,

@@ -95,12 +95,17 @@ The daemon will:
 			soakIntervalFlag, _ := cmd.Flags().GetString("soak-interval")
 			soakSymbol, _ := cmd.Flags().GetString("soak-symbol")
 			soakStrategy, _ := cmd.Flags().GetString("soak-strategy")
+			soakRegimeModeFlag, _ := cmd.Flags().GetString("soak-regime-mode")
 			soakWindowFlag, _ := cmd.Flags().GetString("soak-window")
 			soakDryRun, _ := cmd.Flags().GetBool("soak-dry-run")
 			soakApplyReview, _ := cmd.Flags().GetBool("soak-apply-review")
 			soakLimit, _ := cmd.Flags().GetInt("soak-limit")
 			if paperSoakOnly {
 				paperSoak = true
+			}
+			soakRegimeMode, err := parseCandidateRegimeMode(soakRegimeModeFlag)
+			if err != nil {
+				return err
 			}
 			soakInterval, err := time.ParseDuration(soakIntervalFlag)
 			if err != nil {
@@ -122,6 +127,7 @@ The daemon will:
 				Interval:    soakInterval,
 				Symbol:      strings.ToUpper(strings.TrimSpace(soakSymbol)),
 				Strategy:    soakStrategy,
+				RegimeMode:  soakRegimeMode,
 				Window:      soakWindow,
 				DryRun:      soakDryRun,
 				ApplyReview: soakApplyReview,
@@ -192,6 +198,7 @@ The daemon will:
 				if soakOpts.Symbol != "" {
 					output.Printf("  Soak Symbol:      %s\n", soakOpts.Symbol)
 				}
+				output.Printf("  Soak Regime Mode: %s\n", soakOpts.RegimeMode)
 			}
 			output.Println()
 
@@ -363,6 +370,7 @@ The daemon will:
 	cmd.Flags().String("soak-interval", "1h", "Scheduled paper soak interval")
 	cmd.Flags().String("soak-symbol", "", "Filter scheduled paper soak to one symbol")
 	cmd.Flags().String("soak-strategy", "", "Filter scheduled paper soak to one strategy")
+	cmd.Flags().String("soak-regime-mode", regimeModeStrict, "Scheduled paper soak regime guardrail mode: strict, allow-unknown, or explore")
 	cmd.Flags().String("soak-window", "24h", "Paper prediction evaluation window for scheduled soak runs")
 	cmd.Flags().Bool("soak-dry-run", false, "Run scheduled paper soak without saving predictions, outcomes, or review changes")
 	cmd.Flags().Bool("soak-apply-review", false, "Apply candidate PAUSED status during scheduled review")
@@ -377,6 +385,7 @@ type daemonPaperSoakOptions struct {
 	Interval    time.Duration
 	Symbol      string
 	Strategy    string
+	RegimeMode  string
 	Window      time.Duration
 	DryRun      bool
 	ApplyReview bool
@@ -423,6 +432,7 @@ func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, s
 		CandidateDays:     120,
 		MinCandles:        80,
 		RegimeWindow:      50,
+		RegimeMode:        opts.RegimeMode,
 		TimeWindow:        opts.Window,
 		EvaluateDays:      30,
 		ReviewDays:        90,

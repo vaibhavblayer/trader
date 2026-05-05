@@ -281,15 +281,20 @@ func buildAutonomyReadinessReport(ctx context.Context, app *App, opts autonomyRe
 		StartDate: report.StartDate,
 		EndDate:   report.EndDate,
 	}
-	paperReport, err := app.Store.GetPaperPredictionReport(ctx, filter)
+	predictions, err := app.Store.GetPaperPredictions(ctx, filter)
 	if err != nil {
 		addReadinessCheck(report, "paper_prediction_calibration", models.AutonomyReadinessFail, fmt.Sprintf("paper prediction report unavailable: %v", err), nil)
 	} else {
-		report.Summary.PaperPredictions = paperReport.TotalPredictions
-		report.Summary.PaperDecisive = paperReport.Decisive
-		report.Summary.PaperWinRate = paperReport.WinRate
-		report.Summary.PaperExpectancy = paperReport.Expectancy
-		addSamplePerformanceCheck(report, opts, "paper_prediction_calibration", paperReport.Decisive, paperReport.WinRate, paperReport.Expectancy)
+		trustedPredictions, exploratoryPredictions := splitTrustedPaperCandidatePredictions(predictions)
+		paperStats := calculatePaperCandidateOutcomeStats(trustedPredictions)
+		report.Summary.PaperPredictions = paperStats.total
+		report.Summary.PaperDecisive = paperStats.decisive
+		report.Summary.PaperWinRate = paperStats.winRate
+		report.Summary.PaperExpectancy = paperStats.expectancy
+		addSamplePerformanceCheckWithDetails(report, opts, "paper_prediction_calibration", paperStats.decisive, paperStats.winRate, paperStats.expectancy, map[string]interface{}{
+			"trusted_predictions":     paperStats.total,
+			"exploratory_predictions": len(exploratoryPredictions),
+		})
 	}
 
 	calibrationReport, err := app.Store.GetHistoricalCalibrationReport(ctx, filter)
@@ -387,6 +392,10 @@ func addSafetyProfileCheck(report *models.AutonomyReadinessReport, opts autonomy
 }
 
 func addSamplePerformanceCheck(report *models.AutonomyReadinessReport, opts autonomyReadinessOptions, name string, decisive int, winRate, expectancy float64) {
+	addSamplePerformanceCheckWithDetails(report, opts, name, decisive, winRate, expectancy, nil)
+}
+
+func addSamplePerformanceCheckWithDetails(report *models.AutonomyReadinessReport, opts autonomyReadinessOptions, name string, decisive int, winRate, expectancy float64, details map[string]interface{}) {
 	status := models.AutonomyReadinessPass
 	message := "sample performance meets thresholds"
 	if decisive < opts.MinDecisive {
@@ -399,7 +408,13 @@ func addSamplePerformanceCheck(report *models.AutonomyReadinessReport, opts auto
 		status = models.AutonomyReadinessFail
 		message = fmt.Sprintf("expectancy %.2f%% is below %.2f%%", expectancy, opts.MinExpectancy)
 	}
-	addReadinessCheck(report, name, status, message, map[string]interface{}{"decisive": decisive, "win_rate": winRate, "expectancy": expectancy})
+	if details == nil {
+		details = make(map[string]interface{})
+	}
+	details["decisive"] = decisive
+	details["win_rate"] = winRate
+	details["expectancy"] = expectancy
+	addReadinessCheck(report, name, status, message, details)
 }
 
 func missingEvidenceStatus(phase string) models.AutonomyReadinessStatus {

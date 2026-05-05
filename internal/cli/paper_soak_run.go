@@ -17,6 +17,7 @@ type paperSoakRunReport struct {
 	GeneratedAt        time.Time                       `json:"generated_at"`
 	Symbol             string                          `json:"symbol,omitempty"`
 	Strategy           string                          `json:"strategy,omitempty"`
+	RegimeMode         string                          `json:"regime_mode"`
 	DryRun             bool                            `json:"dry_run"`
 	ApplyReview        bool                            `json:"apply_review"`
 	CandidatesLoaded   int                             `json:"candidates_loaded"`
@@ -45,6 +46,7 @@ type paperSoakRunOptions struct {
 	CandidateDays     int
 	MinCandles        int
 	RegimeWindow      int
+	RegimeMode        string
 	TimeWindow        time.Duration
 	EvaluateDays      int
 	EvalTimeframe     string
@@ -80,6 +82,7 @@ evidence for pause/ready status, and optionally prints autonomy readiness.`,
 	cmd.Flags().Int("candidate-days", 120, "Historical lookback days for candidate signal evaluation")
 	cmd.Flags().Int("min-candles", 80, "Minimum candles required for candidate signal evaluation")
 	cmd.Flags().Int("regime-window", 50, "Candles used to classify current regime")
+	cmd.Flags().String("regime-mode", regimeModeStrict, "Regime guardrail mode: strict, allow-unknown, or explore")
 	cmd.Flags().String("window", "24h", "Paper prediction evaluation window for new candidate signals")
 	cmd.Flags().Int("evaluate-days", 30, "Only evaluate predictions created in the last N days")
 	cmd.Flags().String("eval-timeframe", "", "Historical candle timeframe for outcome evaluation")
@@ -115,6 +118,7 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 	candidateDays, _ := cmd.Flags().GetInt("candidate-days")
 	minCandles, _ := cmd.Flags().GetInt("min-candles")
 	regimeWindow, _ := cmd.Flags().GetInt("regime-window")
+	regimeModeFlag, _ := cmd.Flags().GetString("regime-mode")
 	windowFlag, _ := cmd.Flags().GetString("window")
 	evaluateDays, _ := cmd.Flags().GetInt("evaluate-days")
 	evalTimeframe, _ := cmd.Flags().GetString("eval-timeframe")
@@ -132,6 +136,10 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 	if err != nil {
 		return fmt.Errorf("invalid window %q: %w", windowFlag, err)
 	}
+	regimeMode, err := parseCandidateRegimeMode(regimeModeFlag)
+	if err != nil {
+		return err
+	}
 	report, err := executePaperSoakRun(ctx, app, paperSoakRunOptions{
 		Symbol:            symbol,
 		Strategy:          strategy,
@@ -141,6 +149,7 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 		CandidateDays:     candidateDays,
 		MinCandles:        minCandles,
 		RegimeWindow:      regimeWindow,
+		RegimeMode:        regimeMode,
 		TimeWindow:        timeWindow,
 		EvaluateDays:      evaluateDays,
 		EvalTimeframe:     evalTimeframe,
@@ -184,6 +193,11 @@ func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions
 	if opts.TimeWindow <= 0 {
 		opts.TimeWindow = 24 * time.Hour
 	}
+	regimeMode, err := parseCandidateRegimeMode(opts.RegimeMode)
+	if err != nil {
+		return paperSoakRunReport{}, err
+	}
+	opts.RegimeMode = regimeMode
 
 	symbol := strings.ToUpper(strings.TrimSpace(opts.Symbol))
 	normalizedStrategy := trading.NormalizeStrategyName(opts.Strategy)
@@ -191,6 +205,7 @@ func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions
 		GeneratedAt: time.Now(),
 		Symbol:      symbol,
 		Strategy:    normalizedStrategy,
+		RegimeMode:  opts.RegimeMode,
 		DryRun:      opts.DryRun,
 		ApplyReview: opts.ApplyReview && !opts.DryRun,
 	}
@@ -233,6 +248,7 @@ func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions
 		Days:         opts.CandidateDays,
 		MinCandles:   opts.MinCandles,
 		RegimeWindow: opts.RegimeWindow,
+		RegimeMode:   opts.RegimeMode,
 		TimeWindow:   opts.TimeWindow,
 		DryRun:       opts.DryRun,
 	})
@@ -318,6 +334,7 @@ func displayPaperSoakRunReport(output *Output, report paperSoakRunReport) {
 	if report.Strategy != "" {
 		output.Printf("  Strategy:    %s\n", report.Strategy)
 	}
+	output.Printf("  Regime Mode: %s\n", report.RegimeMode)
 	output.Printf("  Candidates:  %d loaded | %d checked\n", report.CandidatesLoaded, report.CandidatesChecked)
 	output.Printf("  Predictions: %d created | %d open before/blocked by active prediction\n", report.PredictionsCreated, report.OpenPredictions)
 	output.Printf("  Outcomes:    %d evaluated\n", report.OutcomesEvaluated)
