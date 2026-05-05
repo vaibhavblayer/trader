@@ -180,7 +180,9 @@ func newBacktestCmd(app *App) *cobra.Command {
 		Example: `  trader backtest --strategy ema_crossover --symbol RELIANCE --days 365
   trader backtest --strategy supertrend --symbol INFY --days 180 --sl 2.5 --tp 5
   trader backtest --strategy macd --symbol TCS --trailing 2.0 --short
-  trader backtest --strategy multi_indicator --symbol HDFCBANK --capital 500000`,
+  trader backtest --strategy multi_indicator --symbol HDFCBANK --capital 500000
+  trader backtest --strategy supertrend --symbol RELIANCE --timeframe 15min --days 30
+  trader backtest grid --symbols RELIANCE,INFY,TCS --strategies supertrend,multi_indicator --periods 365,1095`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -194,6 +196,7 @@ func newBacktestCmd(app *App) *cobra.Command {
 			slippagePct, _ := cmd.Flags().GetFloat64("slippage")
 			commissionPct, _ := cmd.Flags().GetFloat64("commission")
 			exchange, _ := cmd.Flags().GetString("exchange")
+			timeframe, _ := cmd.Flags().GetString("timeframe")
 			stopLoss, _ := cmd.Flags().GetFloat64("sl")
 			takeProfit, _ := cmd.Flags().GetFloat64("tp")
 			trailingStop, _ := cmd.Flags().GetFloat64("trailing")
@@ -216,6 +219,7 @@ func newBacktestCmd(app *App) *cobra.Command {
 			output.Bold("Backtesting: %s", strategy)
 			output.Printf("  Symbol:     %s\n", symbol)
 			output.Printf("  Category:   %s\n", strategyDef.Category)
+			output.Printf("  Timeframe:  %s\n", timeframe)
 			output.Printf("  Period:     %d days\n", days)
 			output.Printf("  Capital:    %s\n", FormatIndianCurrency(capital))
 			output.Printf("  Slippage:   %.2f%%\n", slippagePct)
@@ -248,7 +252,7 @@ func newBacktestCmd(app *App) *cobra.Command {
 			candles, report, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 				Symbol:    symbol,
 				Exchange:  models.Exchange(exchange),
-				Timeframe: "1day",
+				Timeframe: timeframe,
 				From:      time.Now().AddDate(0, 0, -days),
 				To:        time.Now(),
 			}, 50, false)
@@ -269,6 +273,7 @@ func newBacktestCmd(app *App) *cobra.Command {
 			engine := trading.NewBacktestEngine(nil)
 			result, err := engine.RunOnCandles(ctx, trading.BacktestConfig{
 				Symbol:               symbol,
+				Timeframe:            timeframe,
 				InitialCapital:       capital,
 				Strategy:             strategy,
 				Slippage:             slippagePct / 100,
@@ -298,6 +303,7 @@ func newBacktestCmd(app *App) *cobra.Command {
 	cmd.Flags().String("symbol", "", "Symbol to backtest")
 	cmd.Flags().String("watchlist", "", "Watchlist to backtest")
 	cmd.Flags().Int("days", 365, "Number of days to backtest")
+	cmd.Flags().String("timeframe", "1day", "Candle timeframe (1min, 5min, 15min, 30min, 1hour, 1day)")
 	cmd.Flags().Float64("capital", 1000000, "Starting capital")
 	cmd.Flags().Float64("slippage", 0.1, "Slippage percentage")
 	cmd.Flags().Float64("commission", 0.03, "Commission percentage")
@@ -309,6 +315,7 @@ func newBacktestCmd(app *App) *cobra.Command {
 	cmd.Flags().Float64("trailing", 0, "Trailing stop percentage (0 to disable)")
 	cmd.Flags().Bool("short", false, "Allow short selling")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
+	cmd.AddCommand(newBacktestGridCmd(app))
 
 	return cmd
 }
