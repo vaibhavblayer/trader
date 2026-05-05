@@ -143,6 +143,18 @@ func newWatchlistCmd(app *App) *cobra.Command {
 			if len(args) > 1 {
 				listName = args[1]
 			}
+			if err := app.validateSymbol(symbol); err != nil {
+				output.Error("Invalid symbol: %v", err)
+				return err
+			}
+			if err := app.validateWatchlistName(listName); err != nil {
+				output.Error("Invalid watchlist name: %v", err)
+				return err
+			}
+			if err := app.checkModifyWatchlist(ctx); err != nil {
+				output.Error("%v", err)
+				return err
+			}
 
 			if app.Store != nil {
 				if err := app.Store.AddToWatchlist(ctx, symbol, listName); err != nil {
@@ -169,6 +181,18 @@ func newWatchlistCmd(app *App) *cobra.Command {
 			listName := "default"
 			if len(args) > 1 {
 				listName = args[1]
+			}
+			if err := app.validateSymbol(symbol); err != nil {
+				output.Error("Invalid symbol: %v", err)
+				return err
+			}
+			if err := app.validateWatchlistName(listName); err != nil {
+				output.Error("Invalid watchlist name: %v", err)
+				return err
+			}
+			if err := app.checkModifyWatchlist(ctx); err != nil {
+				output.Error("%v", err)
+				return err
 			}
 
 			if app.Store != nil {
@@ -208,8 +232,8 @@ func newWatchlistCmd(app *App) *cobra.Command {
 						return err
 					}
 				} else {
-					// Sample data
-					symbols = []string{"RELIANCE", "INFY", "TCS", "HDFC", "ICICI"}
+					output.Warning("Store not initialized")
+					symbols = []string{}
 				}
 
 				if output.IsJSON() {
@@ -237,12 +261,8 @@ func newWatchlistCmd(app *App) *cobra.Command {
 						return err
 					}
 				} else {
-					// Sample data
-					watchlists = map[string][]string{
-						"default":  {"RELIANCE", "INFY", "TCS", "HDFC", "ICICI"},
-						"momentum": {"TATAMOTORS", "ADANIENT", "BAJFINANCE"},
-						"breakout": {"SBIN", "AXISBANK", "KOTAKBANK"},
-					}
+					output.Warning("Store not initialized")
+					watchlists = map[string][]string{}
 				}
 
 				if output.IsJSON() {
@@ -272,9 +292,13 @@ func newWatchlistCmd(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			name := args[0]
+			if err := app.validateWatchlistName(name); err != nil {
+				output.Error("Invalid watchlist name: %v", err)
+				return err
+			}
 
-			output.Success("✓ Created watchlist '%s'", name)
-			output.Dim("Use 'trader watchlist add <symbol> %s' to add symbols", name)
+			output.Info("Watchlists are created when the first symbol is added.")
+			output.Dim("Use 'trader watchlist add <symbol> %s' to create and populate this watchlist.", name)
 			return nil
 		},
 	})
@@ -285,11 +309,30 @@ func newWatchlistCmd(app *App) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			name := args[0]
 
 			if name == "default" {
 				output.Error("Cannot delete default watchlist")
 				return fmt.Errorf("cannot delete default watchlist")
+			}
+			if err := app.validateWatchlistName(name); err != nil {
+				output.Error("Invalid watchlist name: %v", err)
+				return err
+			}
+			if err := app.checkModifyWatchlist(ctx); err != nil {
+				output.Error("%v", err)
+				return err
+			}
+			if app.Store == nil {
+				output.Warning("Store not initialized")
+				return nil
+			}
+			if err := app.Store.DeleteWatchlist(ctx, name); err != nil {
+				output.Error("Failed to delete watchlist: %v", err)
+				return err
 			}
 
 			output.Success("✓ Deleted watchlist '%s'", name)

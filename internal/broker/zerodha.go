@@ -46,13 +46,13 @@ type ZerodhaConfig struct {
 // It automatically loads any saved session from disk.
 func NewZerodhaBroker(cfg ZerodhaConfig) *ZerodhaBroker {
 	client := kiteconnect.New(cfg.APIKey)
-	
+
 	tokenPath := cfg.TokenPath
 	if tokenPath == "" {
 		homeDir, _ := os.UserHomeDir()
 		tokenPath = filepath.Join(homeDir, ".config", "zerodha-trader", "session.json")
 	}
-	
+
 	zb := &ZerodhaBroker{
 		client:      client,
 		apiKey:      cfg.APIKey,
@@ -61,10 +61,10 @@ func NewZerodhaBroker(cfg ZerodhaConfig) *ZerodhaBroker {
 		tokenPath:   tokenPath,
 		instruments: make(map[string]models.Instrument),
 	}
-	
+
 	// Automatically load saved session if available
 	_ = zb.loadSession()
-	
+
 	return zb
 }
 
@@ -74,7 +74,6 @@ type sessionData struct {
 	UserID      string    `json:"user_id"`
 	ExpiresAt   time.Time `json:"expires_at"`
 }
-
 
 // Login authenticates with Zerodha using OAuth flow.
 // It first tries to load a persisted session, then falls back to OAuth.
@@ -86,7 +85,7 @@ func (z *ZerodhaBroker) Login(ctx context.Context) error {
 			return nil
 		}
 	}
-	
+
 	// Need fresh authentication - return login URL for user
 	loginURL := z.client.GetLoginURL()
 	return fmt.Errorf("authentication required: please visit %s and complete login, then call CompleteLogin with the request token", loginURL)
@@ -98,19 +97,19 @@ func (z *ZerodhaBroker) CompleteLogin(ctx context.Context, requestToken string) 
 	if err != nil {
 		return fmt.Errorf("failed to generate session: %w", err)
 	}
-	
+
 	z.mu.Lock()
 	z.accessToken = session.AccessToken
 	z.authenticated = true
 	z.client.SetAccessToken(session.AccessToken)
 	z.mu.Unlock()
-	
+
 	// Persist session
 	if err := z.saveSession(session.AccessToken); err != nil {
 		// Log but don't fail - session is valid
 		fmt.Printf("warning: failed to persist session: %v\n", err)
 	}
-	
+
 	return nil
 }
 
@@ -165,19 +164,19 @@ func (z *ZerodhaBroker) performAutoLogin(ctx context.Context, password, totpSecr
 		"user_id":  {z.userID},
 		"password": {password},
 	}
-	
+
 	req, _ := http.NewRequest("POST", "https://kite.zerodha.com/api/login", strings.NewReader(loginData.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("X-Kite-Version", "3")
-	
+
 	resp, err = client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit credentials: %w", err)
 	}
-	
+
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	
+
 	var loginResp struct {
 		Status string `json:"status"`
 		Data   struct {
@@ -202,19 +201,19 @@ func (z *ZerodhaBroker) performAutoLogin(ctx context.Context, password, totpSecr
 		"twofa_value": {totpCode},
 		"twofa_type":  {"totp"},
 	}
-	
+
 	req, _ = http.NewRequest("POST", "https://kite.zerodha.com/api/twofa", strings.NewReader(totpData.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("X-Kite-Version", "3")
-	
+
 	resp, err = client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit TOTP: %w", err)
 	}
-	
+
 	body, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
-	
+
 	var totpResp struct {
 		Status    string `json:"status"`
 		Message   string `json:"message"`
@@ -223,7 +222,7 @@ func (z *ZerodhaBroker) performAutoLogin(ctx context.Context, password, totpSecr
 	if err := json.Unmarshal(body, &totpResp); err != nil {
 		return "", fmt.Errorf("failed to parse TOTP response: %w (body: %s)", err, string(body))
 	}
-	
+
 	if totpResp.Status != "success" {
 		return "", fmt.Errorf("TOTP verification failed: %s", totpResp.Message)
 	}
@@ -233,11 +232,11 @@ func (z *ZerodhaBroker) performAutoLogin(ctx context.Context, password, totpSecr
 	if err != nil {
 		return "", fmt.Errorf("failed to get redirect: %w", err)
 	}
-	
+
 	// Check for redirect
 	location := resp.Header.Get("Location")
 	resp.Body.Close()
-	
+
 	if location == "" {
 		return "", fmt.Errorf("no redirect received after TOTP (status: %d)", resp.StatusCode)
 	}
@@ -252,7 +251,7 @@ func (z *ZerodhaBroker) performAutoLogin(ctx context.Context, password, totpSecr
 		}
 		location = resp.Header.Get("Location")
 		resp.Body.Close()
-		
+
 		if location == "" {
 			return "", fmt.Errorf("no redirect from finish URL")
 		}
@@ -282,7 +281,7 @@ func min(a, b int) int {
 func generateTOTP(secret string) (string, error) {
 	// Remove spaces and convert to uppercase
 	secret = strings.ReplaceAll(strings.ToUpper(secret), " ", "")
-	
+
 	code, err := totp.GenerateCode(secret, time.Now())
 	if err != nil {
 		return "", err
@@ -294,22 +293,22 @@ func generateTOTP(secret string) (string, error) {
 func (z *ZerodhaBroker) Logout(ctx context.Context) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	
+
 	if z.authenticated {
 		if _, err := z.client.InvalidateAccessToken(); err != nil {
 			// Log but continue with local cleanup
 			fmt.Printf("warning: failed to invalidate token: %v\n", err)
 		}
 	}
-	
+
 	z.accessToken = ""
 	z.authenticated = false
-	
+
 	// Remove persisted session
 	if err := os.Remove(z.tokenPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove session file: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -324,20 +323,20 @@ func (z *ZerodhaBroker) IsAuthenticated() bool {
 func (z *ZerodhaBroker) RefreshSession(ctx context.Context) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	
+
 	session, err := z.client.RenewAccessToken(z.accessToken, z.apiSecret)
 	if err != nil {
 		z.authenticated = false
 		return fmt.Errorf("failed to refresh session: %w", err)
 	}
-	
+
 	z.accessToken = session.AccessToken
 	z.client.SetAccessToken(session.AccessToken)
-	
+
 	if err := z.saveSession(session.AccessToken); err != nil {
 		fmt.Printf("warning: failed to persist refreshed session: %v\n", err)
 	}
-	
+
 	return nil
 }
 
@@ -346,23 +345,23 @@ func (z *ZerodhaBroker) loadSession() error {
 	if err != nil {
 		return err
 	}
-	
+
 	var session sessionData
 	if err := json.Unmarshal(data, &session); err != nil {
 		return err
 	}
-	
+
 	// Check if session is expired (Zerodha tokens expire at 6 AM next day)
 	if time.Now().After(session.ExpiresAt) {
 		return fmt.Errorf("session expired")
 	}
-	
+
 	z.mu.Lock()
 	z.accessToken = session.AccessToken
 	z.authenticated = true
 	z.client.SetAccessToken(session.AccessToken)
 	z.mu.Unlock()
-	
+
 	return nil
 }
 
@@ -370,11 +369,11 @@ func (z *ZerodhaBroker) loadSession() error {
 func (z *ZerodhaBroker) CreateTicker() (*ZerodhaTicker, error) {
 	z.mu.RLock()
 	defer z.mu.RUnlock()
-	
+
 	if !z.authenticated || z.accessToken == "" {
 		return nil, fmt.Errorf("not authenticated - please login first")
 	}
-	
+
 	return NewZerodhaTicker(ZerodhaTickerConfig{
 		APIKey:      z.apiKey,
 		AccessToken: z.accessToken,
@@ -394,44 +393,43 @@ func (z *ZerodhaBroker) saveSession(accessToken string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	
+
 	// Zerodha tokens expire at 6 AM IST next day
 	loc, _ := time.LoadLocation("Asia/Kolkata")
 	now := time.Now().In(loc)
 	expiresAt := time.Date(now.Year(), now.Month(), now.Day()+1, 6, 0, 0, 0, loc)
-	
+
 	session := sessionData{
 		AccessToken: accessToken,
 		UserID:      z.userID,
 		ExpiresAt:   expiresAt,
 	}
-	
+
 	data, err := json.Marshal(session)
 	if err != nil {
 		return err
 	}
-	
+
 	// Write with restricted permissions
 	return os.WriteFile(z.tokenPath, data, 0600)
 }
-
 
 // GetQuote fetches real-time quote for a symbol.
 func (z *ZerodhaBroker) GetQuote(ctx context.Context, symbol string) (*models.Quote, error) {
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	quotes, err := z.client.GetQuote(symbol)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get quote: %w", err)
 	}
-	
+
 	q, ok := quotes[symbol]
 	if !ok {
 		return nil, fmt.Errorf("quote not found for symbol: %s", symbol)
 	}
-	
+
 	return &models.Quote{
 		Symbol:        symbol,
 		LTP:           q.LastPrice,
@@ -451,21 +449,21 @@ func (z *ZerodhaBroker) GetHistorical(ctx context.Context, req HistoricalRequest
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	// Get instrument token
 	token, err := z.getInstrumentToken(req.Symbol, req.Exchange)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Map timeframe to Kite interval
 	interval := mapTimeframeToInterval(req.Timeframe)
-	
+
 	data, err := z.client.GetHistoricalData(int(token), interval, req.From, req.To, false, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get historical data: %w", err)
 	}
-	
+
 	candles := make([]models.Candle, len(data))
 	for i, d := range data {
 		candles[i] = models.Candle{
@@ -477,7 +475,7 @@ func (z *ZerodhaBroker) GetHistorical(ctx context.Context, req HistoricalRequest
 			Volume:    int64(d.Volume),
 		}
 	}
-	
+
 	return candles, nil
 }
 
@@ -486,13 +484,13 @@ func (z *ZerodhaBroker) GetInstruments(ctx context.Context, exchange models.Exch
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	// Use exchange-specific endpoint for faster response
 	instruments, err := z.client.GetInstrumentsByExchange(string(exchange))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get instruments: %w", err)
 	}
-	
+
 	result := make([]models.Instrument, len(instruments))
 	for i, inst := range instruments {
 		result[i] = models.Instrument{
@@ -507,41 +505,41 @@ func (z *ZerodhaBroker) GetInstruments(ctx context.Context, exchange models.Exch
 			Strike:    inst.StrikePrice,
 			InstrType: inst.InstrumentType,
 		}
-		
+
 		// Cache instrument
 		key := fmt.Sprintf("%s:%s", inst.Exchange, inst.Tradingsymbol)
 		z.mu.Lock()
 		z.instruments[key] = result[i]
 		z.mu.Unlock()
 	}
-	
+
 	return result, nil
 }
 
 func (z *ZerodhaBroker) getInstrumentToken(symbol string, exchange models.Exchange) (uint32, error) {
 	key := fmt.Sprintf("%s:%s", exchange, symbol)
-	
+
 	z.mu.RLock()
 	inst, ok := z.instruments[key]
 	z.mu.RUnlock()
-	
+
 	if ok {
 		return inst.Token, nil
 	}
-	
+
 	// Fetch instruments if not cached
 	if _, err := z.GetInstruments(context.Background(), exchange); err != nil {
 		return 0, err
 	}
-	
+
 	z.mu.RLock()
 	inst, ok = z.instruments[key]
 	z.mu.RUnlock()
-	
+
 	if !ok {
 		return 0, fmt.Errorf("instrument not found: %s", symbol)
 	}
-	
+
 	return inst.Token, nil
 }
 
@@ -569,13 +567,12 @@ func mapTimeframeToInterval(tf string) string {
 	}
 }
 
-
 // PlaceOrder places a new order.
 func (z *ZerodhaBroker) PlaceOrder(ctx context.Context, order *models.Order) (*OrderResult, error) {
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	params := kiteconnect.OrderParams{
 		Exchange:        string(order.Exchange),
 		Tradingsymbol:   order.Symbol,
@@ -588,20 +585,21 @@ func (z *ZerodhaBroker) PlaceOrder(ctx context.Context, order *models.Order) (*O
 		Validity:        order.Validity,
 		Tag:             order.Tag,
 	}
-	
+
 	if params.Validity == "" {
 		params.Validity = "DAY"
 	}
-	
+
 	resp, err := z.client.PlaceOrder(kiteconnect.VarietyRegular, params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to place order: %w", err)
 	}
-	
+
 	return &OrderResult{
 		OrderID: resp.OrderID,
 		Status:  "PLACED",
 		Message: "Order placed successfully",
+		Tag:     order.Tag,
 	}, nil
 }
 
@@ -610,7 +608,7 @@ func (z *ZerodhaBroker) ModifyOrder(ctx context.Context, orderID string, order *
 	if !z.IsAuthenticated() {
 		return fmt.Errorf("not authenticated")
 	}
-	
+
 	params := kiteconnect.OrderParams{
 		Exchange:        string(order.Exchange),
 		Tradingsymbol:   order.Symbol,
@@ -622,12 +620,12 @@ func (z *ZerodhaBroker) ModifyOrder(ctx context.Context, orderID string, order *
 		TriggerPrice:    order.TriggerPrice,
 		Validity:        order.Validity,
 	}
-	
+
 	_, err := z.client.ModifyOrder(kiteconnect.VarietyRegular, orderID, params)
 	if err != nil {
 		return fmt.Errorf("failed to modify order: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -636,12 +634,12 @@ func (z *ZerodhaBroker) CancelOrder(ctx context.Context, orderID string) error {
 	if !z.IsAuthenticated() {
 		return fmt.Errorf("not authenticated")
 	}
-	
+
 	_, err := z.client.CancelOrder(kiteconnect.VarietyRegular, orderID, nil)
 	if err != nil {
 		return fmt.Errorf("failed to cancel order: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -650,12 +648,12 @@ func (z *ZerodhaBroker) GetOrders(ctx context.Context) ([]models.Order, error) {
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	orders, err := z.client.GetOrders()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get orders: %w", err)
 	}
-	
+
 	result := make([]models.Order, len(orders))
 	for i, o := range orders {
 		result[i] = models.Order{
@@ -676,7 +674,7 @@ func (z *ZerodhaBroker) GetOrders(ctx context.Context) ([]models.Order, error) {
 			PlacedAt:     o.OrderTimestamp.Time,
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -688,14 +686,14 @@ func (z *ZerodhaBroker) GetOrderHistory(ctx context.Context, from, to time.Time)
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	// Zerodha API only provides current day orders
 	// For historical data, users need to use the Kite Console or export trades
 	orders, err := z.client.GetOrders()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get orders: %w", err)
 	}
-	
+
 	// Filter orders by date range
 	var result []models.Order
 	for _, o := range orders {
@@ -720,20 +718,19 @@ func (z *ZerodhaBroker) GetOrderHistory(ctx context.Context, from, to time.Time)
 			})
 		}
 	}
-	
+
 	return result, nil
 }
-
 
 // PlaceGTT places a Good Till Triggered order.
 func (z *ZerodhaBroker) PlaceGTT(ctx context.Context, gtt *models.GTTOrder) (*GTTResult, error) {
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	// Build trigger based on type
 	var trigger kiteconnect.Trigger
-	
+
 	if gtt.TriggerType == "two-leg" && len(gtt.Orders) >= 2 {
 		// OCO trigger with upper and lower legs
 		trigger = &kiteconnect.GTTOneCancelsOtherTrigger{
@@ -760,14 +757,14 @@ func (z *ZerodhaBroker) PlaceGTT(ctx context.Context, gtt *models.GTTOrder) (*GT
 	} else {
 		return nil, fmt.Errorf("GTT order must have at least one leg")
 	}
-	
+
 	transactionType := "BUY"
 	product := "CNC"
 	if len(gtt.Orders) > 0 {
 		transactionType = string(gtt.Orders[0].Side)
 		product = string(gtt.Orders[0].Product)
 	}
-	
+
 	params := kiteconnect.GTTParams{
 		Tradingsymbol:   gtt.Symbol,
 		Exchange:        string(gtt.Exchange),
@@ -776,12 +773,12 @@ func (z *ZerodhaBroker) PlaceGTT(ctx context.Context, gtt *models.GTTOrder) (*GT
 		Product:         product,
 		Trigger:         trigger,
 	}
-	
+
 	resp, err := z.client.PlaceGTT(params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to place GTT: %w", err)
 	}
-	
+
 	return &GTTResult{
 		TriggerID: fmt.Sprintf("%d", resp.TriggerID),
 		Status:    "ACTIVE",
@@ -794,13 +791,13 @@ func (z *ZerodhaBroker) ModifyGTT(ctx context.Context, gttID string, gtt *models
 	if !z.IsAuthenticated() {
 		return fmt.Errorf("not authenticated")
 	}
-	
+
 	var triggerID int
 	fmt.Sscanf(gttID, "%d", &triggerID)
-	
+
 	// Build trigger based on type
 	var trigger kiteconnect.Trigger
-	
+
 	if gtt.TriggerType == "two-leg" && len(gtt.Orders) >= 2 {
 		trigger = &kiteconnect.GTTOneCancelsOtherTrigger{
 			Upper: kiteconnect.TriggerParams{
@@ -825,14 +822,14 @@ func (z *ZerodhaBroker) ModifyGTT(ctx context.Context, gttID string, gtt *models
 	} else {
 		return fmt.Errorf("GTT order must have at least one leg")
 	}
-	
+
 	transactionType := "BUY"
 	product := "CNC"
 	if len(gtt.Orders) > 0 {
 		transactionType = string(gtt.Orders[0].Side)
 		product = string(gtt.Orders[0].Product)
 	}
-	
+
 	params := kiteconnect.GTTParams{
 		Tradingsymbol:   gtt.Symbol,
 		Exchange:        string(gtt.Exchange),
@@ -841,12 +838,12 @@ func (z *ZerodhaBroker) ModifyGTT(ctx context.Context, gttID string, gtt *models
 		Product:         product,
 		Trigger:         trigger,
 	}
-	
+
 	_, err := z.client.ModifyGTT(triggerID, params)
 	if err != nil {
 		return fmt.Errorf("failed to modify GTT: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -855,15 +852,15 @@ func (z *ZerodhaBroker) CancelGTT(ctx context.Context, gttID string) error {
 	if !z.IsAuthenticated() {
 		return fmt.Errorf("not authenticated")
 	}
-	
+
 	var triggerID int
 	fmt.Sscanf(gttID, "%d", &triggerID)
-	
+
 	_, err := z.client.DeleteGTT(triggerID)
 	if err != nil {
 		return fmt.Errorf("failed to cancel GTT: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -872,12 +869,12 @@ func (z *ZerodhaBroker) GetGTTs(ctx context.Context) ([]models.GTTOrder, error) 
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	gtts, err := z.client.GetGTTs()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GTTs: %w", err)
 	}
-	
+
 	result := make([]models.GTTOrder, len(gtts))
 	for i, g := range gtts {
 		orders := make([]models.GTTOrderLeg, len(g.Orders))
@@ -890,17 +887,17 @@ func (z *ZerodhaBroker) GetGTTs(ctx context.Context) ([]models.GTTOrder, error) 
 				Price:    o.Price,
 			}
 		}
-		
+
 		triggerType := "single"
 		if g.Type == kiteconnect.GTTTypeOCO {
 			triggerType = "two-leg"
 		}
-		
+
 		triggerPrice := 0.0
 		if len(g.Condition.TriggerValues) > 0 {
 			triggerPrice = g.Condition.TriggerValues[0]
 		}
-		
+
 		result[i] = models.GTTOrder{
 			ID:           fmt.Sprintf("%d", g.ID),
 			Symbol:       g.Condition.Tradingsymbol,
@@ -914,45 +911,44 @@ func (z *ZerodhaBroker) GetGTTs(ctx context.Context) ([]models.GTTOrder, error) 
 			UpdatedAt:    g.UpdatedAt.Time,
 		}
 	}
-	
+
 	return result, nil
 }
-
 
 // GetPositions fetches current positions.
 func (z *ZerodhaBroker) GetPositions(ctx context.Context) ([]models.Position, error) {
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	positions, err := z.client.GetPositions()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get positions: %w", err)
 	}
-	
+
 	// Combine day and net positions
 	allPositions := append(positions.Day, positions.Net...)
-	
+
 	result := make([]models.Position, 0, len(allPositions))
 	seen := make(map[string]bool)
-	
+
 	for _, p := range allPositions {
 		key := fmt.Sprintf("%s:%s:%s", p.Exchange, p.Tradingsymbol, p.Product)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		
+
 		if p.Quantity == 0 {
 			continue
 		}
-		
+
 		pnl := (p.LastPrice - p.AveragePrice) * float64(p.Quantity) * float64(p.Multiplier)
 		pnlPercent := 0.0
 		if p.AveragePrice > 0 {
 			pnlPercent = ((p.LastPrice - p.AveragePrice) / p.AveragePrice) * 100
 		}
-		
+
 		result = append(result, models.Position{
 			Symbol:       p.Tradingsymbol,
 			Exchange:     models.Exchange(p.Exchange),
@@ -966,7 +962,7 @@ func (z *ZerodhaBroker) GetPositions(ctx context.Context) ([]models.Position, er
 			Multiplier:   int(p.Multiplier),
 		})
 	}
-	
+
 	return result, nil
 }
 
@@ -975,12 +971,12 @@ func (z *ZerodhaBroker) GetHoldings(ctx context.Context) ([]models.Holding, erro
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	holdings, err := z.client.GetHoldings()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get holdings: %w", err)
 	}
-	
+
 	result := make([]models.Holding, len(holdings))
 	for i, h := range holdings {
 		investedValue := h.AveragePrice * float64(h.Quantity)
@@ -990,7 +986,7 @@ func (z *ZerodhaBroker) GetHoldings(ctx context.Context) ([]models.Holding, erro
 		if investedValue > 0 {
 			pnlPercent = (pnl / investedValue) * 100
 		}
-		
+
 		result[i] = models.Holding{
 			Symbol:        h.Tradingsymbol,
 			Quantity:      int(h.Quantity),
@@ -1002,7 +998,7 @@ func (z *ZerodhaBroker) GetHoldings(ctx context.Context) ([]models.Holding, erro
 			CurrentValue:  currentValue,
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -1011,14 +1007,14 @@ func (z *ZerodhaBroker) GetBalance(ctx context.Context) (*models.Balance, error)
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	margins, err := z.client.GetUserMargins()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get balance: %w", err)
 	}
-	
+
 	equity := margins.Equity
-	
+
 	return &models.Balance{
 		AvailableCash:   equity.Available.Cash,
 		UsedMargin:      equity.Used.Debits,
@@ -1032,12 +1028,12 @@ func (z *ZerodhaBroker) GetMargins(ctx context.Context) (*models.Margins, error)
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	margins, err := z.client.GetUserMargins()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get margins: %w", err)
 	}
-	
+
 	return &models.Margins{
 		Equity: models.SegmentMargin{
 			Available: margins.Equity.Available.Cash + margins.Equity.Available.Collateral,
@@ -1052,69 +1048,68 @@ func (z *ZerodhaBroker) GetMargins(ctx context.Context) (*models.Margins, error)
 	}, nil
 }
 
-
 // GetOptionChain fetches option chain for a symbol.
 func (z *ZerodhaBroker) GetOptionChain(ctx context.Context, symbol string, expiry time.Time) (*models.OptionChain, error) {
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	// Get spot price
 	quote, err := z.GetQuote(ctx, fmt.Sprintf("NSE:%s", symbol))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get spot price: %w", err)
 	}
-	
+
 	// Fetch NFO instruments for the symbol
 	instruments, err := z.GetInstruments(ctx, models.NFO)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get instruments: %w", err)
 	}
-	
+
 	// Filter options for the symbol and expiry
 	strikeMap := make(map[float64]*models.OptionStrike)
-	
+
 	for _, inst := range instruments {
 		if inst.Name != symbol {
 			continue
 		}
-		
+
 		// Check expiry (same day)
 		if !sameDay(inst.Expiry, expiry) {
 			continue
 		}
-		
+
 		strike, ok := strikeMap[inst.Strike]
 		if !ok {
 			strike = &models.OptionStrike{Strike: inst.Strike}
 			strikeMap[inst.Strike] = strike
 		}
-		
+
 		// Get quote for this option
 		optSymbol := fmt.Sprintf("NFO:%s", inst.Symbol)
 		optQuote, err := z.GetQuote(ctx, optSymbol)
 		if err != nil {
 			continue // Skip if quote fails
 		}
-		
+
 		optData := &models.OptionData{
 			LTP:    optQuote.LTP,
 			Volume: optQuote.Volume,
 		}
-		
+
 		if inst.InstrType == "CE" {
 			strike.Call = optData
 		} else if inst.InstrType == "PE" {
 			strike.Put = optData
 		}
 	}
-	
+
 	// Convert map to sorted slice
 	strikes := make([]models.OptionStrike, 0, len(strikeMap))
 	for _, s := range strikeMap {
 		strikes = append(strikes, *s)
 	}
-	
+
 	return &models.OptionChain{
 		Symbol:    symbol,
 		SpotPrice: quote.LTP,
@@ -1128,40 +1123,40 @@ func (z *ZerodhaBroker) GetFuturesChain(ctx context.Context, symbol string) (*mo
 	if !z.IsAuthenticated() {
 		return nil, fmt.Errorf("not authenticated")
 	}
-	
+
 	// Get spot price
 	quote, err := z.GetQuote(ctx, fmt.Sprintf("NSE:%s", symbol))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get spot price: %w", err)
 	}
-	
+
 	// Fetch NFO instruments for the symbol
 	instruments, err := z.GetInstruments(ctx, models.NFO)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get instruments: %w", err)
 	}
-	
+
 	// Filter futures for the symbol
 	var expiries []models.FuturesExpiry
-	
+
 	for _, inst := range instruments {
 		if inst.Name != symbol || inst.InstrType != "FUT" {
 			continue
 		}
-		
+
 		// Get quote for this future
 		futSymbol := fmt.Sprintf("NFO:%s", inst.Symbol)
 		futQuote, err := z.GetQuote(ctx, futSymbol)
 		if err != nil {
 			continue
 		}
-		
+
 		basis := futQuote.LTP - quote.LTP
 		basisPercent := 0.0
 		if quote.LTP > 0 {
 			basisPercent = (basis / quote.LTP) * 100
 		}
-		
+
 		expiries = append(expiries, models.FuturesExpiry{
 			Expiry:       inst.Expiry,
 			LTP:          futQuote.LTP,
@@ -1170,7 +1165,7 @@ func (z *ZerodhaBroker) GetFuturesChain(ctx context.Context, symbol string) (*mo
 			BasisPercent: basisPercent,
 		})
 	}
-	
+
 	return &models.FuturesChain{
 		Symbol:    symbol,
 		SpotPrice: quote.LTP,

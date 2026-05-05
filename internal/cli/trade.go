@@ -50,6 +50,14 @@ Can specify stop-loss and target prices for bracket orders.`,
 				output.Error("Invalid quantity: %s", args[1])
 				return fmt.Errorf("invalid quantity")
 			}
+			if err := app.validateSymbol(symbol); err != nil {
+				output.Error("Invalid symbol: %v", err)
+				return err
+			}
+			if err := app.validateQuantity(qty); err != nil {
+				output.Error("Invalid quantity: %v", err)
+				return err
+			}
 
 			price, _ := cmd.Flags().GetFloat64("price")
 			sl, _ := cmd.Flags().GetFloat64("sl")
@@ -57,10 +65,20 @@ Can specify stop-loss and target prices for bracket orders.`,
 			product, _ := cmd.Flags().GetString("product")
 			orderType, _ := cmd.Flags().GetString("type")
 			exchange, _ := cmd.Flags().GetString("exchange")
+			for field, value := range map[string]float64{"price": price, "sl": sl, "target": target} {
+				if err := app.validatePrice(value); err != nil {
+					output.Error("Invalid %s: %v", field, err)
+					return err
+				}
+			}
 
 			if app.Broker == nil {
 				output.Error("Broker not configured. Run 'trader login' first.")
 				return fmt.Errorf("broker not configured")
+			}
+			if err := app.checkPlaceOrder(ctx); err != nil {
+				output.Error("%v", err)
+				return err
 			}
 
 			// Determine order type
@@ -99,6 +117,20 @@ Can specify stop-loss and target prices for bracket orders.`,
 				output.Printf("  Target:   %s\n", FormatIndianCurrency(target))
 			}
 			output.Println()
+
+			riskDecision, err := app.checkOrderRisk(ctx, order, sl, target)
+			if err != nil {
+				output.Error("%v", err)
+				return err
+			}
+			if riskDecision != nil {
+				output.Printf("  Risk:     approved")
+				if riskDecision.RiskReward > 0 {
+					output.Printf(" (R:R %.2f)", riskDecision.RiskReward)
+				}
+				output.Println()
+				output.Println()
+			}
 
 			// Check if paper mode
 			if app.Config.IsPaperMode() {
@@ -160,15 +192,35 @@ Supports market, limit, and stop-loss orders.`,
 				output.Error("Invalid quantity: %s", args[1])
 				return fmt.Errorf("invalid quantity")
 			}
+			if err := app.validateSymbol(symbol); err != nil {
+				output.Error("Invalid symbol: %v", err)
+				return err
+			}
+			if err := app.validateQuantity(qty); err != nil {
+				output.Error("Invalid quantity: %v", err)
+				return err
+			}
 
 			price, _ := cmd.Flags().GetFloat64("price")
+			sl, _ := cmd.Flags().GetFloat64("sl")
+			target, _ := cmd.Flags().GetFloat64("target")
 			product, _ := cmd.Flags().GetString("product")
 			orderType, _ := cmd.Flags().GetString("type")
 			exchange, _ := cmd.Flags().GetString("exchange")
+			for field, value := range map[string]float64{"price": price, "sl": sl, "target": target} {
+				if err := app.validatePrice(value); err != nil {
+					output.Error("Invalid %s: %v", field, err)
+					return err
+				}
+			}
 
 			if app.Broker == nil {
 				output.Error("Broker not configured. Run 'trader login' first.")
 				return fmt.Errorf("broker not configured")
+			}
+			if err := app.checkPlaceOrder(ctx); err != nil {
+				output.Error("%v", err)
+				return err
 			}
 
 			// Determine order type
@@ -200,7 +252,27 @@ Supports market, limit, and stop-loss orders.`,
 			if price > 0 {
 				output.Printf("  Price:    %s\n", FormatIndianCurrency(price))
 			}
+			if sl > 0 {
+				output.Printf("  Stop Loss: %s\n", FormatIndianCurrency(sl))
+			}
+			if target > 0 {
+				output.Printf("  Target:   %s\n", FormatIndianCurrency(target))
+			}
 			output.Println()
+
+			riskDecision, err := app.checkOrderRisk(ctx, order, sl, target)
+			if err != nil {
+				output.Error("%v", err)
+				return err
+			}
+			if riskDecision != nil {
+				output.Printf("  Risk:     approved")
+				if riskDecision.RiskReward > 0 {
+					output.Printf(" (R:R %.2f)", riskDecision.RiskReward)
+				}
+				output.Println()
+				output.Println()
+			}
 
 			// Check if paper mode
 			if app.Config.IsPaperMode() {
@@ -227,6 +299,8 @@ Supports market, limit, and stop-loss orders.`,
 	}
 
 	cmd.Flags().Float64P("price", "p", 0, "Limit price (0 for market order)")
+	cmd.Flags().Float64("sl", 0, "Stop-loss price")
+	cmd.Flags().Float64("target", 0, "Target price")
 	cmd.Flags().String("product", "MIS", "Product type (MIS, CNC, NRML)")
 	cmd.Flags().String("type", "", "Order type (MARKET, LIMIT, SL, SL-M)")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE, NFO)")
@@ -397,6 +471,10 @@ func newExitCmd(app *App) *cobra.Command {
 
 			symbol := strings.ToUpper(args[0])
 			product, _ := cmd.Flags().GetString("product")
+			if err := app.validateSymbol(symbol); err != nil {
+				output.Error("Invalid symbol: %v", err)
+				return err
+			}
 
 			if app.Broker == nil {
 				output.Error("Broker not configured. Run 'trader login' first.")
@@ -421,6 +499,10 @@ func newExitCmd(app *App) *cobra.Command {
 			if position == nil {
 				output.Error("No open position found for %s", symbol)
 				return fmt.Errorf("position not found")
+			}
+			if err := app.checkExitPosition(ctx); err != nil {
+				output.Error("%v", err)
+				return err
 			}
 
 			// Determine exit side
@@ -512,6 +594,10 @@ func newExitAllCmd(app *App) *cobra.Command {
 			if !force {
 				output.Warning("Use --force to confirm exit")
 				return nil
+			}
+			if err := app.checkExitPosition(ctx); err != nil {
+				output.Error("%v", err)
+				return err
 			}
 
 			// Exit all positions

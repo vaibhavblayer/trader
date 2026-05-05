@@ -82,9 +82,14 @@ type HistoricalRequest struct {
 
 // OrderResult represents the result of an order placement.
 type OrderResult struct {
-	OrderID string
-	Status  string
-	Message string
+	OrderID      string
+	Status       string
+	Message      string
+	Tag          string
+	FilledQty    int
+	AveragePrice float64
+	Reconciled   bool
+	Duplicate    bool
 }
 
 // GTTResult represents the result of a GTT order placement.

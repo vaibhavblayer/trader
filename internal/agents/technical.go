@@ -10,6 +10,9 @@ import (
 	"github.com/sashabaranov/go-openai"
 
 	"zerodha-trader/internal/analysis"
+	"zerodha-trader/internal/analysis/quality"
+	techsetup "zerodha-trader/internal/analysis/setup"
+	"zerodha-trader/internal/models"
 )
 
 // TechnicalAgent analyzes technical indicators and patterns to provide trading recommendations.
@@ -41,6 +44,10 @@ func NewTechnicalAgent(llmClient LLMClient, weight float64) *TechnicalAgent {
 
 // Analyze performs technical analysis on the given request data.
 func (a *TechnicalAgent) Analyze(ctx context.Context, req AnalysisRequest) (*AnalysisResult, error) {
+	if result, blocked := a.blockOnBadMarketData(req); blocked {
+		return result, nil
+	}
+
 	// Build analysis context
 	analysisContext := a.buildAnalysisContext(req)
 
@@ -68,7 +75,11 @@ REASONING: <your analysis in one paragraph>`
 		return a.ruleBasedAnalysis(req)
 	}
 
-	return a.parseResponse(response, req)
+	result, err := a.parseResponse(response, req)
+	if err != nil {
+		return nil, err
+	}
+	return a.applyDeterministicSetup(result, req), nil
 }
 
 // buildAnalysisContext creates a structured context string for LLM analysis.
@@ -123,11 +134,32 @@ func (a *TechnicalAgent) buildAnalysisContext(req AnalysisRequest) string {
 		sb.WriteString(fmt.Sprintf("  - Market Regime: %s\n", req.MarketState.MarketRegime))
 	}
 
+	if deterministic, ok := a.evaluateDeterministicSetup(req); ok {
+		sb.WriteString("\nDeterministic Setup Gates:\n")
+		sb.WriteString(fmt.Sprintf("  - %s\n", deterministic.Summary()))
+		for _, gate := range deterministic.Gates {
+			status := "PASS"
+			if !gate.Passed {
+				status = "FAIL"
+			}
+			sb.WriteString(fmt.Sprintf("  - %s: %s (%s)\n", gate.Name, status, gate.Reason))
+		}
+		sb.WriteString("The LLM may explain these gates but must not override failed deterministic gates.\n")
+	}
+
 	return sb.String()
 }
 
 // ruleBasedAnalysis performs analysis without LLM using predefined rules.
 func (a *TechnicalAgent) ruleBasedAnalysis(req AnalysisRequest) (*AnalysisResult, error) {
+	if result, blocked := a.blockOnBadMarketData(req); blocked {
+		return result, nil
+	}
+
+	if deterministic, ok := a.evaluateDeterministicSetup(req); ok {
+		return a.resultFromDeterministicSetup(deterministic), nil
+	}
+
 	result := a.CreateResult(Hold, 50, "")
 
 	// Start with signal score if available
@@ -212,6 +244,150 @@ func (a *TechnicalAgent) ruleBasedAnalysis(req AnalysisRequest) (*AnalysisResult
 
 	result.Timestamp = time.Now()
 	return result, nil
+}
+
+func (a *TechnicalAgent) evaluateDeterministicSetup(req AnalysisRequest) (*techsetup.Setup, bool) {
+	candles := primaryCandles(req.Candles)
+	if len(candles) == 0 {
+		return nil, false
+	}
+	report := quality.ValidateCandles(candles, quality.Config{
+		Symbol:         req.Symbol,
+		Timeframe:      primaryTimeframe(req.Candles),
+		MinCandles:     20,
+		CheckStaleness: false,
+	})
+	if !report.Valid() {
+		return nil, false
+	}
+	higher := make(map[string][]models.Candle)
+	for timeframe, values := range req.Candles {
+		if values == nil || len(values) == len(candles) && sameLastTimestamp(values, candles) {
+			continue
+		}
+		higher[timeframe] = values
+	}
+
+	config := techsetup.DefaultConfig()
+	config.RequireMTFAlignment = len(higher) > 0
+	engine := techsetup.NewEngine(config)
+	result, err := engine.Evaluate(context.Background(), techsetup.Request{
+		Symbol:           req.Symbol,
+		Candles:          candles,
+		HigherTimeframes: higher,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return result, true
+}
+
+func (a *TechnicalAgent) blockOnBadMarketData(req AnalysisRequest) (*AnalysisResult, bool) {
+	candles := primaryCandles(req.Candles)
+	if len(candles) == 0 {
+		return nil, false
+	}
+	report := quality.ValidateCandles(candles, quality.Config{
+		Symbol:         req.Symbol,
+		Timeframe:      primaryTimeframe(req.Candles),
+		MinCandles:     2,
+		CheckStaleness: false,
+	})
+	if report.Valid() {
+		return nil, false
+	}
+	result := a.CreateResult(Hold, 0, "Market data quality gates failed: "+report.Error())
+	result.Timestamp = time.Now()
+	return result, true
+}
+
+func (a *TechnicalAgent) resultFromDeterministicSetup(setup *techsetup.Setup) *AnalysisResult {
+	result := a.CreateResult(Hold, setup.Confidence, setup.Summary())
+	switch setup.Action {
+	case techsetup.ActionBuy:
+		result.Recommendation = Buy
+	case techsetup.ActionSell:
+		result.Recommendation = Sell
+	default:
+		result.Recommendation = Hold
+	}
+	result.EntryPrice = setup.EntryPrice
+	result.StopLoss = setup.StopLoss
+	result.Targets = setup.Targets
+	result.RiskReward = setup.RiskReward
+	result.Timestamp = time.Now()
+	return result
+}
+
+func (a *TechnicalAgent) applyDeterministicSetup(result *AnalysisResult, req AnalysisRequest) *AnalysisResult {
+	deterministic, ok := a.evaluateDeterministicSetup(req)
+	if !ok {
+		return result
+	}
+	deterministicResult := a.resultFromDeterministicSetup(deterministic)
+	if deterministic.Action == techsetup.ActionNoTrade {
+		deterministicResult.Reasoning = fmt.Sprintf("Deterministic gates blocked trade. %s LLM reasoning: %s",
+			deterministic.Summary(), result.Reasoning)
+		return deterministicResult
+	}
+	if (deterministic.Action == techsetup.ActionBuy && result.Recommendation != Buy) ||
+		(deterministic.Action == techsetup.ActionSell && result.Recommendation != Sell) {
+		deterministicResult.Recommendation = Hold
+		deterministicResult.Confidence = 50
+		deterministicResult.EntryPrice = 0
+		deterministicResult.StopLoss = 0
+		deterministicResult.Targets = nil
+		deterministicResult.RiskReward = 0
+		deterministicResult.Reasoning = fmt.Sprintf("LLM recommendation %s conflicts with deterministic setup %s; holding. LLM reasoning: %s",
+			result.Recommendation, deterministic.Action, result.Reasoning)
+		return deterministicResult
+	}
+	deterministicResult.Reasoning = fmt.Sprintf("%s LLM reasoning: %s", deterministic.Summary(), result.Reasoning)
+	return deterministicResult
+}
+
+func primaryCandles(candlesByTimeframe map[string][]models.Candle) []models.Candle {
+	if len(candlesByTimeframe) == 0 {
+		return nil
+	}
+	preferred := []string{"5min", "5minute", "15min", "15minute", "1min", "minute"}
+	for _, key := range preferred {
+		if candles := candlesByTimeframe[key]; len(candles) > 0 {
+			return candles
+		}
+	}
+	var best []models.Candle
+	for _, candles := range candlesByTimeframe {
+		if len(candles) > len(best) {
+			best = candles
+		}
+	}
+	return best
+}
+
+func primaryTimeframe(candlesByTimeframe map[string][]models.Candle) string {
+	if len(candlesByTimeframe) == 0 {
+		return "1day"
+	}
+	preferred := []string{"5min", "5minute", "15min", "15minute", "1min", "minute"}
+	for _, key := range preferred {
+		if len(candlesByTimeframe[key]) > 0 {
+			return key
+		}
+	}
+	for key, candles := range candlesByTimeframe {
+		if len(candles) > 0 {
+			return key
+		}
+	}
+	return "1day"
+}
+
+func sameLastTimestamp(a, b []models.Candle) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	return a[len(a)-1].Timestamp.Equal(b[len(b)-1].Timestamp)
 }
 
 // analyzePatterns scores the detected patterns, weighted by reliability.
@@ -415,7 +591,7 @@ func (a *TechnicalAgent) calculateTradeLevels(result *AnalysisResult, req Analys
 // parseResponse parses the LLM response into an AnalysisResult.
 func (a *TechnicalAgent) parseResponse(response string, req AnalysisRequest) (*AnalysisResult, error) {
 	result := a.CreateResult(Hold, 50, "")
-	
+
 	lines := strings.Split(response, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)

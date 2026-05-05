@@ -12,18 +12,20 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	Trading       TradingConfig       `mapstructure:"trading"`
-	Risk          RiskConfig          `mapstructure:"risk"`
-	UI            UIConfig            `mapstructure:"ui"`
-	Notifications NotificationConfig  `mapstructure:"notifications"`
-	Security      SecurityConfig      `mapstructure:"security"`
-	Credentials   Credentials         `mapstructure:"-"` // Loaded separately
-	Agents        AgentConfig         `mapstructure:"-"` // Loaded separately
+	Trading       TradingConfig      `mapstructure:"trading"`
+	Risk          RiskConfig         `mapstructure:"risk"`
+	UI            UIConfig           `mapstructure:"ui"`
+	Notifications NotificationConfig `mapstructure:"notifications"`
+	Security      SecurityConfig     `mapstructure:"security"`
+	Credentials   Credentials        `mapstructure:"-"` // Loaded separately
+	Agents        AgentConfig        `mapstructure:"-"` // Loaded separately
+	ConfigDir     string             `mapstructure:"-"` // Directory the config was loaded from
 }
 
 // TradingConfig holds trading-related configuration.
 type TradingConfig struct {
 	Mode            string `mapstructure:"mode"`             // "live", "paper"
+	SafetyProfile   string `mapstructure:"safety_profile"`   // backtest, paper, live-readonly, live-trading
 	DefaultProduct  string `mapstructure:"default_product"`  // MIS, CNC, NRML
 	DefaultExchange string `mapstructure:"default_exchange"` // NSE, BSE
 }
@@ -31,12 +33,16 @@ type TradingConfig struct {
 // RiskConfig holds risk management configuration.
 type RiskConfig struct {
 	MaxPositionPercent     float64 `mapstructure:"max_position_percent"`
+	MaxOrderValue          float64 `mapstructure:"max_order_value"`
 	MaxSectorExposure      float64 `mapstructure:"max_sector_exposure"`
 	MaxConcurrentPositions int     `mapstructure:"max_concurrent_positions"`
+	MaxDailyTrades         int     `mapstructure:"max_daily_trades"`
 	MinRiskReward          float64 `mapstructure:"min_risk_reward"`
 	TrailingStopPercent    float64 `mapstructure:"trailing_stop_percent"`
 	DailyLossLimit         float64 `mapstructure:"daily_loss_limit"`
 	MaxSlippage            float64 `mapstructure:"max_slippage"`
+	RequireStopLoss        bool    `mapstructure:"require_stop_loss"`
+	RequireTarget          bool    `mapstructure:"require_target"`
 }
 
 // UIConfig holds UI-related configuration.
@@ -57,11 +63,11 @@ type SecurityConfig struct {
 
 // NotificationConfig holds notification configuration.
 type NotificationConfig struct {
-	Enabled  bool              `mapstructure:"enabled"`
-	Level    string            `mapstructure:"level"` // all, trades_only, errors_only
-	Webhook  WebhookConfig     `mapstructure:"webhook"`
-	Telegram TelegramConfig    `mapstructure:"telegram"`
-	Email    EmailConfig       `mapstructure:"email"`
+	Enabled  bool           `mapstructure:"enabled"`
+	Level    string         `mapstructure:"level"` // all, trades_only, errors_only
+	Webhook  WebhookConfig  `mapstructure:"webhook"`
+	Telegram TelegramConfig `mapstructure:"telegram"`
+	Email    EmailConfig    `mapstructure:"email"`
 }
 
 // WebhookConfig holds webhook notification configuration.
@@ -145,7 +151,7 @@ func Load(configDir string) (*Config, error) {
 		configDir = DefaultConfigDir()
 	}
 
-	cfg := &Config{}
+	cfg := &Config{ConfigDir: configDir}
 
 	// Load main config
 	if err := loadConfigFile(configDir, "config", cfg); err != nil {
@@ -268,16 +274,34 @@ func (c *Config) Validate() error {
 	if c.Trading.Mode != "" && c.Trading.Mode != "live" && c.Trading.Mode != "paper" {
 		return fmt.Errorf("invalid trading mode: %s (must be 'live' or 'paper')", c.Trading.Mode)
 	}
+	profile := c.SafetyProfile()
+	switch profile {
+	case SafetyProfileBacktest, SafetyProfilePaper, SafetyProfileLiveReadOnly, SafetyProfileLiveTrading:
+	default:
+		return fmt.Errorf("invalid safety_profile: %s", c.Trading.SafetyProfile)
+	}
+	if profile == SafetyProfilePaper && c.Trading.Mode == "live" {
+		return fmt.Errorf("safety_profile paper requires trading mode paper")
+	}
+	if (profile == SafetyProfileLiveReadOnly || profile == SafetyProfileLiveTrading) && c.Trading.Mode != "live" {
+		return fmt.Errorf("safety_profile %s requires trading mode live", profile)
+	}
 
 	// Validate risk parameters
 	if c.Risk.MaxPositionPercent < 0 || c.Risk.MaxPositionPercent > 100 {
 		return fmt.Errorf("max_position_percent must be between 0 and 100")
+	}
+	if c.Risk.MaxOrderValue < 0 {
+		return fmt.Errorf("max_order_value must be non-negative")
 	}
 	if c.Risk.MaxSectorExposure < 0 || c.Risk.MaxSectorExposure > 100 {
 		return fmt.Errorf("max_sector_exposure must be between 0 and 100")
 	}
 	if c.Risk.MinRiskReward < 0 {
 		return fmt.Errorf("min_risk_reward must be non-negative")
+	}
+	if c.Risk.MaxDailyTrades < 0 {
+		return fmt.Errorf("max_daily_trades must be non-negative")
 	}
 
 	// Validate agent config
@@ -290,5 +314,74 @@ func (c *Config) Validate() error {
 
 // IsPaperMode returns true if paper trading mode is enabled.
 func (c *Config) IsPaperMode() bool {
-	return c.Trading.Mode == "paper"
+	return c.SafetyProfile() == SafetyProfilePaper
+}
+
+const (
+	SafetyProfileBacktest     = "backtest"
+	SafetyProfilePaper        = "paper"
+	SafetyProfileLiveReadOnly = "live-readonly"
+	SafetyProfileLiveTrading  = "live-trading"
+)
+
+// SafetyCapabilities describes what the active safety profile permits.
+type SafetyCapabilities struct {
+	BrokerOrders      bool
+	BrokerGTT         bool
+	AutoTrade         bool
+	StateWrites       bool
+	ConfigWrites      bool
+	LLMOrderAuthority bool
+}
+
+// SafetyProfile returns the effective safety profile.
+func (c *Config) SafetyProfile() string {
+	if c == nil {
+		return SafetyProfileLiveReadOnly
+	}
+	if c.Trading.SafetyProfile != "" {
+		return c.Trading.SafetyProfile
+	}
+	if c.Security.ReadOnlyMode {
+		return SafetyProfileLiveReadOnly
+	}
+	if c.Trading.Mode == "paper" || c.Trading.Mode == "" {
+		return SafetyProfilePaper
+	}
+	return SafetyProfileLiveReadOnly
+}
+
+// SafetyCapabilities returns the permission set for the effective safety profile.
+func (c *Config) SafetyCapabilities() SafetyCapabilities {
+	switch c.SafetyProfile() {
+	case SafetyProfileBacktest:
+		return SafetyCapabilities{
+			StateWrites:       false,
+			LLMOrderAuthority: true,
+		}
+	case SafetyProfilePaper:
+		return SafetyCapabilities{
+			BrokerOrders:      true,
+			BrokerGTT:         true,
+			AutoTrade:         true,
+			StateWrites:       true,
+			ConfigWrites:      true,
+			LLMOrderAuthority: true,
+		}
+	case SafetyProfileLiveTrading:
+		return SafetyCapabilities{
+			BrokerOrders:      true,
+			BrokerGTT:         true,
+			AutoTrade:         true,
+			StateWrites:       true,
+			ConfigWrites:      true,
+			LLMOrderAuthority: false,
+		}
+	default:
+		return SafetyCapabilities{
+			StateWrites:       false,
+			ConfigWrites:      true,
+			LLMOrderAuthority: false,
+		}
+	}
 }

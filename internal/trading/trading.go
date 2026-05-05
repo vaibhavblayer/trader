@@ -103,6 +103,7 @@ type BacktestConfig struct {
 	Symbol         string
 	StartDate      time.Time
 	EndDate        time.Time
+	Timeframe      string
 	InitialCapital float64
 	Strategy       string
 	Parameters     map[string]interface{}
@@ -110,11 +111,25 @@ type BacktestConfig struct {
 	Commission     float64 // as fraction, e.g. 0.0003 = 0.03%
 
 	// Risk management
-	StopLossPercent    float64 // e.g. 3.0 means 3% stop loss
-	TakeProfitPercent  float64 // e.g. 6.0 means 6% take profit
+	StopLossPercent     float64 // e.g. 3.0 means 3% stop loss
+	TakeProfitPercent   float64 // e.g. 6.0 means 6% take profit
 	TrailingStopPercent float64 // e.g. 2.0 means 2% trailing stop
-	MaxPositionPercent float64 // max % of capital per trade (default 95)
-	AllowShort         bool    // allow short selling
+	MaxPositionPercent  float64 // max % of capital per trade (default 95)
+	AllowShort          bool    // allow short selling
+
+	// Event-based execution model
+	ExecutionTiming      string  // "next_open" (default) or "same_close"
+	AllowPartialFills    bool    // allow quantity to be capped by modeled volume
+	MaxFillVolumePercent float64 // max fill as % of candle volume (0 disables)
+
+	// Transaction cost model. All rates are fractions unless noted.
+	BrokerageRate   float64 // broker fee as fraction of turnover
+	BrokeragePerLeg float64 // flat broker fee per entry/exit leg
+	STTRate         float64 // securities transaction tax rate
+	ExchangeFeeRate float64
+	SEBIRate        float64
+	StampDutyRate   float64
+	GSTRate         float64 // GST on brokerage + exchange fees
 }
 
 // BacktestResult represents backtesting results.
@@ -134,24 +149,29 @@ type BacktestResult struct {
 	LosingTrades  int
 
 	// P&L
-	GrossProfit  float64
-	GrossLoss    float64
-	NetProfit    float64
-	AvgWin       float64
-	AvgLoss      float64
-	LargestWin   float64
-	LargestLoss  float64
-	ProfitFactor float64
-	Expectancy   float64
+	GrossProfit   float64
+	GrossLoss     float64
+	NetProfit     float64
+	TotalCosts    float64
+	TotalTurnover float64
+	TotalSlippage float64
+	AvgWin        float64
+	AvgLoss       float64
+	LargestWin    float64
+	LargestLoss   float64
+	ProfitFactor  float64
+	Expectancy    float64
 
 	// Streaks
 	MaxConsecutiveWins   int
 	MaxConsecutiveLosses int
 
 	// Time
-	AvgHoldBars    int
-	AvgWinHoldBars int
+	AvgHoldBars     int
+	AvgWinHoldBars  int
 	AvgLossHoldBars int
+	PartialFills    int
+	RejectedSignals int
 
 	// Capital
 	StartCapital float64
@@ -171,15 +191,21 @@ type EquityPoint struct {
 
 // BacktestTrade represents a trade in backtesting.
 type BacktestTrade struct {
-	EntryTime  time.Time
-	ExitTime   time.Time
-	Symbol     string
-	Side       string
-	EntryPrice float64
-	ExitPrice  float64
-	Quantity   int
-	PnL        float64
-	PnLPercent float64
-	ExitReason string
-	HoldBars   int
+	EntryTime    time.Time
+	ExitTime     time.Time
+	Symbol       string
+	Side         string
+	EntryPrice   float64
+	ExitPrice    float64
+	Quantity     int
+	PnL          float64
+	GrossPnL     float64
+	EntryCosts   float64
+	ExitCosts    float64
+	TotalCosts   float64
+	SlippageCost float64
+	PnLPercent   float64
+	ExitReason   string
+	HoldBars     int
+	PartialFill  bool
 }

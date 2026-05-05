@@ -11,6 +11,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
 )
 
@@ -136,6 +137,21 @@ func (s *SQLiteStore) initSchema() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	-- Append-only decision lifecycle log
+	CREATE TABLE IF NOT EXISTS decision_logs (
+		id TEXT PRIMARY KEY,
+		decision_id TEXT NOT NULL,
+		timestamp DATETIME NOT NULL,
+		stage TEXT NOT NULL,
+		symbol TEXT NOT NULL,
+		action TEXT NOT NULL,
+		status TEXT NOT NULL,
+		message TEXT,
+		payload TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY (decision_id) REFERENCES agent_decisions(id)
+	);
+
 	-- Trade plans table
 	CREATE TABLE IF NOT EXISTS trade_plans (
 		id TEXT PRIMARY KEY,
@@ -229,6 +245,23 @@ func (s *SQLiteStore) initSchema() error {
 		metrics TEXT
 	);
 
+	-- Durable paper trading account snapshot
+	CREATE TABLE IF NOT EXISTS paper_state (
+		id TEXT PRIMARY KEY,
+		state TEXT NOT NULL,
+		updated_at DATETIME NOT NULL
+	);
+
+	-- Append-only paper trading ledger
+	CREATE TABLE IF NOT EXISTS paper_ledger (
+		id TEXT PRIMARY KEY,
+		timestamp DATETIME NOT NULL,
+		type TEXT NOT NULL,
+		ref_id TEXT,
+		symbol TEXT,
+		payload TEXT
+	);
+
 	-- Sync status table
 	CREATE TABLE IF NOT EXISTS sync_status (
 		data_type TEXT PRIMARY KEY,
@@ -243,6 +276,7 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 	CREATE INDEX IF NOT EXISTS idx_decisions_symbol ON agent_decisions(symbol);
 	CREATE INDEX IF NOT EXISTS idx_decisions_timestamp ON agent_decisions(timestamp);
+	CREATE INDEX IF NOT EXISTS idx_decision_logs_decision ON decision_logs(decision_id, timestamp);
 	CREATE INDEX IF NOT EXISTS idx_plans_symbol ON trade_plans(symbol);
 	CREATE INDEX IF NOT EXISTS idx_plans_status ON trade_plans(status);
 	CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol);
@@ -251,12 +285,24 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_events_date ON events(date);
 	CREATE INDEX IF NOT EXISTS idx_journal_date ON journal(date);
 	CREATE INDEX IF NOT EXISTS idx_watchlist_list ON watchlist(list_name);
+	CREATE INDEX IF NOT EXISTS idx_paper_ledger_timestamp ON paper_ledger(timestamp);
+	CREATE INDEX IF NOT EXISTS idx_paper_ledger_ref ON paper_ledger(ref_id);
 	`
 
-	_, err := s.db.Exec(schema)
-	return err
-}
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
 
+	if _, err := s.db.Exec(`
+		UPDATE alerts
+		SET id = 'ALERT_' || rowid || '_' || strftime('%s', COALESCE(created_at, CURRENT_TIMESTAMP))
+		WHERE id IS NULL OR TRIM(id) = ''
+	`); err != nil {
+		return fmt.Errorf("failed to backfill alert IDs: %w", err)
+	}
+
+	return nil
+}
 
 // Close closes the database connection.
 func (s *SQLiteStore) Close() error {
@@ -430,7 +476,6 @@ func (s *SQLiteStore) GetTrades(ctx context.Context, filter TradeFilter) ([]mode
 	return trades, rows.Err()
 }
 
-
 // SaveTradeAnalysis saves trade analysis to the database.
 func (s *SQLiteStore) SaveTradeAnalysis(ctx context.Context, analysis *models.TradeAnalysis) error {
 	_, err := s.db.ExecContext(ctx, `
@@ -591,7 +636,6 @@ func (s *SQLiteStore) UpdatePlanStatus(ctx context.Context, planID string, statu
 	return nil
 }
 
-
 // ============================================================================
 // AI Decisions Methods
 // ============================================================================
@@ -615,6 +659,61 @@ func (s *SQLiteStore) SaveDecision(ctx context.Context, decision *models.Decisio
 		return fmt.Errorf("failed to save decision: %w", err)
 	}
 	return nil
+}
+
+// SaveDecisionLog appends a lifecycle event for a trading decision.
+func (s *SQLiteStore) SaveDecisionLog(ctx context.Context, log *models.DecisionLog) error {
+	if log == nil {
+		return fmt.Errorf("decision log is required")
+	}
+	if log.ID == "" {
+		log.ID = fmt.Sprintf("DLOG_%d", time.Now().UnixNano())
+	}
+	if log.Timestamp.IsZero() {
+		log.Timestamp = time.Now()
+	}
+	payload, err := json.Marshal(log.Payload)
+	if err != nil {
+		return fmt.Errorf("marshal decision log payload: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO decision_logs (id, decision_id, timestamp, stage, symbol, action, status, message, payload)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, log.ID, log.DecisionID, log.Timestamp, log.Stage, log.Symbol, log.Action, log.Status, log.Message, string(payload))
+	if err != nil {
+		return fmt.Errorf("failed to save decision log: %w", err)
+	}
+	return nil
+}
+
+// GetDecisionLogs retrieves lifecycle events for a trading decision in chronological order.
+func (s *SQLiteStore) GetDecisionLogs(ctx context.Context, decisionID string) ([]models.DecisionLog, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, decision_id, timestamp, stage, symbol, action, status, COALESCE(message, ''), COALESCE(payload, '{}')
+		FROM decision_logs
+		WHERE decision_id = ?
+		ORDER BY timestamp ASC, created_at ASC
+	`, decisionID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query decision logs: %w", err)
+	}
+	defer rows.Close()
+
+	var logs []models.DecisionLog
+	for rows.Next() {
+		var log models.DecisionLog
+		var payloadJSON string
+		if err := rows.Scan(&log.ID, &log.DecisionID, &log.Timestamp, &log.Stage, &log.Symbol, &log.Action, &log.Status, &log.Message, &payloadJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan decision log: %w", err)
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &log.Payload); err != nil {
+			log.Payload = map[string]interface{}{"raw": payloadJSON}
+		}
+		logs = append(logs, log)
+	}
+
+	return logs, rows.Err()
 }
 
 // GetDecisions retrieves AI decisions from the database.
@@ -856,6 +955,112 @@ func (s *SQLiteStore) GetDecisionByID(ctx context.Context, id string) (*models.D
 	return &d, nil
 }
 
+// LoadPaperState loads the durable paper trading snapshot.
+func (s *SQLiteStore) LoadPaperState(ctx context.Context) (*broker.PaperState, error) {
+	var stateJSON string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT state FROM paper_state WHERE id = 'default'
+	`).Scan(&stateJSON)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to load paper state: %w", err)
+	}
+
+	var state broker.PaperState
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		return nil, fmt.Errorf("failed to decode paper state: %w", err)
+	}
+	return &state, nil
+}
+
+// SavePaperState saves the durable paper trading snapshot.
+func (s *SQLiteStore) SavePaperState(ctx context.Context, state *broker.PaperState) error {
+	if state == nil {
+		return fmt.Errorf("paper state is required")
+	}
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = time.Now()
+	}
+
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("failed to encode paper state: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO paper_state (id, state, updated_at)
+		VALUES ('default', ?, ?)
+		ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
+	`, string(stateJSON), state.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save paper state: %w", err)
+	}
+	return nil
+}
+
+// AppendPaperLedger appends a paper trading ledger event.
+func (s *SQLiteStore) AppendPaperLedger(ctx context.Context, event *broker.PaperLedgerEvent) error {
+	if event == nil {
+		return fmt.Errorf("paper ledger event is required")
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
+	if strings.TrimSpace(event.ID) == "" {
+		event.ID = fmt.Sprintf("PAPER_LEDGER_%d", time.Now().UnixNano())
+	}
+
+	payloadJSON, err := json.Marshal(event.Payload)
+	if err != nil {
+		return fmt.Errorf("failed to encode paper ledger payload: %w", err)
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO paper_ledger (id, timestamp, type, ref_id, symbol, payload)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, event.ID, event.Timestamp, event.Type, event.RefID, event.Symbol, string(payloadJSON))
+	if err != nil {
+		return fmt.Errorf("failed to append paper ledger event: %w", err)
+	}
+	return nil
+}
+
+// GetPaperLedger returns recent paper trading ledger events.
+func (s *SQLiteStore) GetPaperLedger(ctx context.Context, limit int) ([]broker.PaperLedgerEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, timestamp, type, COALESCE(ref_id, ''), COALESCE(symbol, ''), COALESCE(payload, '{}')
+		FROM paper_ledger
+		ORDER BY timestamp DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query paper ledger: %w", err)
+	}
+	defer rows.Close()
+
+	var events []broker.PaperLedgerEvent
+	for rows.Next() {
+		var event broker.PaperLedgerEvent
+		var payloadJSON string
+		if err := rows.Scan(&event.ID, &event.Timestamp, &event.Type, &event.RefID, &event.Symbol, &payloadJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan paper ledger event: %w", err)
+		}
+		if payloadJSON != "" {
+			if err := json.Unmarshal([]byte(payloadJSON), &event.Payload); err != nil {
+				return nil, fmt.Errorf("failed to decode paper ledger payload: %w", err)
+			}
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
 // UpdateDecisionOutcome updates the outcome and P&L of a decision.
 func (s *SQLiteStore) UpdateDecisionOutcome(ctx context.Context, id string, outcome models.DecisionOutcome, pnl float64) error {
 	result, err := s.db.ExecContext(ctx, `
@@ -896,6 +1101,26 @@ func (s *SQLiteStore) RemoveFromWatchlist(ctx context.Context, symbol, listName 
 	if err != nil {
 		return fmt.Errorf("failed to remove from watchlist: %w", err)
 	}
+	return nil
+}
+
+// DeleteWatchlist removes every symbol from a watchlist.
+func (s *SQLiteStore) DeleteWatchlist(ctx context.Context, listName string) error {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM watchlist WHERE list_name = ?
+	`, listName)
+	if err != nil {
+		return fmt.Errorf("failed to delete watchlist: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check delete result: %w", err)
+	}
+	if rows == 0 {
+		return fmt.Errorf("watchlist not found or already empty: %s", listName)
+	}
+
 	return nil
 }
 
@@ -943,13 +1168,16 @@ func (s *SQLiteStore) GetAllWatchlists(ctx context.Context) (map[string][]string
 	return watchlists, rows.Err()
 }
 
-
 // ============================================================================
 // Alerts Methods
 // ============================================================================
 
 // SaveAlert saves an alert to the database.
 func (s *SQLiteStore) SaveAlert(ctx context.Context, alert *models.Alert) error {
+	if strings.TrimSpace(alert.ID) == "" {
+		alert.ID = fmt.Sprintf("ALERT_%d", time.Now().UnixNano())
+	}
+
 	triggered := 0
 	if alert.Triggered {
 		triggered = 1
@@ -1000,6 +1228,26 @@ func (s *SQLiteStore) TriggerAlert(ctx context.Context, alertID string) error {
 	}
 
 	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("alert not found: %s", alertID)
+	}
+
+	return nil
+}
+
+// DeleteAlert removes an alert from the database.
+func (s *SQLiteStore) DeleteAlert(ctx context.Context, alertID string) error {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM alerts WHERE id = ?
+	`, alertID)
+	if err != nil {
+		return fmt.Errorf("failed to delete alert: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check delete result: %w", err)
+	}
 	if rows == 0 {
 		return fmt.Errorf("alert not found: %s", alertID)
 	}

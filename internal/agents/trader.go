@@ -329,9 +329,10 @@ func (a *TraderAgent) generateReasoning(ctx context.Context, req AnalysisRequest
 	sb.WriteString(fmt.Sprintf("\nConsensus: %s\n", consensus.Calculation))
 	sb.WriteString(fmt.Sprintf("Agreeing Agents: %d/%d\n", consensus.AgreeingAgents, consensus.TotalAgents))
 
-	systemPrompt := `You are a senior trader synthesizing recommendations from multiple analysis agents.
-Provide a concise final trading decision with clear reasoning.
-Your response should be a single paragraph explaining the decision.`
+	systemPrompt := `You are a senior trader reviewing recommendations from multiple analysis agents.
+Explain the already-computed consensus in one concise paragraph.
+Do not change the action, entry, stop loss, targets, confidence, or execution decision.
+You have no order authority; execution is handled only by deterministic gates, risk checks, safety profile checks, and broker controls.`
 
 	response, err := a.llmClient.CompleteWithSystem(ctx, systemPrompt, sb.String())
 	if err != nil {

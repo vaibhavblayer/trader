@@ -224,10 +224,80 @@ func (o *Orchestrator) ProcessSymbol(ctx context.Context, req AnalysisRequest) (
 			if o.notifier != nil {
 				o.notifier.SendError(ctx, err, "saving decision")
 			}
+		} else {
+			o.logDecisionEvent(ctx, decision, models.DecisionStageGenerated, "OK", "decision generated", map[string]interface{}{
+				"confidence":    decision.Confidence,
+				"entry_price":   decision.EntryPrice,
+				"stop_loss":     decision.StopLoss,
+				"targets":       decision.Targets,
+				"agent_count":   len(results),
+				"risk_approved": decision.RiskCheck == nil || decision.RiskCheck.Approved,
+				"authority":     "deterministic_consensus",
+			})
+			if decision.RiskCheck != nil {
+				status := "APPROVED"
+				message := "risk check approved"
+				if !decision.RiskCheck.Approved {
+					status = "REJECTED"
+					message = "risk check rejected"
+				}
+				o.logDecisionEvent(ctx, decision, models.DecisionStageRiskChecked, status, message, map[string]interface{}{
+					"violations":       decision.RiskCheck.Violations,
+					"position_size":    decision.RiskCheck.PositionSize,
+					"portfolio_impact": decision.RiskCheck.PortfolioImpact,
+					"max_loss_amount":  decision.RiskCheck.MaxLossAmount,
+				})
+			}
+			stage := models.DecisionStageExecutionBlocked
+			status := "BLOCKED"
+			message := "decision not selected for execution"
+			if decision.Executed {
+				stage = models.DecisionStageExecutionSelected
+				status = "SELECTED"
+				message = "decision selected for execution"
+			}
+			o.logDecisionEvent(ctx, decision, stage, status, message, map[string]interface{}{
+				"mode":       o.autonomousMode(),
+				"confidence": decision.Confidence,
+				"threshold":  o.autoExecuteThreshold(),
+			})
 		}
 	}
 
 	return decision, nil
+}
+
+func (o *Orchestrator) logDecisionEvent(ctx context.Context, decision *models.Decision, stage models.DecisionLogStage, status, message string, payload map[string]interface{}) {
+	if o.store == nil || decision == nil || decision.ID == "" {
+		return
+	}
+	if err := o.store.SaveDecisionLog(ctx, &models.DecisionLog{
+		ID:         fmt.Sprintf("DLOG_%d", time.Now().UnixNano()),
+		DecisionID: decision.ID,
+		Timestamp:  time.Now(),
+		Stage:      stage,
+		Symbol:     decision.Symbol,
+		Action:     decision.Action,
+		Status:     status,
+		Message:    message,
+		Payload:    payload,
+	}); err != nil && o.notifier != nil {
+		o.notifier.SendError(ctx, err, "saving decision log")
+	}
+}
+
+func (o *Orchestrator) autonomousMode() string {
+	if o.config == nil {
+		return "UNKNOWN"
+	}
+	return o.config.AutonomousMode
+}
+
+func (o *Orchestrator) autoExecuteThreshold() float64 {
+	if o.config == nil {
+		return 0
+	}
+	return o.config.AutoExecuteThreshold
 }
 
 // agentResult holds the result from a single agent.

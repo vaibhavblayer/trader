@@ -11,6 +11,10 @@ const configTemplate = `# Zerodha Go Trader Configuration
 [trading]
 # Trading mode: "live" or "paper"
 mode = "paper"
+# Safety profile: "backtest", "paper", "live-readonly", or "live-trading"
+# live mode defaults to live-readonly unless live-trading is explicitly selected.
+# LLM-driven simulated execution is allowed in backtest/paper only.
+safety_profile = "paper"
 # Default product type: MIS, CNC, NRML
 default_product = "MIS"
 # Default exchange: NSE, BSE
@@ -19,12 +23,20 @@ default_exchange = "NSE"
 [risk]
 # Maximum position size as percentage of portfolio
 max_position_percent = 10.0
+# Maximum single order value in INR (0 disables this cap)
+max_order_value = 0.0
 # Maximum exposure per sector as percentage
 max_sector_exposure = 30.0
 # Maximum number of concurrent positions
 max_concurrent_positions = 5
+# Maximum broker orders allowed per day (0 disables this cap)
+max_daily_trades = 10
 # Minimum risk-reward ratio
 min_risk_reward = 2.0
+# Require a stop-loss for new exposure
+require_stop_loss = true
+# Require a target for new exposure so risk/reward can be validated
+require_target = true
 # Trailing stop-loss percentage
 trailing_stop_percent = 1.0
 # Daily loss limit in INR

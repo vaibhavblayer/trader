@@ -153,25 +153,27 @@ func playSound(name string) {
 	exec.Command("afplay", "/System/Library/Sounds/"+name+".aiff").Start()
 }
 
+func backtestLongDescription() string {
+	var b strings.Builder
+	b.WriteString("Backtest trading strategies on historical data.\n\n")
+	b.WriteString("Available strategies:\n")
+	for _, def := range trading.AvailableStrategyDefinitions() {
+		suffix := ""
+		if def.Name == "ema_crossover" {
+			suffix = " (default)"
+		}
+		fmt.Fprintf(&b, "  %-18s %s%s\n", def.Name, def.Description, suffix)
+	}
+	b.WriteString("\nCalculates: total return, win rate, max drawdown, Sharpe ratio,\n")
+	b.WriteString("Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.")
+	return b.String()
+}
+
 func newBacktestCmd(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "backtest",
 		Short: "Backtest trading strategies",
-		Long: `Backtest trading strategies on historical data.
-
-Available strategies:
-  ema_crossover      EMA 9/21 crossover (default)
-  sma_crossover      SMA 10/20 crossover
-  rsi_oversold       RSI oversold/overbought reversal
-  macd               MACD signal line crossover
-  supertrend         SuperTrend direction change
-  bollinger_breakout Bollinger Band mean reversion
-  adx_trend          ADX trend strength + DI crossover
-  donchian_breakout  Donchian channel breakout (turtle)
-  multi_indicator    EMA + RSI + ADX + volume filter
-
-Calculates: total return, win rate, max drawdown, Sharpe ratio,
-Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.`,
+		Long:  backtestLongDescription(),
 		Example: `  trader backtest --strategy ema_crossover --symbol RELIANCE --days 365
   trader backtest --strategy supertrend --symbol INFY --days 180 --sl 2.5 --tp 5
   trader backtest --strategy macd --symbol TCS --trailing 2.0 --short
@@ -182,6 +184,7 @@ Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.`,
 			defer cancel()
 
 			strategy, _ := cmd.Flags().GetString("strategy")
+			strategy = trading.NormalizeStrategyName(strategy)
 			symbol, _ := cmd.Flags().GetString("symbol")
 			days, _ := cmd.Flags().GetInt("days")
 			capital, _ := cmd.Flags().GetFloat64("capital")
@@ -192,18 +195,32 @@ Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.`,
 			takeProfit, _ := cmd.Flags().GetFloat64("tp")
 			trailingStop, _ := cmd.Flags().GetFloat64("trailing")
 			allowShort, _ := cmd.Flags().GetBool("short")
+			executionTiming, _ := cmd.Flags().GetString("execution")
+			partialFills, _ := cmd.Flags().GetBool("partial-fills")
+			maxFillVolumePct, _ := cmd.Flags().GetFloat64("max-fill-volume")
 
 			if symbol == "" {
 				output.Error("Symbol is required. Use --symbol flag.")
 				return fmt.Errorf("symbol required")
 			}
+			strategyDef, ok := trading.DefaultStrategyRegistry().Definition(strategy)
+			if !ok {
+				output.Error("Unknown strategy: %s", strategy)
+				output.Info("Available strategies: %s", strings.Join(trading.AvailableStrategies(), ", "))
+				return fmt.Errorf("unknown strategy")
+			}
 
 			output.Bold("Backtesting: %s", strategy)
 			output.Printf("  Symbol:     %s\n", symbol)
+			output.Printf("  Category:   %s\n", strategyDef.Category)
 			output.Printf("  Period:     %d days\n", days)
 			output.Printf("  Capital:    %s\n", FormatIndianCurrency(capital))
 			output.Printf("  Slippage:   %.2f%%\n", slippagePct)
 			output.Printf("  Commission: %.2f%%\n", commissionPct)
+			output.Printf("  Execution:  %s\n", executionTiming)
+			if partialFills {
+				output.Printf("  Fill cap:   %.2f%% of bar volume\n", maxFillVolumePct)
+			}
 			if stopLoss > 0 {
 				output.Printf("  Stop Loss:  %.1f%%\n", stopLoss)
 			}
@@ -225,17 +242,18 @@ Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.`,
 
 			output.Info("Fetching historical data...")
 
-			candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+			candles, report, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 				Symbol:    symbol,
 				Exchange:  models.Exchange(exchange),
 				Timeframe: "1day",
 				From:      time.Now().AddDate(0, 0, -days),
 				To:        time.Now(),
-			})
+			}, 50, false)
 			if err != nil {
-				output.Error("Failed to fetch historical data: %v", err)
+				output.Error("Failed to fetch usable historical data: %v", err)
 				return err
 			}
+			logQualityWarnings(app, report)
 
 			if len(candles) < 50 {
 				output.Error("Insufficient data for backtest (need at least 50 candles, got %d)", len(candles))
@@ -247,15 +265,18 @@ Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.`,
 
 			engine := trading.NewBacktestEngine(nil)
 			result, err := engine.RunOnCandles(ctx, trading.BacktestConfig{
-				Symbol:              symbol,
-				InitialCapital:      capital,
-				Strategy:            strategy,
-				Slippage:            slippagePct / 100,
-				Commission:          commissionPct / 100,
-				StopLossPercent:     stopLoss,
-				TakeProfitPercent:   takeProfit,
-				TrailingStopPercent: trailingStop,
-				AllowShort:          allowShort,
+				Symbol:               symbol,
+				InitialCapital:       capital,
+				Strategy:             strategy,
+				Slippage:             slippagePct / 100,
+				Commission:           commissionPct / 100,
+				ExecutionTiming:      executionTiming,
+				AllowPartialFills:    partialFills,
+				MaxFillVolumePercent: maxFillVolumePct,
+				StopLossPercent:      stopLoss,
+				TakeProfitPercent:    takeProfit,
+				TrailingStopPercent:  trailingStop,
+				AllowShort:           allowShort,
 			}, candles)
 			if err != nil {
 				output.Error("Backtest failed: %v", err)
@@ -270,13 +291,16 @@ Sortino ratio, Calmar ratio, profit factor, expectancy, streaks.`,
 		},
 	}
 
-	cmd.Flags().String("strategy", "ema_crossover", "Strategy (ema_crossover, sma_crossover, rsi_oversold, macd, supertrend, bollinger_breakout, adx_trend, donchian_breakout, multi_indicator)")
+	cmd.Flags().String("strategy", "ema_crossover", fmt.Sprintf("Strategy (%s)", strings.Join(trading.AvailableStrategies(), ", ")))
 	cmd.Flags().String("symbol", "", "Symbol to backtest")
 	cmd.Flags().String("watchlist", "", "Watchlist to backtest")
 	cmd.Flags().Int("days", 365, "Number of days to backtest")
 	cmd.Flags().Float64("capital", 1000000, "Starting capital")
 	cmd.Flags().Float64("slippage", 0.1, "Slippage percentage")
 	cmd.Flags().Float64("commission", 0.03, "Commission percentage")
+	cmd.Flags().String("execution", "next_open", "Execution timing (next_open, same_close)")
+	cmd.Flags().Bool("partial-fills", false, "Cap fills by candle volume")
+	cmd.Flags().Float64("max-fill-volume", 10, "Maximum fill as percentage of candle volume when partial fills are enabled")
 	cmd.Flags().Float64("sl", 3.0, "Stop loss percentage (0 to disable)")
 	cmd.Flags().Float64("tp", 0, "Take profit percentage (0 to disable)")
 	cmd.Flags().Float64("trailing", 0, "Trailing stop percentage (0 to disable)")
@@ -298,6 +322,10 @@ func displayBacktestResult(output *Output, r *trading.BacktestResult) error {
 	output.Printf("  Avg Hold (bars):    %d\n", r.AvgHoldBars)
 	output.Printf("  Avg Win Hold:       %d bars\n", r.AvgWinHoldBars)
 	output.Printf("  Avg Loss Hold:      %d bars\n", r.AvgLossHoldBars)
+	if r.PartialFills > 0 || r.RejectedSignals > 0 {
+		output.Printf("  Partial Fills:      %d\n", r.PartialFills)
+		output.Printf("  Rejected Signals:   %d\n", r.RejectedSignals)
+	}
 	output.Println()
 
 	// P&L
@@ -305,6 +333,8 @@ func displayBacktestResult(output *Output, r *trading.BacktestResult) error {
 	output.Printf("  Gross Profit:       %s\n", output.Green(FormatIndianCurrency(r.GrossProfit)))
 	output.Printf("  Gross Loss:         %s\n", output.Red(FormatIndianCurrency(r.GrossLoss)))
 	output.Printf("  Net Profit:         %s\n", output.FormatPnL(r.NetProfit))
+	output.Printf("  Costs:              %s\n", FormatIndianCurrency(r.TotalCosts))
+	output.Printf("  Slippage Cost:      %s\n", FormatIndianCurrency(r.TotalSlippage))
 	output.Printf("  Total Return:       %s\n", output.FormatPercent(r.TotalReturn))
 	output.Printf("  Annualized Return:  %s\n", output.FormatPercent(r.AnnualizedReturn))
 	output.Println()
@@ -662,7 +692,7 @@ func newAPICmd(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "api",
 		Short: "REST API server",
-		Long:  "Start a REST API server for external integrations.",
+		Long:  "REST API server commands for external integrations.",
 	}
 
 	cmd.AddCommand(&cobra.Command{
@@ -670,7 +700,7 @@ func newAPICmd(app *App) *cobra.Command {
 		Short: "Start the API server",
 		Long: `Start a REST API server for external integrations.
 
-Endpoints:
+This server is not implemented yet. Planned endpoints:
   GET  /api/quote/:symbol     - Get quote
   GET  /api/positions         - Get positions
   GET  /api/orders            - Get orders
@@ -682,20 +712,11 @@ Endpoints:
   trader api start --key myapikey`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
-			port, _ := cmd.Flags().GetInt("port")
-			apiKey, _ := cmd.Flags().GetString("key")
 
-			output.Bold("Starting REST API Server")
-			output.Printf("  Port:    %d\n", port)
-			if apiKey != "" {
-				output.Printf("  API Key: %s\n", "****"+apiKey[len(apiKey)-4:])
-			}
-			output.Println()
+			err := fmt.Errorf("api server is not implemented in this version")
+			output.Error("%v", err)
 
-			output.Info("API server starting on http://localhost:%d", port)
-			output.Println()
-
-			output.Bold("Available Endpoints")
+			output.Bold("Planned Endpoints")
 			endpoints := []struct {
 				method string
 				path   string
@@ -725,14 +746,7 @@ Endpoints:
 					output.DimText(e.desc))
 			}
 
-			output.Println()
-			output.Dim("Press Ctrl+C to stop the server")
-
-			// In a real implementation, this would start an HTTP server
-			// For now, just show the info
-			output.Warning("API server not implemented in this version")
-
-			return nil
+			return err
 		},
 	})
 

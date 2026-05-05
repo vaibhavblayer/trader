@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -231,8 +232,17 @@ func TestPaperTradingSimulation(t *testing.T) {
 		}
 	}
 
-	expectedPnL := (newPrice - 3500.0) * 10
-	if tcsPosition.PnL != expectedPnL {
+	orders, err := paperBroker.GetOrders(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get orders: %v", err)
+	}
+	if len(orders) != 1 {
+		t.Fatalf("Expected 1 order, got %d", len(orders))
+	}
+	buyFill := orders[0]
+
+	expectedPnL := (newPrice - buyFill.AveragePrice) * 10
+	if math.Abs(tcsPosition.PnL-expectedPnL) > 0.01 {
 		t.Errorf("Expected P&L %.2f, got %.2f", expectedPnL, tcsPosition.PnL)
 	}
 
@@ -265,8 +275,25 @@ func TestPaperTradingSimulation(t *testing.T) {
 
 	// Test 7: Verify balance reflects profit
 	finalBalance, _ := paperBroker.GetBalance(ctx)
-	expectedBalance := initialBalance - (3500.0 * 10) + (3600.0 * 10)
-	if finalBalance.AvailableCash != expectedBalance {
+	orders, err = paperBroker.GetOrders(ctx)
+	if err != nil {
+		t.Fatalf("Failed to get final orders: %v", err)
+	}
+	if len(orders) != 2 {
+		t.Fatalf("Expected 2 orders, got %d", len(orders))
+	}
+	var buyOrderFill, sellOrderFill models.Order
+	for _, order := range orders {
+		if order.Side == models.OrderSideBuy {
+			buyOrderFill = order
+		} else if order.Side == models.OrderSideSell {
+			sellOrderFill = order
+		}
+	}
+	buyValue := buyOrderFill.AveragePrice * float64(buyOrderFill.FilledQty)
+	sellValue := sellOrderFill.AveragePrice * float64(sellOrderFill.FilledQty)
+	expectedBalance := initialBalance - buyValue - buyValue*0.0003 + sellValue - sellValue*0.0003
+	if math.Abs(finalBalance.AvailableCash-expectedBalance) > 0.01 {
 		t.Errorf("Expected final balance %.2f, got %.2f", expectedBalance, finalBalance.AvailableCash)
 	}
 

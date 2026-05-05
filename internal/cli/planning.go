@@ -64,6 +64,31 @@ The plan will be monitored and you'll be notified when price approaches key leve
 			qty, _ := cmd.Flags().GetInt("qty")
 			notes, _ := cmd.Flags().GetString("notes")
 			side, _ := cmd.Flags().GetString("side")
+			side = strings.ToUpper(side)
+			if err := app.validateSymbol(symbol); err != nil {
+				output.Error("Invalid symbol: %v", err)
+				return err
+			}
+			for field, value := range map[string]float64{"entry": entry, "sl": sl, "target": target, "t1": t1, "t2": t2, "t3": t3} {
+				if err := app.validatePrice(value); err != nil {
+					output.Error("Invalid %s: %v", field, err)
+					return err
+				}
+			}
+			if qty > 0 {
+				if err := app.validateQuantity(qty); err != nil {
+					output.Error("Invalid quantity: %v", err)
+					return err
+				}
+			}
+			if err := app.validateText("notes", notes, 1000); err != nil {
+				output.Error("Invalid notes: %v", err)
+				return err
+			}
+			if side != string(models.OrderSideBuy) && side != string(models.OrderSideSell) {
+				output.Error("Invalid side: %s", side)
+				return fmt.Errorf("invalid side")
+			}
 
 			// Use target if t1 not specified
 			if t1 == 0 && target > 0 {
@@ -79,6 +104,7 @@ The plan will be monitored and you'll be notified when price approaches key leve
 			}
 
 			plan := &models.TradePlan{
+				ID:         fmt.Sprintf("PLAN_%d", time.Now().UnixNano()),
 				Symbol:     symbol,
 				Side:       models.OrderSide(side),
 				EntryPrice: entry,
@@ -95,6 +121,10 @@ The plan will be monitored and you'll be notified when price approaches key leve
 			}
 
 			if app.Store != nil {
+				if err := app.checkSavePlan(ctx); err != nil {
+					output.Error("%v", err)
+					return err
+				}
 				if err := app.Store.SavePlan(ctx, plan); err != nil {
 					output.Error("Failed to save plan: %v", err)
 					return err
@@ -249,6 +279,10 @@ func newPlanExecuteCmd(app *App) *cobra.Command {
 			defer cancel()
 
 			planID := args[0]
+			if err := app.validateOrderID(planID); err != nil {
+				output.Error("Invalid plan ID: %v", err)
+				return err
+			}
 
 			if app.Store == nil {
 				output.Error("Store not initialized")
@@ -284,6 +318,10 @@ func newPlanExecuteCmd(app *App) *cobra.Command {
 				output.Error("Plan is not in executable state: %s", plan.Status)
 				return fmt.Errorf("plan not executable")
 			}
+			if err := app.checkExecutePlan(ctx); err != nil {
+				output.Error("%v", err)
+				return err
+			}
 
 			output.Info("Executing plan %s...", planID)
 			output.Printf("  Symbol: %s\n", plan.Symbol)
@@ -301,6 +339,16 @@ func newPlanExecuteCmd(app *App) *cobra.Command {
 				Quantity:     plan.Quantity,
 				Price:        plan.EntryPrice,
 				TriggerPrice: plan.StopLoss,
+			}
+			order.Tag = broker.IntentOrderTag("plan:"+planID, order)
+
+			riskDecision, err := app.checkOrderRisk(ctx, order, plan.StopLoss, plan.Target1)
+			if err != nil {
+				output.Error("%v", err)
+				return err
+			}
+			if riskDecision != nil && riskDecision.RiskReward > 0 {
+				output.Printf("  Risk:   approved (R:R %.2f)\n", riskDecision.RiskReward)
 			}
 
 			result, err := app.Broker.PlaceOrder(ctx, order)
@@ -329,9 +377,26 @@ func newPlanCancelCmd(app *App) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			planID := args[0]
+			if err := app.validateOrderID(planID); err != nil {
+				output.Error("Invalid plan ID: %v", err)
+				return err
+			}
+			if err := app.checkModifyPlan(ctx); err != nil {
+				output.Error("%v", err)
+				return err
+			}
 
 			output.Info("Cancelling plan %s...", planID)
+			if app.Store != nil {
+				if err := app.Store.UpdatePlanStatus(ctx, planID, models.PlanCancelled); err != nil {
+					output.Error("Failed to cancel plan: %v", err)
+					return err
+				}
+			}
 			output.Success("✓ Plan cancelled")
 
 			return nil
@@ -400,16 +465,17 @@ Can place AMO (After Market Orders) for the setups.`,
 
 			for _, symbol := range symbols {
 				// Fetch historical data
-				candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+				candles, report, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 					Symbol:    symbol,
 					Exchange:  models.Exchange(exchange),
 					Timeframe: "1day",
 					From:      time.Now().AddDate(0, 0, -60),
 					To:        time.Now(),
-				})
+				}, 20, false)
 				if err != nil || len(candles) < 20 {
 					continue
 				}
+				logQualityWarnings(app, report)
 
 				// Extract price data
 				closes := make([]float64, len(candles))
@@ -546,6 +612,16 @@ You'll be notified when the price crosses the specified level.`,
 			above, _ := cmd.Flags().GetFloat64("above")
 			below, _ := cmd.Flags().GetFloat64("below")
 			change, _ := cmd.Flags().GetFloat64("change")
+			if err := app.validateSymbol(symbol); err != nil {
+				output.Error("Invalid symbol: %v", err)
+				return err
+			}
+			for field, value := range map[string]float64{"above": above, "below": below, "change": change} {
+				if err := app.validatePrice(value); err != nil {
+					output.Error("Invalid %s: %v", field, err)
+					return err
+				}
+			}
 
 			var condition string
 			var price float64
@@ -565,6 +641,7 @@ You'll be notified when the price crosses the specified level.`,
 			}
 
 			alert := &models.Alert{
+				ID:        fmt.Sprintf("ALERT_%d", time.Now().UnixNano()),
 				Symbol:    symbol,
 				Condition: condition,
 				Price:     price,
@@ -572,6 +649,10 @@ You'll be notified when the price crosses the specified level.`,
 			}
 
 			if app.Store != nil {
+				if err := app.checkSaveAlert(ctx); err != nil {
+					output.Error("%v", err)
+					return err
+				}
 				if err := app.Store.SaveAlert(ctx, alert); err != nil {
 					output.Error("Failed to save alert: %v", err)
 					return err
@@ -583,6 +664,7 @@ You'll be notified when the price crosses the specified level.`,
 			}
 
 			output.Success("✓ Alert created")
+			output.Printf("  ID:        %s\n", alert.ID)
 			output.Printf("  Symbol:    %s\n", symbol)
 			output.Printf("  Condition: %s %s\n", condition, FormatPrice(price))
 
@@ -654,7 +736,22 @@ You'll be notified when the price crosses the specified level.`,
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
 			alertID := args[0]
+			if app.Store == nil {
+				output.Warning("Store not initialized")
+				return nil
+			}
+			if err := app.checkSaveAlert(ctx); err != nil {
+				output.Error("%v", err)
+				return err
+			}
+			if err := app.Store.DeleteAlert(ctx, alertID); err != nil {
+				output.Error("Failed to delete alert: %v", err)
+				return err
+			}
 
 			output.Success("✓ Alert %s deleted", alertID)
 			return nil

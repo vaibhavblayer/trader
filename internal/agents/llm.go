@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/sashabaranov/go-openai"
 )
@@ -41,6 +42,7 @@ func (c *OpenAIClient) Complete(ctx context.Context, prompt string) (string, err
 			{Role: openai.ChatMessageRoleUser, Content: prompt},
 		},
 	}
+	applyJSONResponseFormat(&req, prompt)
 	if c.reasoningEffort != "" {
 		req.ReasoningEffort = c.reasoningEffort
 	}
@@ -63,6 +65,7 @@ func (c *OpenAIClient) CompleteWithSystem(ctx context.Context, systemPrompt, use
 			{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 		},
 	}
+	applyJSONResponseFormat(&req, systemPrompt, userPrompt)
 	if c.reasoningEffort != "" {
 		req.ReasoningEffort = c.reasoningEffort
 	}
@@ -129,6 +132,7 @@ func (c *OpenAIClient) CompleteWithToolsVerbose(ctx context.Context, systemPromp
 			Messages: messages,
 			Tools:    tools,
 		}
+		applyJSONResponseFormat(&req, systemPrompt, userPrompt)
 		if c.reasoningEffort != "" {
 			req.ReasoningEffort = c.reasoningEffort
 		}
@@ -141,7 +145,7 @@ func (c *OpenAIClient) CompleteWithToolsVerbose(ctx context.Context, systemPromp
 		}
 
 		choice := resp.Choices[0]
-		
+
 		// If no tool calls, return the content
 		if len(choice.Message.ToolCalls) == 0 {
 			cot.Response = choice.Message.Content
@@ -195,4 +199,16 @@ func (c *OpenAIClient) GetReasoningEffort() string {
 // SetReasoningEffort updates the reasoning effort setting.
 func (c *OpenAIClient) SetReasoningEffort(effort string) {
 	c.reasoningEffort = effort
+}
+
+func applyJSONResponseFormat(req *openai.ChatCompletionRequest, prompts ...string) {
+	for _, prompt := range prompts {
+		normalized := strings.ToLower(prompt)
+		if strings.Contains(normalized, "json") {
+			req.ResponseFormat = &openai.ChatCompletionResponseFormat{
+				Type: openai.ChatCompletionResponseFormatTypeJSONObject,
+			}
+			return
+		}
+	}
 }

@@ -29,6 +29,8 @@ type DataStore interface {
 
 	// AI Decisions
 	SaveDecision(ctx context.Context, decision *models.Decision) error
+	SaveDecisionLog(ctx context.Context, log *models.DecisionLog) error
+	GetDecisionLogs(ctx context.Context, decisionID string) ([]models.DecisionLog, error)
 	GetDecisions(ctx context.Context, filter DecisionFilter) ([]models.Decision, error)
 	GetDecisionByID(ctx context.Context, id string) (*models.Decision, error)
 	GetDecisionStats(ctx context.Context, dateRange DateRange) (*models.AIStats, error)
@@ -37,6 +39,7 @@ type DataStore interface {
 	// Watchlist
 	AddToWatchlist(ctx context.Context, symbol, listName string) error
 	RemoveFromWatchlist(ctx context.Context, symbol, listName string) error
+	DeleteWatchlist(ctx context.Context, listName string) error
 	GetWatchlist(ctx context.Context, listName string) ([]string, error)
 	GetAllWatchlists(ctx context.Context) (map[string][]string, error)
 
@@ -44,6 +47,7 @@ type DataStore interface {
 	SaveAlert(ctx context.Context, alert *models.Alert) error
 	GetActiveAlerts(ctx context.Context) ([]models.Alert, error)
 	TriggerAlert(ctx context.Context, alertID string) error
+	DeleteAlert(ctx context.Context, alertID string) error
 
 	// Events Calendar
 	SaveEvent(ctx context.Context, event *models.CorporateEvent) error

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -104,6 +106,7 @@ The daemon will:
 
 			// Display configuration
 			output.Printf("  Mode:             %s\n", app.Config.Agents.AutonomousMode)
+			output.Printf("  Safety Profile:   %s\n", app.Config.SafetyProfile())
 			output.Printf("  Confidence:       %.0f%%\n", app.Config.Agents.AutoExecuteThreshold)
 			output.Printf("  Max Daily Trades: %d\n", app.Config.Agents.MaxDailyTrades)
 			output.Printf("  Max Daily Loss:   %s\n", FormatIndianCurrency(app.Config.Agents.MaxDailyLoss))
@@ -116,6 +119,10 @@ The daemon will:
 
 			if dryRun {
 				output.Warning("🔍 DRY RUN MODE - No actual trades will be executed")
+				output.Println()
+			}
+			if !app.Config.SafetyCapabilities().AutoTrade {
+				output.Warning("Safety profile blocks autonomous execution; daemon will analyze only")
 				output.Println()
 			}
 
@@ -215,10 +222,9 @@ func newTraderStopCmd(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 
-			output.Info("Stopping autonomous trading daemon...")
-			output.Success("✓ Daemon stopped")
-
-			return nil
+			err := fmt.Errorf("persistent daemon control is not implemented; stop the foreground trader process with Ctrl+C or your process manager")
+			output.Error("%v", err)
+			return err
 		},
 	}
 }
@@ -230,27 +236,30 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 
-			// Sample status
 			status := struct {
-				Running           bool
-				Paused            bool
-				Mode              string
-				DailyTrades       int
-				DailyLoss         float64
-				LastTradeAt       time.Time
-				ConsecutiveLosses int
-				Uptime            time.Duration
-				EnabledAgents     []string
+				Tracked               bool     `json:"tracked"`
+				Mode                  string   `json:"mode"`
+				SafetyProfile         string   `json:"safety_profile"`
+				AutoTradeAllowed      bool     `json:"auto_trade_allowed"`
+				LLMOrderAuthority     bool     `json:"llm_order_authority"`
+				AutoExecuteThreshold  float64  `json:"auto_execute_threshold"`
+				MaxDailyTrades        int      `json:"max_daily_trades"`
+				MaxDailyLoss          float64  `json:"max_daily_loss"`
+				ConsecutiveLossLimit  int      `json:"consecutive_loss_limit"`
+				EnabledAgents         []string `json:"enabled_agents"`
+				PersistentStateStatus string   `json:"persistent_state_status"`
 			}{
-				Running:           true,
-				Paused:            false,
-				Mode:              "SEMI_AUTO",
-				DailyTrades:       3,
-				DailyLoss:         1250.50,
-				LastTradeAt:       time.Now().Add(-45 * time.Minute),
-				ConsecutiveLosses: 0,
-				Uptime:            2*time.Hour + 30*time.Minute,
-				EnabledAgents:     []string{"technical", "research", "news", "risk", "trader"},
+				Tracked:               false,
+				Mode:                  app.Config.Agents.AutonomousMode,
+				SafetyProfile:         app.Config.SafetyProfile(),
+				AutoTradeAllowed:      app.Config.SafetyCapabilities().AutoTrade,
+				LLMOrderAuthority:     app.Config.SafetyCapabilities().LLMOrderAuthority,
+				AutoExecuteThreshold:  app.Config.Agents.AutoExecuteThreshold,
+				MaxDailyTrades:        app.Config.Agents.MaxDailyTrades,
+				MaxDailyLoss:          app.Config.Agents.MaxDailyLoss,
+				ConsecutiveLossLimit:  app.Config.Agents.ConsecutiveLossLimit,
+				EnabledAgents:         app.Config.Agents.EnabledAgents,
+				PersistentStateStatus: "not implemented",
 			}
 
 			if output.IsJSON() {
@@ -260,37 +269,112 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 			output.Bold("Autonomous Trading Daemon Status")
 			output.Println()
 
-			// Status indicator
-			if status.Running {
-				if status.Paused {
-					output.Printf("  Status: %s\n", output.Yellow("⏸ PAUSED"))
-				} else {
-					output.Printf("  Status: %s\n", output.Green("● RUNNING"))
-				}
-			} else {
-				output.Printf("  Status: %s\n", output.Red("○ STOPPED"))
-			}
-
-			output.Printf("  Mode:   %s\n", status.Mode)
-			output.Printf("  Uptime: %s\n", FormatDuration(status.Uptime))
+			output.Printf("  Runtime State: %s\n", output.Yellow("not tracked by this command"))
+			output.Printf("  Mode:          %s\n", status.Mode)
+			output.Printf("  Safety Profile: %s\n", status.SafetyProfile)
+			output.Printf("  Profile Auto Trading: %s\n", formatBoolStatus(output, status.AutoTradeAllowed))
+			output.Printf("  Profile LLM Orders:   %s\n", formatBoolStatus(output, status.LLMOrderAuthority))
 			output.Println()
 
-			output.Bold("Daily Statistics")
-			output.Printf("  Trades:       %d / %d\n", status.DailyTrades, app.Config.Agents.MaxDailyTrades)
-			output.Printf("  Daily Loss:   %s / %s\n",
-				output.FormatPnL(-status.DailyLoss),
-				FormatIndianCurrency(app.Config.Agents.MaxDailyLoss))
-			output.Printf("  Last Trade:   %s\n", FormatDateTime(status.LastTradeAt))
-			output.Printf("  Consec. Loss: %d / %d\n", status.ConsecutiveLosses, app.Config.Agents.ConsecutiveLossLimit)
+			output.Bold("Configured Limits")
+			output.Printf("  Confidence:   %.0f%%\n", status.AutoExecuteThreshold)
+			output.Printf("  Daily Trades: %d\n", status.MaxDailyTrades)
+			output.Printf("  Daily Loss:   %s\n", FormatIndianCurrency(status.MaxDailyLoss))
+			output.Printf("  Loss Streak:  %d\n", status.ConsecutiveLossLimit)
 			output.Println()
 
 			output.Bold("Enabled Agents")
 			for _, agent := range status.EnabledAgents {
 				output.Printf("  • %s\n", agent)
 			}
+			output.Println()
+			output.Dim("Persistent daemon runtime state is not available yet; this command reports configuration only.")
 
 			return nil
 		},
+	}
+}
+
+func formatBoolStatus(output *Output, enabled bool) string {
+	if enabled {
+		return output.Green("enabled")
+	}
+	return output.Yellow("disabled")
+}
+
+func formatPassStatus(output *Output, passed bool) string {
+	if passed {
+		return output.Green("PASS")
+	}
+	return output.Yellow("WARN")
+}
+
+func uniqueDecisionDisplayIDs(decisions []models.Decision) map[string]string {
+	const minPrefixLen = 12
+
+	result := make(map[string]string, len(decisions))
+	for _, decision := range decisions {
+		id := decision.ID
+		prefixLen := minPrefixLen
+		if prefixLen > len(id) {
+			prefixLen = len(id)
+		}
+
+		for prefixLen < len(id) {
+			prefix := id[:prefixLen]
+			unique := true
+			for _, other := range decisions {
+				if other.ID != id && strings.HasPrefix(other.ID, prefix) {
+					unique = false
+					break
+				}
+			}
+			if unique {
+				break
+			}
+			prefixLen++
+		}
+		result[id] = id[:prefixLen]
+	}
+
+	return result
+}
+
+func resolveDecisionID(ctx context.Context, dataStore store.DataStore, input string) (string, error) {
+	if dataStore == nil {
+		return "", fmt.Errorf("database not initialized")
+	}
+
+	decision, err := dataStore.GetDecisionByID(ctx, input)
+	if err != nil {
+		return "", fmt.Errorf("failed to get decision: %w", err)
+	}
+	if decision != nil {
+		return decision.ID, nil
+	}
+
+	decisions, err := dataStore.GetDecisions(ctx, store.DecisionFilter{Limit: 1000})
+	if err != nil {
+		return "", fmt.Errorf("failed to search decisions: %w", err)
+	}
+
+	matches := make([]string, 0, 4)
+	for _, decision := range decisions {
+		if strings.HasPrefix(decision.ID, input) {
+			matches = append(matches, decision.ID)
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return input, nil
+	case 1:
+		return matches[0], nil
+	default:
+		if len(matches) > 5 {
+			matches = append(matches[:5], fmt.Sprintf("...and %d more", len(matches)-5))
+		}
+		return "", fmt.Errorf("decision ID prefix %q is ambiguous; matches: %s", input, strings.Join(matches, ", "))
 	}
 }
 
@@ -302,11 +386,9 @@ func newTraderPauseCmd(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 
-			output.Info("Pausing trading daemon...")
-			output.Success("✓ Trading paused")
-			output.Dim("Analysis continues. Use 'trader trader resume' to resume trading.")
-
-			return nil
+			err := fmt.Errorf("persistent daemon pause/resume state is not implemented yet")
+			output.Error("%v", err)
+			return err
 		},
 	}
 }
@@ -318,10 +400,9 @@ func newTraderResumeCmd(app *App) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 
-			output.Info("Resuming trading daemon...")
-			output.Success("✓ Trading resumed")
-
-			return nil
+			err := fmt.Errorf("persistent daemon pause/resume state is not implemented yet")
+			output.Error("%v", err)
+			return err
 		},
 	}
 }
@@ -340,11 +421,11 @@ func newTraderDecisionsCmd(app *App) *cobra.Command {
 		Long: `List recent AI trading decisions with outcomes.
 
 Shows timestamp, symbol, action, confidence, execution status, and P&L for each decision.`,
-		Example: `  trader trader decisions list
-  trader trader decisions list --limit 20
-  trader trader decisions list --symbol RELIANCE
-  trader trader decisions list --executed
-  trader trader decisions list --days 7`,
+		Example: `  trader decisions list
+  trader decisions list --limit 20
+  trader decisions list --symbol RELIANCE
+  trader decisions list --executed
+  trader decisions list --days 7`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -395,6 +476,7 @@ Shows timestamp, symbol, action, confidence, execution status, and P&L for each 
 			output.Bold("Recent AI Decisions %s", output.SourceTag(SourceAI))
 			output.Println()
 
+			displayIDs := uniqueDecisionDisplayIDs(decisions)
 			table := NewTable(output, "ID", "Time", "Symbol", "Action", "Confidence", "Executed", "Outcome", "P&L")
 			for _, d := range decisions {
 				actionColor := ColorYellow
@@ -422,14 +504,8 @@ Shows timestamp, symbol, action, confidence, execution status, and P&L for each 
 					pnl = output.FormatPnL(d.PnL)
 				}
 
-				// Truncate ID for display
-				displayID := d.ID
-				if len(displayID) > 8 {
-					displayID = displayID[:8]
-				}
-
 				table.AddRow(
-					displayID,
+					displayIDs[d.ID],
 					FormatTime(d.Timestamp),
 					d.Symbol,
 					output.ColoredString(actionColor, d.Action),
@@ -442,7 +518,7 @@ Shows timestamp, symbol, action, confidence, execution status, and P&L for each 
 			table.Render()
 
 			output.Println()
-			output.Dim("Use 'trader trader decisions show <id>' for full details")
+			output.Dim("Use 'trader decisions show <id>' for full details; shown IDs are unique prefixes.")
 
 			return nil
 		},
@@ -473,9 +549,14 @@ Displays:
 			defer cancel()
 
 			decisionID := args[0]
+			resolvedID, err := resolveDecisionID(ctx, app.Store, decisionID)
+			if err != nil {
+				output.Error("%v", err)
+				return nil
+			}
 
 			// Get decision from store
-			decision, err := app.Store.GetDecisionByID(ctx, decisionID)
+			decision, err := app.Store.GetDecisionByID(ctx, resolvedID)
 			if err != nil {
 				output.Error("Failed to get decision: %v", err)
 				return err
@@ -484,9 +565,16 @@ Displays:
 				output.Error("Decision not found: %s", decisionID)
 				return nil
 			}
+			logs, err := app.Store.GetDecisionLogs(ctx, resolvedID)
+			if err != nil {
+				output.Warning("Failed to get decision logs: %v", err)
+			}
 
 			if output.IsJSON() {
-				return output.JSON(decision)
+				return output.JSON(map[string]interface{}{
+					"decision": decision,
+					"logs":     logs,
+				})
 			}
 
 			// Display decision header
@@ -627,6 +715,18 @@ Displays:
 			}
 			output.Println()
 
+			if len(logs) > 0 {
+				output.Bold("Decision Log")
+				for _, log := range logs {
+					output.Printf("  %s  %-18s %-12s %s\n",
+						FormatTime(log.Timestamp),
+						log.Stage,
+						log.Status,
+						log.Message)
+				}
+				output.Println()
+			}
+
 			// Reasoning
 			if decision.Reasoning != "" {
 				output.Bold("Reasoning")
@@ -650,9 +750,9 @@ Displays:
 - Average confidence score
 - Accuracy by agent
 - Performance by market condition`,
-		Example: `  trader trader decisions stats
-  trader trader decisions stats --days 30
-  trader trader decisions stats --days 7`,
+		Example: `  trader decisions stats
+  trader decisions stats --days 30
+  trader decisions stats --days 7`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -779,78 +879,84 @@ func newTraderHealthCmd(app *App) *cobra.Command {
 		Use:   "health",
 		Short: "System health diagnostics",
 		Long: `Display system health including:
-- Uptime and memory usage
-- API connection status
-- WebSocket health
-- Database status
-- Recent errors`,
+- Local runtime health
+- Configuration and database readiness
+- Broker and LLM client initialization
+- Active safety profile capabilities`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+
+			health := struct {
+				MemoryMB               uint64 `json:"memory_mb"`
+				Goroutines             int    `json:"goroutines"`
+				ConfigLoaded           bool   `json:"config_loaded"`
+				StoreReady             bool   `json:"store_ready"`
+				BrokerInitialized      bool   `json:"broker_initialized"`
+				BrokerAuthenticated    bool   `json:"broker_authenticated"`
+				LLMClientConfigured    bool   `json:"llm_client_configured"`
+				TradingMode            string `json:"trading_mode"`
+				SafetyProfile          string `json:"safety_profile"`
+				ProfileAutoTrade       bool   `json:"profile_auto_trade"`
+				ProfileLLMOrders       bool   `json:"profile_llm_orders"`
+				RuntimeStateTracked    bool   `json:"runtime_state_tracked"`
+				ExternalServicesProbed bool   `json:"external_services_probed"`
+			}{
+				MemoryMB:               mem.Alloc / 1024 / 1024,
+				Goroutines:             runtime.NumGoroutine(),
+				ConfigLoaded:           app.Config != nil,
+				StoreReady:             app.Store != nil,
+				BrokerInitialized:      app.Broker != nil,
+				LLMClientConfigured:    app.LLMClient != nil,
+				RuntimeStateTracked:    false,
+				ExternalServicesProbed: false,
+			}
+			if app.Config != nil {
+				health.TradingMode = app.Config.Trading.Mode
+				health.SafetyProfile = app.Config.SafetyProfile()
+				capabilities := app.Config.SafetyCapabilities()
+				health.ProfileAutoTrade = capabilities.AutoTrade
+				health.ProfileLLMOrders = capabilities.LLMOrderAuthority
+			}
+			if app.Broker != nil {
+				health.BrokerAuthenticated = app.Broker.IsAuthenticated()
+			}
+
+			if output.IsJSON() {
+				return output.JSON(health)
+			}
 
 			output.Bold("System Health")
 			output.Println()
 
-			// System metrics
 			output.Bold("System")
-			output.Printf("  Uptime:      %s\n", FormatDuration(2*time.Hour+30*time.Minute))
-			output.Printf("  Memory:      125 MB\n")
-			output.Printf("  Goroutines:  42\n")
-			output.Printf("  CPU:         2.5%%\n")
+			output.Printf("  Memory:     %d MB\n", health.MemoryMB)
+			output.Printf("  Goroutines: %d\n", health.Goroutines)
 			output.Println()
 
-			// Connections
-			output.Bold("Connections")
-			connections := []struct {
-				name    string
-				status  string
-				latency string
-			}{
-				{"Zerodha API", "OK", "45ms"},
-				{"WebSocket", "OK", "12ms"},
-				{"OpenAI API", "OK", "250ms"},
-				{"SQLite", "OK", "1ms"},
-			}
-
-			for _, c := range connections {
-				statusColor := ColorGreen
-				if c.status != "OK" {
-					statusColor = ColorRed
-				}
-				output.Printf("  %-15s %s (%s)\n", c.name, output.ColoredString(statusColor, c.status), c.latency)
-			}
+			output.Bold("Local Checks")
+			output.Printf("  Config Loaded        %s\n", formatPassStatus(output, health.ConfigLoaded))
+			output.Printf("  SQLite Store         %s\n", formatPassStatus(output, health.StoreReady))
+			output.Printf("  Broker Initialized   %s\n", formatPassStatus(output, health.BrokerInitialized))
+			output.Printf("  Broker Authenticated %s\n", formatPassStatus(output, health.BrokerAuthenticated))
+			output.Printf("  LLM Client           %s\n", formatPassStatus(output, health.LLMClientConfigured))
 			output.Println()
 
-			// Recent errors
-			output.Bold("Recent Errors")
-			output.Printf("  Last 24h: %s\n", output.Green("0 errors"))
+			output.Bold("Safety")
+			output.Printf("  Trading Mode:  %s\n", health.TradingMode)
+			output.Printf("  Safety Profile: %s\n", health.SafetyProfile)
+			output.Printf("  Auto Trading:  %s\n", formatBoolStatus(output, health.ProfileAutoTrade))
+			output.Printf("  LLM Orders:    %s\n", formatBoolStatus(output, health.ProfileLLMOrders))
 			output.Println()
 
-			// Health checks
-			output.Bold("Health Checks")
-			checks := []struct {
-				name   string
-				passed bool
-			}{
-				{"API Authentication", true},
-				{"Market Data Feed", true},
-				{"Order Execution", true},
-				{"Risk Limits", true},
-				{"Notification System", true},
-			}
-
-			for _, c := range checks {
-				status := output.Green("✓ PASS")
-				if !c.passed {
-					status = output.Red("✗ FAIL")
-				}
-				output.Printf("  %-20s %s\n", c.name, status)
-			}
+			output.Dim("External Zerodha/OpenAI/WebSocket connectivity is not probed by this local health command.")
+			output.Dim("Persistent daemon runtime state is not available yet.")
 
 			return nil
 		},
 	}
 }
-
 
 // getWatchlistSymbols retrieves symbols from the specified watchlist.
 func getWatchlistSymbols(app *App, watchlistName string) ([]string, error) {
@@ -876,6 +982,7 @@ func getWatchlistSymbols(app *App, watchlistName string) ([]string, error) {
 // createOrchestrator creates an orchestrator with all enabled agents.
 func createOrchestrator(app *App) *agents.Orchestrator {
 	var agentList []agents.Agent
+	decisionLLM := app.llmForTradeDecisions()
 
 	// Get agent weights from config
 	weights := app.Config.Agents.AgentWeights
@@ -897,7 +1004,7 @@ func createOrchestrator(app *App) *agents.Orchestrator {
 
 		switch agentName {
 		case "technical":
-			agentList = append(agentList, agents.NewTechnicalAgent(app.LLMClient, weight))
+			agentList = append(agentList, agents.NewTechnicalAgent(decisionLLM, weight))
 		case "research":
 			// WebSearchClient is optional - pass nil for now
 			agentList = append(agentList, agents.NewResearchAgent(app.LLMClient, nil, weight))
@@ -921,6 +1028,16 @@ func createOrchestrator(app *App) *agents.Orchestrator {
 	)
 }
 
+func (app *App) llmForTradeDecisions() agents.LLMClient {
+	if app == nil || app.Config == nil {
+		return nil
+	}
+	if !app.Config.SafetyCapabilities().LLMOrderAuthority {
+		return nil
+	}
+	return app.LLMClient
+}
+
 // processSymbol analyzes a symbol and returns a trading decision.
 func processSymbol(ctx context.Context, app *App, orchestrator *agents.Orchestrator, symbol string, dryRun bool) (*models.Decision, error) {
 	// Format symbol with exchange prefix for Zerodha API
@@ -933,15 +1050,15 @@ func processSymbol(ctx context.Context, app *App, orchestrator *agents.Orchestra
 	}
 
 	// Get historical data for analysis
-	candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+	candles, _, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 		Symbol:    symbol,
 		Exchange:  models.NSE,
 		Timeframe: "day",
 		From:      time.Now().AddDate(0, -3, 0),
 		To:        time.Now(),
-	})
+	}, 50, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get historical data: %w", err)
+		return nil, fmt.Errorf("failed to get usable historical data: %w", err)
 	}
 
 	// Build analysis request
@@ -957,6 +1074,13 @@ func processSymbol(ctx context.Context, app *App, orchestrator *agents.Orchestra
 	decision, err := orchestrator.ProcessSymbol(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("analysis failed: %w", err)
+	}
+	if !dryRun && !app.Config.SafetyCapabilities().AutoTrade {
+		decision.Executed = false
+		if decision.Reasoning != "" {
+			decision.Reasoning += " "
+		}
+		decision.Reasoning += "Safety profile blocks autonomous execution."
 	}
 
 	return decision, nil
@@ -1010,8 +1134,29 @@ func displayDecision(output *Output, decision *models.Decision, dryRun bool) {
 
 // executeDecision places an order based on the AI decision.
 func executeDecision(ctx context.Context, app *App, output *Output, decision *models.Decision) {
+	if err := app.checkAutoTrade(ctx); err != nil {
+		output.Error("   %v", err)
+		return
+	}
+	if err := app.validateSymbol(decision.Symbol); err != nil {
+		output.Error("   Invalid symbol: %v", err)
+		return
+	}
+	if err := app.validatePrice(decision.EntryPrice); err != nil {
+		output.Error("   Invalid entry price: %v", err)
+		return
+	}
+	if err := app.validatePrice(decision.StopLoss); err != nil {
+		output.Error("   Invalid stop loss: %v", err)
+		return
+	}
+
 	// Calculate position size based on config
 	positionSize := calculatePositionSize(app, decision)
+	if err := app.validateQuantity(positionSize); err != nil {
+		output.Error("   Invalid position size: %v", err)
+		return
+	}
 
 	// Determine order side
 	side := models.OrderSideBuy
@@ -1029,15 +1174,64 @@ func executeDecision(ctx context.Context, app *App, output *Output, decision *mo
 		Quantity: positionSize,
 		Price:    decision.EntryPrice,
 	}
+	order.Tag = broker.IntentOrderTag("decision:"+decision.ID, order)
+
+	target := 0.0
+	if len(decision.Targets) > 0 {
+		target = decision.Targets[0]
+	}
+	riskDecision, err := app.checkOrderRisk(ctx, order, decision.StopLoss, target)
+	if err != nil {
+		payload := map[string]interface{}{}
+		if riskDecision != nil {
+			payload["violations"] = riskDecision.Violations
+			payload["warnings"] = riskDecision.Warnings
+			payload["order_value"] = riskDecision.OrderValue
+			payload["projected_value"] = riskDecision.ProjectedValue
+			payload["risk_reward"] = riskDecision.RiskReward
+		}
+		app.logDecisionEvent(ctx, decision, models.DecisionStageExecutionBlocked, "RISK_REJECTED", err.Error(), payload)
+		output.Error("   %v", err)
+		return
+	}
+	if riskDecision != nil && riskDecision.RiskReward > 0 {
+		output.Dim("   Risk approved: R:R %.2f", riskDecision.RiskReward)
+	}
+	riskPayload := map[string]interface{}{}
+	if riskDecision != nil {
+		riskPayload["order_value"] = riskDecision.OrderValue
+		riskPayload["projected_value"] = riskDecision.ProjectedValue
+		riskPayload["risk_reward"] = riskDecision.RiskReward
+	}
+	app.logDecisionEvent(ctx, decision, models.DecisionStageRiskChecked, "APPROVED", "hard risk check approved", riskPayload)
+	app.logDecisionEvent(ctx, decision, models.DecisionStageOrderSubmitted, "SUBMITTED", "submitting entry order to broker", map[string]interface{}{
+		"symbol":   order.Symbol,
+		"side":     order.Side,
+		"type":     order.Type,
+		"product":  order.Product,
+		"quantity": order.Quantity,
+		"price":    order.Price,
+		"tag":      order.Tag,
+	})
 
 	// Place the order
 	result, err := app.Broker.PlaceOrder(ctx, order)
 	if err != nil {
+		app.logDecisionEvent(ctx, decision, models.DecisionStageOrderRejected, "BROKER_ERROR", err.Error(), map[string]interface{}{
+			"symbol":   order.Symbol,
+			"side":     order.Side,
+			"quantity": order.Quantity,
+			"price":    order.Price,
+		})
 		output.Error("   ❌ Order failed: %v", err)
 		return
 	}
 
 	output.Success("   ✓ Order placed: %s", result.OrderID)
+	app.logDecisionEvent(ctx, decision, models.DecisionStageOrderAccepted, result.Status, result.Message, map[string]interface{}{
+		"order_id": result.OrderID,
+		"status":   result.Status,
+	})
 
 	// Update decision with order ID
 	decision.OrderID = result.OrderID
@@ -1051,6 +1245,14 @@ func executeDecision(ctx context.Context, app *App, output *Output, decision *mo
 
 	// Place stop-loss order (GTT)
 	if decision.StopLoss > 0 {
+		if err := app.checkPlaceGTT(ctx); err != nil {
+			app.logDecisionEvent(ctx, decision, models.DecisionStageProtectiveOrder, "BLOCKED", err.Error(), map[string]interface{}{
+				"trigger_price": decision.StopLoss,
+				"quantity":      positionSize,
+			})
+			output.Dim("   Warning: Stop-loss GTT blocked: %v", err)
+			return
+		}
 		slSide := models.OrderSideSell
 		if decision.Action == "SELL" {
 			slSide = models.OrderSideBuy
@@ -1073,8 +1275,17 @@ func executeDecision(ctx context.Context, app *App, output *Output, decision *mo
 
 		gttResult, err := app.Broker.PlaceGTT(ctx, slOrder)
 		if err != nil {
+			app.logDecisionEvent(ctx, decision, models.DecisionStageProtectiveOrder, "FAILED", err.Error(), map[string]interface{}{
+				"trigger_price": decision.StopLoss,
+				"quantity":      positionSize,
+			})
 			output.Dim("   Warning: Failed to place SL order: %v", err)
 		} else {
+			app.logDecisionEvent(ctx, decision, models.DecisionStageProtectiveOrder, "PLACED", "stop-loss GTT placed", map[string]interface{}{
+				"trigger_id":    gttResult.TriggerID,
+				"trigger_price": decision.StopLoss,
+				"quantity":      positionSize,
+			})
 			output.Success("   ✓ Stop-loss GTT placed: %s", gttResult.TriggerID)
 		}
 	}

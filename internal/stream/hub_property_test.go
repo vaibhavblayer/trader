@@ -74,7 +74,6 @@ func TestProperty_AllSubscribersReceiveTicksWithinTimeout(t *testing.T) {
 				wg.Add(1)
 				go func(idx int, ch <-chan models.Tick) {
 					defer wg.Done()
-					timeout := time.After(5 * time.Second)
 					for {
 						select {
 						case _, ok := <-ch:
@@ -85,8 +84,6 @@ func TestProperty_AllSubscribersReceiveTicksWithinTimeout(t *testing.T) {
 							if atomic.LoadInt64(&receivedCounts[idx]) >= int64(tickCount) {
 								return
 							}
-						case <-timeout:
-							return
 						}
 					}
 				}(i, channels[i])
@@ -111,7 +108,8 @@ func TestProperty_AllSubscribersReceiveTicksWithinTimeout(t *testing.T) {
 				time.Sleep(1 * time.Millisecond) // Small delay between publishes
 			}
 
-			// Wait for all receivers to finish
+			waitForCounts(receivedCounts, int64(tickCount), 250*time.Millisecond)
+			hub.Stop()
 			wg.Wait()
 
 			// Verify all subscribers received all ticks
@@ -136,7 +134,6 @@ func TestProperty_AllSubscribersReceiveTicksWithinTimeout(t *testing.T) {
 
 	properties.TestingRun(t)
 }
-
 
 // TestProperty_SlowConsumersDoNotBlockOthers tests that slow consumers don't block fast ones.
 // This is part of Property 5 validation for Requirements 2.2, 2.6.
@@ -179,7 +176,6 @@ func TestProperty_SlowConsumersDoNotBlockOthers(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				timeout := time.After(2 * time.Second)
 				for {
 					select {
 					case _, ok := <-fastCh:
@@ -190,8 +186,6 @@ func TestProperty_SlowConsumersDoNotBlockOthers(t *testing.T) {
 						if atomic.LoadInt64(&fastReceived) >= 10 {
 							return
 						}
-					case <-timeout:
-						return
 					}
 				}
 			}()
@@ -209,6 +203,8 @@ func TestProperty_SlowConsumersDoNotBlockOthers(t *testing.T) {
 				hub.Publish(tick)
 			}
 
+			waitForCount(&fastReceived, 10, 100*time.Millisecond)
+			hub.Stop()
 			wg.Wait()
 
 			// Fast subscriber should have received at least some ticks
@@ -258,7 +254,7 @@ func TestProperty_ConsumersReceiveCorrectSymbolTicks(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				timeout := time.After(500 * time.Millisecond)
+				timeout := time.After(50 * time.Millisecond)
 				select {
 				case tick, ok := <-ch:
 					if ok {
@@ -299,4 +295,31 @@ func TestProperty_ConsumersReceiveCorrectSymbolTicks(t *testing.T) {
 	))
 
 	properties.TestingRun(t)
+}
+
+func waitForCounts(counts []int64, want int64, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		allDone := true
+		for i := range counts {
+			if atomic.LoadInt64(&counts[i]) < want {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForCount(count *int64, want int64, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(count) >= want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

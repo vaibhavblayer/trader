@@ -250,9 +250,9 @@ func newExamplesCmd(app *App) *cobra.Command {
 					title: "Options Trading",
 					commands: []string{
 						"trader options chain NIFTY      # View option chain",
-						"trader options greeks --symbol NIFTY --strike 19500 --type CE",
-						"trader options strategy build straddle --symbol NIFTY",
-						"trader options payoff           # View payoff diagram",
+						"trader options greeks --symbol NIFTY --spot 19600 --strike 19500 --type CE --expiry 2026-05-28 --iv 14.5",
+						"trader options strategy build straddle --symbol NIFTY --strike 19500 --call-premium 112.8 --put-premium 78.6",
+						"trader options payoff --symbol NIFTY --strike 19500 --call-premium 112.8 --put-premium 78.6",
 					},
 				},
 				{
@@ -275,18 +275,18 @@ func newExamplesCmd(app *App) *cobra.Command {
 				{
 					title: "Start Autonomous Trading",
 					commands: []string{
-						"trader trader config            # Review settings",
+						"trader config show              # Review settings",
 						"trader trader start --dry-run   # Test without trading",
 						"trader trader start             # Start trading",
 						"trader trader status            # Check status",
-						"trader trader decisions list    # View AI decisions",
+						"trader decisions list           # View AI decisions",
 					},
 				},
 				{
 					title: "Backtest a Strategy",
 					commands: []string{
-						"trader backtest --strategy momentum --symbol RELIANCE --days 365",
-						"trader backtest --strategy breakout --watchlist nifty50",
+						"trader backtest --strategy ema_crossover --symbol RELIANCE --days 365",
+						"trader backtest --strategy donchian_breakout --symbol SBIN --days 365",
 					},
 				},
 				{

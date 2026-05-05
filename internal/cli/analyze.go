@@ -4,6 +4,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"zerodha-trader/internal/agents"
+	techsetup "zerodha-trader/internal/analysis/setup"
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
 )
@@ -67,17 +69,18 @@ func newAnalyzeCmd(app *App) *cobra.Command {
 				days = 30
 			}
 
-			candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+			candles, report, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 				Symbol:    symbol,
 				Exchange:  models.Exchange(exchange),
 				Timeframe: timeframe,
 				From:      time.Now().AddDate(0, 0, -days),
 				To:        time.Now(),
-			})
+			}, 26, true)
 			if err != nil {
-				output.Error("Failed to get historical data: %v", err)
+				output.Error("Failed to get usable historical data: %v", err)
 				return err
 			}
+			logQualityWarnings(app, report)
 
 			if len(candles) < 26 {
 				output.Error("Insufficient data for analysis (need at least 26 candles)")
@@ -220,6 +223,17 @@ func newAnalyzeCmd(app *App) *cobra.Command {
 
 			// VWAP (simplified - use typical price * volume weighted)
 			vwap := ltp // Simplified
+			var deterministicSetup *techsetup.Setup
+			if len(candles) >= 60 {
+				setupConfig := techsetup.DefaultConfig()
+				setupConfig.AvoidFirstMinutes = 0
+				setupConfig.AvoidLastMinutes = 0
+				setupConfig.RequireMTFAlignment = false
+				deterministicSetup, _ = techsetup.NewEngine(setupConfig).Evaluate(ctx, techsetup.Request{
+					Symbol:  symbol,
+					Candles: candles,
+				})
+			}
 
 			analysis := AnalysisResult{
 				Symbol:    symbol,
@@ -270,6 +284,7 @@ func newAnalyzeCmd(app *App) *cobra.Command {
 					S2:                s2,
 				},
 				Patterns: detectPatterns(candles),
+				Setup:    deterministicSetup,
 			}
 
 			output.Println()
@@ -300,6 +315,7 @@ type AnalysisResult struct {
 	Volume     VolumeAnalysis
 	Levels     LevelAnalysis
 	Patterns   []PatternInfo
+	Setup      *techsetup.Setup
 }
 
 type TrendAnalysis struct {
@@ -362,6 +378,38 @@ func displayAnalysis(output *Output, a AnalysisResult, detailed bool) error {
 	output.Bold("%s Technical Analysis", a.Symbol)
 	output.Printf("  LTP: %s  Timeframe: %s\n", output.BoldText(FormatPrice(a.LTP)), a.Timeframe)
 	output.Println()
+
+	if a.Setup != nil {
+		output.Bold("Deterministic Setup %s", output.SourceTag(SourceCalc))
+		actionColor := ColorYellow
+		if a.Setup.Action == techsetup.ActionBuy {
+			actionColor = ColorGreen
+		} else if a.Setup.Action == techsetup.ActionSell {
+			actionColor = ColorRed
+		}
+		output.Printf("  Action: %s  Regime: %s  Confidence: %.0f%%\n",
+			output.ColoredString(actionColor, string(a.Setup.Action)), a.Setup.Regime, a.Setup.Confidence)
+		if a.Setup.Action != techsetup.ActionNoTrade {
+			output.Printf("  Entry: %s  SL: %s  R:R: %.2f\n",
+				FormatPrice(a.Setup.EntryPrice), FormatPrice(a.Setup.StopLoss), a.Setup.RiskReward)
+			if len(a.Setup.Targets) > 0 {
+				output.Printf("  Targets: %s\n", formatTargets(a.Setup.Targets))
+			}
+		}
+		if len(a.Setup.Invalidations) > 0 {
+			output.Printf("  Blocked by: %s\n", strings.Join(a.Setup.Invalidations, "; "))
+		}
+		if detailed {
+			for _, gate := range a.Setup.Gates {
+				marker := output.Green("PASS")
+				if !gate.Passed {
+					marker = output.Red("FAIL")
+				}
+				output.Printf("  %-16s %s %s\n", gate.Name, marker, gate.Reason)
+			}
+		}
+		output.Println()
+	}
 
 	// Trend - calculated from Zerodha data
 	trendColor := ColorGreen
@@ -464,6 +512,14 @@ func displayAnalysis(output *Output, a AnalysisResult, detailed bool) error {
 	return nil
 }
 
+func formatTargets(targets []float64) string {
+	parts := make([]string, 0, len(targets))
+	for _, target := range targets {
+		parts = append(parts, FormatPrice(target))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func newSignalCmd(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "signal <symbol>",
@@ -495,17 +551,18 @@ Includes recommendation: STRONG BUY, BUY, WEAK BUY, NEUTRAL, WEAK SELL, SELL, ST
 				days = 5
 			}
 
-			candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+			candles, report, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 				Symbol:    symbol,
 				Exchange:  models.Exchange(exchange),
 				Timeframe: timeframe,
 				From:      time.Now().AddDate(0, 0, -days),
 				To:        time.Now(),
-			})
+			}, 26, true)
 			if err != nil {
-				output.Error("Failed to get historical data: %v", err)
+				output.Error("Failed to get usable historical data: %v", err)
 				return err
 			}
+			logQualityWarnings(app, report)
 
 			if len(candles) < 26 {
 				output.Error("Insufficient data for signal calculation")
@@ -771,17 +828,18 @@ Shows trend alignment and confluence across timeframes.`,
 				from := time.Now().AddDate(0, 0, -tf.days)
 				to := time.Now()
 
-				candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
+				candles, report, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 					Symbol:    symbol,
 					Exchange:  models.Exchange(exchange),
 					Timeframe: tf.tf,
 					From:      from,
 					To:        to,
-				})
+				}, 20, true)
 				if err != nil {
-					output.Warning("Failed to get %s data: %v", tf.name, err)
+					output.Warning("Failed data quality for %s timeframe: %v", tf.name, err)
 					continue
 				}
+				logQualityWarnings(app, report)
 
 				if len(candles) < 20 {
 					output.Warning("Insufficient data for %s timeframe", tf.name)
@@ -1093,11 +1151,11 @@ PRESETS:
 			gapDown, _ := cmd.Flags().GetFloat64("gap-down")
 			watchlistName, _ := cmd.Flags().GetString("watchlist")
 			exchange, _ := cmd.Flags().GetString("exchange")
-			
+
 			// Scope flags
 			scanAll, _ := cmd.Flags().GetBool("all")
 			indexName, _ := cmd.Flags().GetString("index")
-			
+
 			// Price filters
 			minPrice, _ := cmd.Flags().GetFloat64("min-price")
 			maxPrice, _ := cmd.Flags().GetFloat64("max-price")
@@ -1106,12 +1164,12 @@ PRESETS:
 			largecap, _ := cmd.Flags().GetBool("largecap")
 			limit, _ := cmd.Flags().GetInt("limit")
 			sortBy, _ := cmd.Flags().GetString("sort")
-			
+
 			// Volatility filters
 			volatile, _ := cmd.Flags().GetBool("volatile")
 			minATR, _ := cmd.Flags().GetFloat64("min-atr")
 			minChange, _ := cmd.Flags().GetFloat64("min-change")
-			
+
 			gainers, _ := cmd.Flags().GetBool("gainers")
 			losers, _ := cmd.Flags().GetBool("losers")
 
@@ -1181,7 +1239,7 @@ PRESETS:
 					}
 				}
 			}
-			
+
 			// Apply --volatile flag (shortcut for volatile preset)
 			if volatile {
 				if minATR == 0 {
@@ -1221,7 +1279,7 @@ PRESETS:
 
 			// Get symbols to scan based on scope
 			var symbols []string
-			
+
 			if scanAll {
 				// Fetch all NSE equity instruments
 				output.Info("Fetching all NSE instruments...")
@@ -1230,7 +1288,7 @@ PRESETS:
 					output.Error("Failed to fetch instruments: %v", err)
 					return err
 				}
-				
+
 				// Filter for equity stocks only (EQ segment)
 				for _, inst := range instruments {
 					if inst.Segment == "NSE" && inst.InstrType == "EQ" {
@@ -1276,16 +1334,16 @@ PRESETS:
 
 			for _, symbol := range symbols {
 				scanned++
-				
+
 				// Show progress for large scans
 				if len(symbols) > 50 && scanned%50 == 0 {
 					elapsed := time.Since(startTime)
 					rate := float64(scanned) / elapsed.Seconds()
 					remaining := time.Duration(float64(len(symbols)-scanned)/rate) * time.Second
-					output.Printf("\r  Progress: %d/%d (%.0f/s) | Found: %d | ETA: %s    ", 
+					output.Printf("\r  Progress: %d/%d (%.0f/s) | Found: %d | ETA: %s    ",
 						scanned, len(symbols), rate, len(results), remaining.Round(time.Second))
 				}
-				
+
 				// Fetch historical data
 				candles, err := app.Broker.GetHistorical(ctx, broker.HistoricalRequest{
 					Symbol:    symbol,
@@ -1312,7 +1370,7 @@ PRESETS:
 				}
 
 				currentPrice := closes[len(closes)-1]
-				
+
 				// Apply price filters first (fast filter)
 				if minPrice > 0 && currentPrice < minPrice {
 					continue
@@ -1323,7 +1381,7 @@ PRESETS:
 
 				// Calculate indicators
 				rsi := calculateRSI(closes, 14)
-				
+
 				// Volume ratio
 				avgVolume := int64(0)
 				if len(volumes) >= 20 {
@@ -1352,14 +1410,14 @@ PRESETS:
 						gap = ((currOpen - prevClose) / prevClose) * 100
 					}
 				}
-				
+
 				// Calculate ATR (14-period) as percentage of price
 				atr := calculateATR(highs, lows, closes, 14)
 				atrPct := 0.0
 				if currentPrice > 0 {
 					atrPct = (atr / currentPrice) * 100
 				}
-				
+
 				// Calculate today's range as percentage
 				dayRange := 0.0
 				if len(candles) > 0 {
@@ -1385,7 +1443,7 @@ PRESETS:
 				if gapDown > 0 && gap > -gapDown {
 					continue
 				}
-				
+
 				// Apply volatility filters
 				if minATR > 0 && atrPct < minATR {
 					continue
@@ -1393,7 +1451,7 @@ PRESETS:
 				if minChange > 0 && (change < minChange && change > -minChange) {
 					continue
 				}
-				
+
 				// Apply gainers/losers filter
 				if gainers && change <= 0 {
 					continue
@@ -1425,14 +1483,14 @@ PRESETS:
 					Signal:   signal,
 				})
 			}
-			
+
 			// Clear progress line
 			if len(symbols) > 50 {
 				output.Printf("\r                                                                    \r")
-				output.Printf("  Scanned %d stocks in %s, found %d matches\n\n", 
+				output.Printf("  Scanned %d stocks in %s, found %d matches\n\n",
 					scanned, time.Since(startTime).Round(time.Second), len(results))
 			}
-			
+
 			// Sort results
 			switch sortBy {
 			case "price":
@@ -1457,7 +1515,7 @@ PRESETS:
 					return results[i].ATRPct > results[j].ATRPct
 				})
 			}
-			
+
 			// Limit results
 			if limit > 0 && len(results) > limit {
 				results = results[:limit]
@@ -1478,27 +1536,27 @@ PRESETS:
 	cmd.Flags().Float64("volume-above", 0, "Volume multiple above average")
 	cmd.Flags().Float64("gap-up", 0, "Gap up percentage")
 	cmd.Flags().Float64("gap-down", 0, "Gap down percentage")
-	
+
 	// Volatility filters (for day trading)
 	cmd.Flags().Bool("volatile", false, "Show volatile stocks (ATR > 2%)")
 	cmd.Flags().Float64("min-atr", 0, "Minimum ATR percentage (volatility filter)")
 	cmd.Flags().Float64("min-change", 0, "Minimum absolute change percentage")
-	
+
 	// Price filters
 	cmd.Flags().Float64("min-price", 0, "Minimum stock price")
 	cmd.Flags().Float64("max-price", 0, "Maximum stock price")
 	cmd.Flags().Bool("penny", false, "Show penny stocks (< ₹50)")
 	cmd.Flags().Bool("midcap", false, "Show mid-cap stocks (₹100-₹500)")
 	cmd.Flags().Bool("largecap", false, "Show large-cap stocks (> ₹500)")
-	
+
 	// Change filters
 	cmd.Flags().Bool("gainers", false, "Show only gainers (positive change)")
 	cmd.Flags().Bool("losers", false, "Show only losers (negative change)")
-	
+
 	// Output options
 	cmd.Flags().Int("limit", 0, "Limit number of results")
 	cmd.Flags().String("sort", "", "Sort by: price, change, rsi, volume, atr")
-	
+
 	// Scope options
 	cmd.Flags().Bool("all", false, "Scan ALL NSE equity stocks (takes time)")
 	cmd.Flags().String("index", "", "Scan index constituents (nifty50, nifty100, nifty200)")
@@ -1707,14 +1765,14 @@ func getIndexConstituents(indexName string) []string {
 }
 
 type ScanResult struct {
-	Symbol    string
-	LTP       float64
-	Change    float64
-	RSI       float64
-	Volume    float64
-	ATRPct    float64 // ATR as percentage of price (volatility measure)
-	DayRange  float64 // Today's high-low range as percentage
-	Signal    string
+	Symbol   string
+	LTP      float64
+	Change   float64
+	RSI      float64
+	Volume   float64
+	ATRPct   float64 // ATR as percentage of price (volatility measure)
+	DayRange float64 // Today's high-low range as percentage
+	Signal   string
 }
 
 func displayScanResults(output *Output, results []ScanResult) error {
@@ -1730,7 +1788,7 @@ func displayScanResults(output *Output, results []ScanResult) error {
 		} else if r.ATRPct < 1.5 {
 			atrColor = ColorRed // Low volatility
 		}
-		
+
 		table.AddRow(
 			r.Symbol,
 			FormatPrice(r.LTP),
@@ -2110,10 +2168,10 @@ func parseAIInsights(response string) ([]string, []string) {
 
 		if content == "" || content == line {
 			// Skip lines that aren't bullet points
-			if !strings.HasPrefix(strings.TrimSpace(line), "-") && 
-			   !strings.HasPrefix(strings.TrimSpace(line), "•") &&
-			   !strings.HasPrefix(strings.TrimSpace(line), "*") &&
-			   !(len(line) > 2 && line[0] >= '1' && line[0] <= '9') {
+			if !strings.HasPrefix(strings.TrimSpace(line), "-") &&
+				!strings.HasPrefix(strings.TrimSpace(line), "•") &&
+				!strings.HasPrefix(strings.TrimSpace(line), "*") &&
+				!(len(line) > 2 && line[0] >= '1' && line[0] <= '9') {
 				continue
 			}
 		}
@@ -2223,31 +2281,12 @@ func calculateBollingerBands(closes []float64, period int, stdDev float64) (uppe
 
 	middle = calculateSMA(closes, period)
 
-	// Calculate standard deviation
 	sum := 0.0
 	for i := len(closes) - period; i < len(closes); i++ {
 		diff := closes[i] - middle
 		sum += diff * diff
 	}
-	sd := 0.0
-	if period > 0 {
-		sd = sum / float64(period)
-		if sd > 0 {
-			sd = sd // sqrt would be needed but we'll use variance for simplicity
-		}
-	}
-	// Simplified: use range-based approximation
-	high := closes[len(closes)-1]
-	low := closes[len(closes)-1]
-	for i := len(closes) - period; i < len(closes); i++ {
-		if closes[i] > high {
-			high = closes[i]
-		}
-		if closes[i] < low {
-			low = closes[i]
-		}
-	}
-	bandWidth := (high - low) / 2
+	bandWidth := stdDev * math.Sqrt(sum/float64(period))
 
 	upper = middle + bandWidth
 	lower = middle - bandWidth

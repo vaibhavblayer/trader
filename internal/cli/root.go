@@ -2,9 +2,11 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -14,7 +16,9 @@ import (
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/config"
 	"zerodha-trader/internal/logging"
+	"zerodha-trader/internal/security"
 	"zerodha-trader/internal/store"
+	"zerodha-trader/internal/trading"
 )
 
 // Version information
@@ -31,14 +35,38 @@ type App struct {
 	Ticker    broker.Ticker
 	Store     store.DataStore
 	LLMClient agents.LLMClient
+	Access    *security.AccessController
+	Validator *security.InputValidator
+	Risk      *trading.RiskManager
 }
 
 // NewRootCmd creates the root command for the CLI.
 // Requirements: 21.1-21.13
 func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 	app := &App{
-		Config: cfg,
-		Logger: logger,
+		Config:    cfg,
+		Logger:    logger,
+		Access:    newAccessController(cfg, logger),
+		Validator: security.NewInputValidator(cfg.Security.StrictValidation),
+		Risk:      trading.NewRiskManager(cfg.Risk),
+	}
+
+	// Initialize SQLite store before broker setup so paper trading can restore durable state.
+	configDir := cfg.ConfigDir
+	if configDir == "" {
+		configDir = config.DefaultConfigDir()
+	}
+	dbPath := filepath.Join(configDir, "trader.db")
+	dataStore, err := store.NewSQLiteStore(dbPath)
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to initialize store, some features may be unavailable")
+	} else {
+		app.Store = dataStore
+		logger.Debug().Msg("SQLite store initialized")
+	}
+	var paperLedger broker.PaperLedger
+	if dataStore != nil {
+		paperLedger = dataStore
 	}
 
 	// Initialize broker if credentials are available
@@ -48,8 +76,31 @@ func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 			APISecret: cfg.Credentials.Zerodha.APISecret,
 			UserID:    cfg.Credentials.Zerodha.UserID,
 		})
-		app.Broker = zerodhaBroker
 		logger.Debug().Msg("Zerodha broker initialized")
+		if cfg.IsPaperMode() {
+			app.Broker = broker.NewPaperBroker(broker.PaperBrokerConfig{
+				DataBroker: zerodhaBroker,
+				FillModel: broker.PaperFillModel{
+					SlippageRate:        cfg.Risk.MaxSlippage / 100,
+					AllowPartialFills:   true,
+					MaxFillDepthPercent: 25,
+				},
+				Ledger: paperLedger,
+			})
+			logger.Debug().Msg("Paper broker initialized with Zerodha market data")
+		} else {
+			app.Broker = zerodhaBroker
+		}
+		app.Broker = broker.NewSafeBroker(app.Broker)
+		caps := cfg.SafetyCapabilities()
+		app.Broker = broker.NewPolicyBroker(app.Broker, broker.ExecutionPolicy{
+			Profile:     cfg.SafetyProfile(),
+			AllowOrders: caps.BrokerOrders,
+			AllowGTT:    caps.BrokerGTT,
+			AllowModify: caps.BrokerOrders,
+			AllowCancel: caps.BrokerOrders,
+		})
+		logger.Debug().Msg("Safe broker execution wrapper enabled")
 
 		// Initialize ticker if broker is authenticated
 		if zerodhaBroker.IsAuthenticated() {
@@ -61,16 +112,6 @@ func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 				logger.Debug().Msg("Zerodha ticker initialized")
 			}
 		}
-	}
-
-	// Initialize SQLite store
-	dbPath := config.DefaultConfigDir() + "/trader.db"
-	dataStore, err := store.NewSQLiteStore(dbPath)
-	if err != nil {
-		logger.Warn().Err(err).Msg("Failed to initialize store, some features may be unavailable")
-	} else {
-		app.Store = dataStore
-		logger.Debug().Msg("SQLite store initialized")
 	}
 
 	// Initialize LLM client if OpenAI API key is available
@@ -241,17 +282,17 @@ func newConfigCmd(app *App) *cobra.Command {
 					"notifications": app.Config.Notifications,
 					"security":      app.Config.Security,
 					"agents": map[string]interface{}{
-						"model":                    app.Config.Agents.Model,
-						"reasoning_effort":          app.Config.Agents.ReasoningEffort,
-						"autonomous_mode":           app.Config.Agents.AutonomousMode,
-						"auto_execute_threshold":    app.Config.Agents.AutoExecuteThreshold,
-						"max_daily_trades":          app.Config.Agents.MaxDailyTrades,
-						"max_daily_loss":            app.Config.Agents.MaxDailyLoss,
-						"max_position_size":         app.Config.Agents.MaxPositionSize,
-						"cooldown_minutes":          app.Config.Agents.CooldownMinutes,
-						"consecutive_loss_limit":    app.Config.Agents.ConsecutiveLossLimit,
-						"enabled_agents":            app.Config.Agents.EnabledAgents,
-						"agent_weights":             app.Config.Agents.AgentWeights,
+						"model":                  app.Config.Agents.Model,
+						"reasoning_effort":       app.Config.Agents.ReasoningEffort,
+						"autonomous_mode":        app.Config.Agents.AutonomousMode,
+						"auto_execute_threshold": app.Config.Agents.AutoExecuteThreshold,
+						"max_daily_trades":       app.Config.Agents.MaxDailyTrades,
+						"max_daily_loss":         app.Config.Agents.MaxDailyLoss,
+						"max_position_size":      app.Config.Agents.MaxPositionSize,
+						"cooldown_minutes":       app.Config.Agents.CooldownMinutes,
+						"consecutive_loss_limit": app.Config.Agents.ConsecutiveLossLimit,
+						"enabled_agents":         app.Config.Agents.EnabledAgents,
+						"agent_weights":          app.Config.Agents.AgentWeights,
 					},
 					"credentials": map[string]interface{}{
 						"zerodha_configured": app.Config.Credentials.Zerodha.APIKey != "",
@@ -324,6 +365,7 @@ Supported keys:
   model              AI model name (e.g., gpt-5.4-mini, gpt-4o, gpt-5.2)
   reasoning          Reasoning effort for reasoning models (low, medium, high, off)
   mode               Trading mode (paper, live)
+  safety-profile     Safety profile (backtest, paper, live-readonly, live-trading)
   autonomous         Autonomous mode (MANUAL, NOTIFY_ONLY, SEMI_AUTO, FULL_AUTO)
   threshold          Auto-execute confidence threshold (0-100)
   max-trades         Maximum daily trades
@@ -334,6 +376,7 @@ Supported keys:
 		Example: `  trader config set model gpt-5.4-mini
   trader config set reasoning high
   trader config set mode paper
+  trader config set safety-profile live-readonly
   trader config set autonomous NOTIFY_ONLY
   trader config set threshold 85
   trader config set max-trades 15
@@ -341,6 +384,10 @@ Supported keys:
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			if err := app.checkModifyConfig(context.Background()); err != nil {
+				output.Error("%v", err)
+				return err
+			}
 			key := args[0]
 			value := args[1]
 
@@ -388,8 +435,46 @@ Supported keys:
 					output.Error("Failed to update mode: %v", err)
 					return err
 				}
+				profile := config.SafetyProfilePaper
+				if value == "live" {
+					profile = config.SafetyProfileLiveReadOnly
+				}
+				if err := updateConfigToml(configDir, "trading", "safety_profile", profile); err != nil {
+					output.Error("Failed to update safety profile: %v", err)
+					return err
+				}
 				app.Config.Trading.Mode = value
+				app.Config.Trading.SafetyProfile = profile
 				output.Success("✓ Trading mode set to: %s", value)
+				output.Dim("Safety profile set to: %s", profile)
+
+			case "safety-profile":
+				validProfiles := map[string]bool{
+					config.SafetyProfileBacktest:     true,
+					config.SafetyProfilePaper:        true,
+					config.SafetyProfileLiveReadOnly: true,
+					config.SafetyProfileLiveTrading:  true,
+				}
+				if !validProfiles[value] {
+					output.Error("Invalid safety profile: %s", value)
+					output.Println("  Valid: backtest, paper, live-readonly, live-trading")
+					return fmt.Errorf("invalid safety profile")
+				}
+				if value == config.SafetyProfilePaper && app.Config.Trading.Mode == "live" {
+					output.Error("Safety profile paper requires trading mode paper")
+					return fmt.Errorf("invalid safety profile for mode")
+				}
+				if (value == config.SafetyProfileLiveReadOnly || value == config.SafetyProfileLiveTrading) && app.Config.Trading.Mode != "live" {
+					output.Error("Safety profile %s requires trading mode live", value)
+					return fmt.Errorf("invalid safety profile for mode")
+				}
+				if err := updateConfigToml(configDir, "trading", "safety_profile", value); err != nil {
+					output.Error("Failed to update safety profile: %v", err)
+					return err
+				}
+				app.Config.Trading.SafetyProfile = value
+				output.Success("✓ Safety profile set to: %s", value)
+				output.Dim("Restart any running daemon for changes to take effect")
 
 			case "autonomous":
 				validModes := map[string]bool{"MANUAL": true, "NOTIFY_ONLY": true, "SEMI_AUTO": true, "FULL_AUTO": true}
@@ -617,6 +702,7 @@ func isNumericValue(s string) bool {
 func showConfig(output *Output, cfg *config.Config) error {
 	output.Bold("Trading Configuration")
 	output.Printf("  Mode:            %s\n", cfg.Trading.Mode)
+	output.Printf("  Safety Profile:  %s\n", cfg.SafetyProfile())
 	output.Printf("  Default Product: %s\n", cfg.Trading.DefaultProduct)
 	output.Printf("  Default Exchange: %s\n", cfg.Trading.DefaultExchange)
 	output.Println()
