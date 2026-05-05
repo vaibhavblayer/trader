@@ -30,6 +30,14 @@ func TestSQLiteDaemonStateRoundTrip(t *testing.T) {
 		Symbols:               []string{"RELIANCE", "INFY"},
 		DryRun:                true,
 		IntervalSeconds:       30,
+		PaperSoakEnabled:      true,
+		PaperSoakOnly:         true,
+		PaperSoakInterval:     time.Hour,
+		PaperSoakSymbol:       "HDFCBANK",
+		PaperSoakDryRun:       true,
+		LastPaperSoakRunAt:    now.Add(-time.Hour),
+		NextPaperSoakRunAt:    now.Add(time.Hour),
+		LastPaperSoakSummary:  "candidates=1",
 		Mode:                  "FULL_AUTO",
 		SafetyProfile:         "paper",
 		Paused:                true,
@@ -55,6 +63,9 @@ func TestSQLiteDaemonStateRoundTrip(t *testing.T) {
 	}
 	if len(got.Symbols) != 2 || got.Symbols[0] != "RELIANCE" || got.Symbols[1] != "INFY" {
 		t.Fatalf("symbols not restored: %#v", got.Symbols)
+	}
+	if !got.PaperSoakEnabled || !got.PaperSoakOnly || got.PaperSoakInterval != time.Hour || got.PaperSoakSymbol != "HDFCBANK" {
+		t.Fatalf("paper soak state not restored: %#v", got)
 	}
 }
 

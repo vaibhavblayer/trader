@@ -36,6 +36,29 @@ type paperSoakRunReport struct {
 	Readiness          *models.AutonomyReadinessReport `json:"readiness,omitempty"`
 }
 
+type paperSoakRunOptions struct {
+	Symbol            string
+	Strategy          string
+	Status            string
+	Exchange          models.Exchange
+	Limit             int
+	CandidateDays     int
+	MinCandles        int
+	RegimeWindow      int
+	TimeWindow        time.Duration
+	EvaluateDays      int
+	EvalTimeframe     string
+	ReviewDays        int
+	ApplyReview       bool
+	DryRun            bool
+	IncludeReadiness  bool
+	ReadinessDays     int
+	MinDecisive       int
+	MinReviewedTrades int
+	MinWinRate        float64
+	MinExpectancy     float64
+}
+
 func newPaperSoakRunCmd(app *App) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "soak-run",
@@ -109,37 +132,89 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 	if err != nil {
 		return fmt.Errorf("invalid window %q: %w", windowFlag, err)
 	}
-	symbol = strings.ToUpper(strings.TrimSpace(symbol))
-	normalizedStrategy := trading.NormalizeStrategyName(strategy)
+	report, err := executePaperSoakRun(ctx, app, paperSoakRunOptions{
+		Symbol:            symbol,
+		Strategy:          strategy,
+		Status:            status,
+		Exchange:          models.Exchange(strings.ToUpper(strings.TrimSpace(exchangeFlag))),
+		Limit:             limit,
+		CandidateDays:     candidateDays,
+		MinCandles:        minCandles,
+		RegimeWindow:      regimeWindow,
+		TimeWindow:        timeWindow,
+		EvaluateDays:      evaluateDays,
+		EvalTimeframe:     evalTimeframe,
+		ReviewDays:        reviewDays,
+		ApplyReview:       applyReview,
+		DryRun:            dryRun,
+		IncludeReadiness:  includeReadiness,
+		ReadinessDays:     readinessDays,
+		MinDecisive:       minDecisive,
+		MinReviewedTrades: minReviewedTrades,
+		MinWinRate:        minWinRate,
+		MinExpectancy:     minExpectancy,
+	})
+	if err != nil {
+		return err
+	}
 
+	if output.IsJSON() {
+		return output.JSON(report)
+	}
+	displayPaperSoakRunReport(output, report)
+	return nil
+}
+
+func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions) (paperSoakRunReport, error) {
+	if app == nil || app.Store == nil {
+		return paperSoakRunReport{}, fmt.Errorf("paper store is not available")
+	}
+	if app.Broker == nil {
+		return paperSoakRunReport{}, fmt.Errorf("broker not configured")
+	}
+	if opts.Exchange == "" {
+		opts.Exchange = models.NSE
+	}
+	if opts.Status == "" {
+		opts.Status = models.PaperCandidateStatusActive
+	}
+	if opts.Limit <= 0 {
+		opts.Limit = 100
+	}
+	if opts.TimeWindow <= 0 {
+		opts.TimeWindow = 24 * time.Hour
+	}
+
+	symbol := strings.ToUpper(strings.TrimSpace(opts.Symbol))
+	normalizedStrategy := trading.NormalizeStrategyName(opts.Strategy)
 	report := paperSoakRunReport{
 		GeneratedAt: time.Now(),
 		Symbol:      symbol,
 		Strategy:    normalizedStrategy,
-		DryRun:      dryRun,
-		ApplyReview: applyReview && !dryRun,
+		DryRun:      opts.DryRun,
+		ApplyReview: opts.ApplyReview && !opts.DryRun,
 	}
 
 	evaluationFilter := store.PaperPredictionFilter{
 		Symbol: symbol,
-		Limit:  limit,
+		Limit:  opts.Limit,
 	}
 	evaluated := false
 	evaluationFilter.Evaluated = &evaluated
-	if evaluateDays > 0 {
-		evaluationFilter.StartDate = time.Now().AddDate(0, 0, -evaluateDays)
+	if opts.EvaluateDays > 0 {
+		evaluationFilter.StartDate = time.Now().AddDate(0, 0, -opts.EvaluateDays)
 		evaluationFilter.EndDate = time.Now()
 	}
 	openPredictions, err := app.Store.GetPaperPredictions(ctx, evaluationFilter)
 	if err != nil {
-		return err
+		return report, err
 	}
 	report.OpenPredictions = len(openPredictions)
 	report.Evaluations = evaluatePaperPredictions(ctx, app, openPredictions, paperEvaluationOptions{
-		Exchange:      models.Exchange(strings.ToUpper(strings.TrimSpace(exchangeFlag))),
-		EvalTimeframe: evalTimeframe,
+		Exchange:      opts.Exchange,
+		EvalTimeframe: opts.EvalTimeframe,
 		Now:           time.Now(),
-		DryRun:        dryRun,
+		DryRun:        opts.DryRun,
 	})
 	report.OutcomesEvaluated = countPaperEvaluationStatus(report.Evaluations, "EVALUATED")
 	report.Errors += countPaperEvaluationStatus(report.Evaluations, "ERROR")
@@ -147,19 +222,19 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 	candidates, err := app.Store.GetPaperCandidates(ctx, models.PaperCandidateFilter{
 		Symbol:   symbol,
 		Strategy: normalizedStrategy,
-		Status:   strings.ToUpper(strings.TrimSpace(status)),
-		Limit:    limit,
+		Status:   strings.ToUpper(strings.TrimSpace(opts.Status)),
+		Limit:    opts.Limit,
 	})
 	if err != nil {
-		return err
+		return report, err
 	}
 	report.CandidatesLoaded = len(candidates)
 	report.CandidateRun = runPaperCandidates(ctx, app, candidates, candidateRunOptions{
-		Days:         candidateDays,
-		MinCandles:   minCandles,
-		RegimeWindow: regimeWindow,
-		TimeWindow:   timeWindow,
-		DryRun:       dryRun,
+		Days:         opts.CandidateDays,
+		MinCandles:   opts.MinCandles,
+		RegimeWindow: opts.RegimeWindow,
+		TimeWindow:   opts.TimeWindow,
+		DryRun:       opts.DryRun,
 	})
 	report.CandidatesChecked = len(report.CandidateRun)
 	report.PredictionsCreated = countCandidateRunStatus(report.CandidateRun, "PREDICTED")
@@ -169,40 +244,35 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 	report.Errors += countCandidateRunStatus(report.CandidateRun, "ERROR")
 
 	report.CandidateReview, err = reviewPaperCandidates(ctx, app.Store, candidates, paperCandidateReviewOptions{
-		Days:  reviewDays,
-		Apply: applyReview && !dryRun,
+		Days:  opts.ReviewDays,
+		Apply: opts.ApplyReview && !opts.DryRun,
 	})
 	if err != nil {
-		return err
+		return report, err
 	}
 	report.CandidatesPaused = countCandidateReviewAction(report.CandidateReview, "PAUSE")
 	report.CandidatesReady = countCandidateReviewAction(report.CandidateReview, "READY")
 
-	if includeReadiness {
+	if opts.IncludeReadiness {
 		readiness, err := buildAutonomyReadinessReport(ctx, app, autonomyReadinessOptions{
-			Days:               readinessDays,
+			Days:               opts.ReadinessDays,
 			Symbol:             symbol,
 			Phase:              autonomyPhasePaperSoak,
-			MinDecisive:        minDecisive,
-			MinReviewedTrades:  minReviewedTrades,
-			MinWinRate:         minWinRate,
-			MinExpectancy:      minExpectancy,
+			MinDecisive:        opts.MinDecisive,
+			MinReviewedTrades:  opts.MinReviewedTrades,
+			MinWinRate:         opts.MinWinRate,
+			MinExpectancy:      opts.MinExpectancy,
 			MaxSlippageBp:      50,
 			MaxRejectionRate:   10,
 			MaxMissingLinkRate: 20,
 		})
 		if err != nil {
-			return err
+			return report, err
 		}
 		report.Readiness = readiness
 		report.ReadinessDecision = string(readiness.Decision)
 	}
-
-	if output.IsJSON() {
-		return output.JSON(report)
-	}
-	displayPaperSoakRunReport(output, report)
-	return nil
+	return report, nil
 }
 
 func countCandidateRunStatus(results []candidateRunResult, status string) int {

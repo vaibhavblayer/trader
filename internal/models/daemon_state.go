@@ -25,6 +25,15 @@ type DaemonState struct {
 	Symbols               []string
 	DryRun                bool
 	IntervalSeconds       int
+	PaperSoakEnabled      bool
+	PaperSoakOnly         bool
+	PaperSoakInterval     time.Duration
+	PaperSoakSymbol       string
+	PaperSoakStrategy     string
+	PaperSoakDryRun       bool
+	LastPaperSoakRunAt    time.Time
+	NextPaperSoakRunAt    time.Time
+	LastPaperSoakSummary  string
 	Mode                  string
 	SafetyProfile         string
 	StopRequested         bool

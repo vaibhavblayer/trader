@@ -90,6 +90,43 @@ The daemon will:
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			watchlist, _ := cmd.Flags().GetString("watchlist")
 			interval, _ := cmd.Flags().GetInt("interval")
+			paperSoak, _ := cmd.Flags().GetBool("paper-soak")
+			paperSoakOnly, _ := cmd.Flags().GetBool("paper-soak-only")
+			soakIntervalFlag, _ := cmd.Flags().GetString("soak-interval")
+			soakSymbol, _ := cmd.Flags().GetString("soak-symbol")
+			soakStrategy, _ := cmd.Flags().GetString("soak-strategy")
+			soakWindowFlag, _ := cmd.Flags().GetString("soak-window")
+			soakDryRun, _ := cmd.Flags().GetBool("soak-dry-run")
+			soakApplyReview, _ := cmd.Flags().GetBool("soak-apply-review")
+			soakLimit, _ := cmd.Flags().GetInt("soak-limit")
+			if paperSoakOnly {
+				paperSoak = true
+			}
+			soakInterval, err := time.ParseDuration(soakIntervalFlag)
+			if err != nil {
+				return fmt.Errorf("invalid soak-interval %q: %w", soakIntervalFlag, err)
+			}
+			if soakInterval <= 0 {
+				soakInterval = time.Hour
+			}
+			soakWindow, err := time.ParseDuration(soakWindowFlag)
+			if err != nil {
+				return fmt.Errorf("invalid soak-window %q: %w", soakWindowFlag, err)
+			}
+			if soakWindow <= 0 {
+				soakWindow = 24 * time.Hour
+			}
+			soakOpts := daemonPaperSoakOptions{
+				Enabled:     paperSoak,
+				Only:        paperSoakOnly,
+				Interval:    soakInterval,
+				Symbol:      strings.ToUpper(strings.TrimSpace(soakSymbol)),
+				Strategy:    soakStrategy,
+				Window:      soakWindow,
+				DryRun:      soakDryRun,
+				ApplyReview: soakApplyReview,
+				Limit:       soakLimit,
+			}
 			controlCtx, controlCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer controlCancel()
 
@@ -147,6 +184,15 @@ The daemon will:
 			if watchlist != "" {
 				output.Printf("  Watchlist:        %s\n", watchlist)
 			}
+			if paperSoak {
+				output.Printf("  Paper Soak:       every %s\n", soakInterval)
+				if paperSoakOnly {
+					output.Printf("  Daemon Mode:      paper-soak-only\n")
+				}
+				if soakOpts.Symbol != "" {
+					output.Printf("  Soak Symbol:      %s\n", soakOpts.Symbol)
+				}
+			}
 			output.Println()
 
 			if dryRun {
@@ -163,13 +209,18 @@ The daemon will:
 				output.Println()
 			}
 
-			// Get watchlist symbols
-			symbols, err := getWatchlistSymbols(app, watchlist)
-			if err != nil {
-				output.Error("Failed to get watchlist: %v", err)
-				return err
+			// Get watchlist symbols unless this daemon is only running paper soak cycles.
+			var symbols []string
+			if !paperSoakOnly {
+				symbols, err = getWatchlistSymbols(app, watchlist)
+				if err != nil {
+					output.Error("Failed to get watchlist: %v", err)
+					return err
+				}
+				output.Printf("  Monitoring %d symbols\n", len(symbols))
+			} else {
+				output.Printf("  Monitoring paper candidates only\n")
 			}
-			output.Printf("  Monitoring %d symbols\n", len(symbols))
 			output.Println()
 
 			// Start the daemon
@@ -177,20 +228,27 @@ The daemon will:
 			defer cancel()
 			startedAt := time.Now()
 			runtimeState := &models.DaemonState{
-				ID:              defaultDaemonStateID,
-				Status:          models.DaemonStatusRunning,
-				PID:             os.Getpid(),
-				Hostname:        daemonHostname(),
-				StartedAt:       startedAt,
-				UpdatedAt:       startedAt,
-				LastHeartbeatAt: startedAt,
-				Watchlist:       watchlist,
-				Symbols:         symbols,
-				DryRun:          dryRun,
-				IntervalSeconds: interval,
-				Mode:            app.Config.Agents.AutonomousMode,
-				SafetyProfile:   app.Config.SafetyProfile(),
-				Message:         "daemon started",
+				ID:                 defaultDaemonStateID,
+				Status:             models.DaemonStatusRunning,
+				PID:                os.Getpid(),
+				Hostname:           daemonHostname(),
+				StartedAt:          startedAt,
+				UpdatedAt:          startedAt,
+				LastHeartbeatAt:    startedAt,
+				Watchlist:          watchlist,
+				Symbols:            symbols,
+				DryRun:             dryRun,
+				IntervalSeconds:    interval,
+				PaperSoakEnabled:   paperSoak,
+				PaperSoakOnly:      paperSoakOnly,
+				PaperSoakInterval:  soakInterval,
+				PaperSoakSymbol:    soakOpts.Symbol,
+				PaperSoakStrategy:  soakStrategy,
+				PaperSoakDryRun:    soakDryRun,
+				NextPaperSoakRunAt: nextPaperSoakRunAt(paperSoak, startedAt),
+				Mode:               app.Config.Agents.AutonomousMode,
+				SafetyProfile:      app.Config.SafetyProfile(),
+				Message:            "daemon started",
 			}
 			if err := saveDaemonStateWithEvent(ctx, app, runtimeState, "START", "daemon started"); err != nil {
 				output.Error("Failed to persist daemon state: %v", err)
@@ -198,8 +256,11 @@ The daemon will:
 			}
 			defer markDaemonStopped(context.Background(), app, "daemon process exited")
 
-			// Create orchestrator with agents
-			orchestrator := createOrchestrator(app)
+			// Create orchestrator with agents unless running a paper-soak-only daemon.
+			var orchestrator *agents.Orchestrator
+			if !paperSoakOnly {
+				orchestrator = createOrchestrator(app)
+			}
 
 			// Handle graceful shutdown
 			sigChan := make(chan os.Signal, 1)
@@ -212,9 +273,11 @@ The daemon will:
 				cancel()
 			}()
 
-			if err := orchestrator.Start(ctx); err != nil {
-				output.Error("Failed to start orchestrator: %v", err)
-				return err
+			if orchestrator != nil {
+				if err := orchestrator.Start(ctx); err != nil {
+					output.Error("Failed to start orchestrator: %v", err)
+					return err
+				}
 			}
 
 			output.Success("✓ Daemon started")
@@ -252,6 +315,17 @@ The daemon will:
 						continue
 					}
 					lastControlMessage = ""
+					if paperSoak && duePaperSoakRun(runtimeState, time.Now()) {
+						if err := runScheduledPaperSoakCycle(ctx, app, output, runtimeState, soakOpts); err != nil {
+							output.Warning("Paper soak run failed: %v", err)
+							runtimeState.LastPaperSoakSummary = "error: " + err.Error()
+							runtimeState.NextPaperSoakRunAt = time.Now().Add(soakOpts.Interval)
+							_ = saveDaemonStateWithEvent(ctx, app, runtimeState, "PAPER_SOAK_ERROR", runtimeState.LastPaperSoakSummary)
+						}
+					}
+					if paperSoakOnly {
+						continue
+					}
 					scanCount++
 					output.Dim("[%s] Scan #%d - Analyzing %d symbols...",
 						time.Now().Format("15:04:05"), scanCount, len(symbols))
@@ -284,8 +358,104 @@ The daemon will:
 	cmd.Flags().Bool("dry-run", false, "Run without executing trades")
 	cmd.Flags().String("watchlist", "default", "Watchlist to monitor")
 	cmd.Flags().Int("interval", 60, "Scan interval in seconds")
+	cmd.Flags().Bool("paper-soak", false, "Schedule candidate-aware paper soak cycles inside the daemon")
+	cmd.Flags().Bool("paper-soak-only", false, "Run only scheduled paper soak cycles, without the legacy analysis/trading loop")
+	cmd.Flags().String("soak-interval", "1h", "Scheduled paper soak interval")
+	cmd.Flags().String("soak-symbol", "", "Filter scheduled paper soak to one symbol")
+	cmd.Flags().String("soak-strategy", "", "Filter scheduled paper soak to one strategy")
+	cmd.Flags().String("soak-window", "24h", "Paper prediction evaluation window for scheduled soak runs")
+	cmd.Flags().Bool("soak-dry-run", false, "Run scheduled paper soak without saving predictions, outcomes, or review changes")
+	cmd.Flags().Bool("soak-apply-review", false, "Apply candidate PAUSED status during scheduled review")
+	cmd.Flags().Int("soak-limit", 100, "Maximum candidates and predictions per scheduled soak run")
 
 	return cmd
+}
+
+type daemonPaperSoakOptions struct {
+	Enabled     bool
+	Only        bool
+	Interval    time.Duration
+	Symbol      string
+	Strategy    string
+	Window      time.Duration
+	DryRun      bool
+	ApplyReview bool
+	Limit       int
+}
+
+func nextPaperSoakRunAt(enabled bool, now time.Time) time.Time {
+	if !enabled {
+		return time.Time{}
+	}
+	return now
+}
+
+func duePaperSoakRun(state *models.DaemonState, now time.Time) bool {
+	if state == nil || !state.PaperSoakEnabled {
+		return false
+	}
+	return state.NextPaperSoakRunAt.IsZero() || !now.Before(state.NextPaperSoakRunAt)
+}
+
+func runScheduledPaperSoakCycle(ctx context.Context, app *App, output *Output, state *models.DaemonState, opts daemonPaperSoakOptions) error {
+	if state == nil {
+		return fmt.Errorf("daemon state is required")
+	}
+	if opts.Interval <= 0 {
+		opts.Interval = time.Hour
+	}
+	if opts.Window <= 0 {
+		opts.Window = 24 * time.Hour
+	}
+	if opts.Limit <= 0 {
+		opts.Limit = 100
+	}
+
+	output.Dim("[%s] Paper soak run starting...", time.Now().Format("15:04:05"))
+	runCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	report, err := executePaperSoakRun(runCtx, app, paperSoakRunOptions{
+		Symbol:            opts.Symbol,
+		Strategy:          opts.Strategy,
+		Status:            models.PaperCandidateStatusActive,
+		Exchange:          models.NSE,
+		Limit:             opts.Limit,
+		CandidateDays:     120,
+		MinCandles:        80,
+		RegimeWindow:      50,
+		TimeWindow:        opts.Window,
+		EvaluateDays:      30,
+		ReviewDays:        90,
+		ApplyReview:       opts.ApplyReview,
+		DryRun:            opts.DryRun,
+		IncludeReadiness:  true,
+		ReadinessDays:     30,
+		MinDecisive:       20,
+		MinReviewedTrades: 0,
+		MinWinRate:        50,
+		MinExpectancy:     0,
+	})
+	now := time.Now()
+	state.LastPaperSoakRunAt = now
+	state.NextPaperSoakRunAt = now.Add(opts.Interval)
+	if err != nil {
+		return err
+	}
+	state.LastPaperSoakSummary = fmt.Sprintf(
+		"candidates=%d predictions=%d outcomes=%d paused=%d ready=%d readiness=%s",
+		report.CandidatesChecked,
+		report.PredictionsCreated,
+		report.OutcomesEvaluated,
+		report.CandidatesPaused,
+		report.CandidatesReady,
+		report.ReadinessDecision,
+	)
+	state.Message = "paper soak run completed: " + state.LastPaperSoakSummary
+	if err := saveDaemonStateWithEvent(ctx, app, state, "PAPER_SOAK_RUN", state.LastPaperSoakSummary); err != nil {
+		return err
+	}
+	output.Success("Paper soak run complete: %s", state.LastPaperSoakSummary)
+	return nil
 }
 
 func newTraderStopCmd(app *App) *cobra.Command {
@@ -343,6 +513,7 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 				return err
 			}
 
+			heartbeatFresh := daemonHeartbeatFresh(state) && state.Status != models.DaemonStatusStopped
 			status := struct {
 				Tracked              bool                `json:"tracked"`
 				Runtime              *models.DaemonState `json:"runtime"`
@@ -359,7 +530,7 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 			}{
 				Tracked:              true,
 				Runtime:              state,
-				HeartbeatFresh:       daemonHeartbeatFresh(state),
+				HeartbeatFresh:       heartbeatFresh,
 				Mode:                 app.Config.Agents.AutonomousMode,
 				SafetyProfile:        app.Config.SafetyProfile(),
 				AutoTradeAllowed:     app.Config.SafetyCapabilities().AutoTrade,
@@ -395,6 +566,26 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 			output.Printf("  Safety Profile: %s\n", status.SafetyProfile)
 			output.Printf("  Profile Auto Trading: %s\n", formatBoolStatus(output, status.AutoTradeAllowed))
 			output.Printf("  Profile LLM Orders:   %s\n", formatBoolStatus(output, status.LLMOrderAuthority))
+			if state.PaperSoakEnabled {
+				output.Printf("  Paper Soak:     enabled")
+				if state.PaperSoakOnly {
+					output.Printf(" (only)")
+				}
+				output.Println()
+				output.Printf("  Soak Interval:  %s\n", state.PaperSoakInterval)
+				if state.PaperSoakSymbol != "" {
+					output.Printf("  Soak Symbol:    %s\n", state.PaperSoakSymbol)
+				}
+				if !state.LastPaperSoakRunAt.IsZero() {
+					output.Printf("  Last Soak:      %s\n", FormatDateTime(state.LastPaperSoakRunAt))
+				}
+				if !state.NextPaperSoakRunAt.IsZero() {
+					output.Printf("  Next Soak:      %s\n", FormatDateTime(state.NextPaperSoakRunAt))
+				}
+				if state.LastPaperSoakSummary != "" {
+					output.Printf("  Soak Summary:   %s\n", state.LastPaperSoakSummary)
+				}
+			}
 			output.Println()
 
 			output.Bold("Configured Limits")
