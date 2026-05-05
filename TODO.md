@@ -18,6 +18,8 @@ None.
 
 ## Done
 
+- [x] Persistent paper prediction tracker history and accuracy restore for live paper mode.
+- [x] Persistent paper broker ledger for orders, GTTs, positions, balances, and paper execution events.
 - [x] LLM role reduction: explanation, summarization, news classification, and review only; no direct live order authority.
 - [x] Separate safety profiles for backtest, paper, live-readonly, and live-trading.
 - [x] Data quality gates for stale candles, missing candles, bad volume, market session mismatch, and symbol/token mismatch.

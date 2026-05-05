@@ -12,6 +12,7 @@ import (
 
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
+	"zerodha-trader/internal/store"
 )
 
 // addPaperCommands adds paper trading commands.
@@ -172,7 +173,11 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 			output.Println()
 
 			// Initialize tracker
-			tracker := NewPaperTracker()
+			tracker, err := NewPersistentPaperTracker(ctx, app.Store)
+			if err != nil {
+				output.Warning("Failed to load paper prediction history: %v", err)
+				tracker = NewPaperTracker()
+			}
 
 			// Track latest ticks
 			latestTicks := make(map[string]models.Tick)
@@ -506,7 +511,84 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 
 	cmd.AddCommand(newPaperLedgerCmd(app))
 	cmd.AddCommand(newPaperStateCmd(app))
+	cmd.AddCommand(newPaperPredictionsCmd(app))
 
+	return cmd
+}
+
+func newPaperPredictionsCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "predictions",
+		Short: "Show persistent paper prediction history",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if app.Store == nil {
+				output.Warning("Paper prediction store is not available")
+				return nil
+			}
+
+			limit, _ := cmd.Flags().GetInt("limit")
+			activeOnly, _ := cmd.Flags().GetBool("active")
+			symbol, _ := cmd.Flags().GetString("symbol")
+			filter := store.PaperPredictionFilter{
+				Symbol: strings.ToUpper(strings.TrimSpace(symbol)),
+				Limit:  limit,
+			}
+			if activeOnly {
+				evaluated := false
+				filter.Evaluated = &evaluated
+			}
+
+			predictions, err := app.Store.GetPaperPredictions(ctx, filter)
+			if err != nil {
+				output.Error("Failed to get paper predictions: %v", err)
+				return err
+			}
+			if output.IsJSON() {
+				return output.JSON(predictions)
+			}
+			if len(predictions) == 0 {
+				output.Info("No paper predictions found")
+				return nil
+			}
+
+			output.Bold("Paper Predictions")
+			output.Println()
+			table := NewTable(output, "Time", "Symbol", "Action", "Conf", "Entry", "Exit", "Outcome", "P&L")
+			for _, prediction := range predictions {
+				exit := "-"
+				if prediction.Evaluated {
+					exit = FormatPrice(prediction.ExitPrice)
+				}
+				outcome := prediction.Outcome
+				if outcome == "" {
+					outcome = "ACTIVE"
+				}
+				pnl := "-"
+				if prediction.Evaluated {
+					pnl = FormatPercent(prediction.PnLPercent)
+				}
+				table.AddRow(
+					FormatDateTime(prediction.CreatedAt),
+					prediction.Symbol,
+					prediction.Action,
+					FormatConfidence(prediction.Confidence),
+					FormatPrice(prediction.EntryPrice),
+					exit,
+					outcome,
+					pnl,
+				)
+			}
+			table.Render()
+			return nil
+		},
+	}
+	cmd.Flags().Int("limit", 20, "Maximum predictions to show")
+	cmd.Flags().Bool("active", false, "Show only active predictions")
+	cmd.Flags().String("symbol", "", "Filter by symbol")
 	return cmd
 }
 

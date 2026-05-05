@@ -36,6 +36,10 @@ type DataStore interface {
 	GetDecisionStats(ctx context.Context, dateRange DateRange) (*models.AIStats, error)
 	UpdateDecisionOutcome(ctx context.Context, id string, outcome models.DecisionOutcome, pnl float64) error
 
+	// Paper prediction tracking
+	SavePaperPrediction(ctx context.Context, prediction *models.PaperPrediction) error
+	GetPaperPredictions(ctx context.Context, filter PaperPredictionFilter) ([]models.PaperPrediction, error)
+
 	// Watchlist
 	AddToWatchlist(ctx context.Context, symbol, listName string) error
 	RemoveFromWatchlist(ctx context.Context, symbol, listName string) error
@@ -100,6 +104,13 @@ type DecisionFilter struct {
 	EndDate   time.Time
 	Executed  *bool
 	Outcome   string
+	Limit     int
+}
+
+// PaperPredictionFilter represents filters for querying paper predictions.
+type PaperPredictionFilter struct {
+	Symbol    string
+	Evaluated *bool
 	Limit     int
 }
 

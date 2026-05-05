@@ -2,31 +2,17 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
+
+	"zerodha-trader/internal/models"
+	"zerodha-trader/internal/store"
 )
 
-// Prediction represents an AI prediction for tracking.
-type Prediction struct {
-	ID          string
-	Symbol      string
-	Action      string // BUY, SELL
-	Confidence  float64
-	EntryPrice  float64
-	TargetPrice float64
-	StopLoss    float64
-	TimeWindow  time.Duration
-	CreatedAt   time.Time
-	ExpiresAt   time.Time
-	Reasoning   string
-
-	// Outcome tracking
-	Evaluated  bool
-	ExitPrice  float64
-	Outcome    string // RIGHT, WRONG, EXPIRED
-	PnLPercent float64
-}
+type Prediction = models.PaperPrediction
+type PaperStats = models.PaperPredictionStats
 
 // PaperTracker tracks AI predictions without executing trades.
 type PaperTracker struct {
@@ -34,6 +20,7 @@ type PaperTracker struct {
 	predictions map[string]*Prediction
 	history     []*Prediction
 	stats       PaperStats
+	store       store.DataStore
 }
 
 // GetRecentHistory returns the last N evaluated predictions for context.
@@ -55,19 +42,6 @@ func (pt *PaperTracker) GetRecentHistory(n int) []*Prediction {
 	return result
 }
 
-// PaperStats holds prediction accuracy statistics.
-type PaperStats struct {
-	TotalPredictions   int
-	RightPredictions   int
-	WrongPredictions   int
-	ExpiredPredictions int
-	WinRate            float64
-	AvgConfidence      float64
-	AvgPnLPercent      float64
-	BestPrediction     float64
-	WorstPrediction    float64
-}
-
 // NewPaperTracker creates a new paper trading tracker.
 func NewPaperTracker() *PaperTracker {
 	return &PaperTracker{
@@ -76,15 +50,47 @@ func NewPaperTracker() *PaperTracker {
 	}
 }
 
+func NewPersistentPaperTracker(ctx context.Context, dataStore store.DataStore) (*PaperTracker, error) {
+	tracker := NewPaperTracker()
+	tracker.store = dataStore
+	if dataStore == nil {
+		return tracker, nil
+	}
+
+	predictions, err := dataStore.GetPaperPredictions(ctx, store.PaperPredictionFilter{Limit: 1000})
+	if err != nil {
+		return nil, err
+	}
+	for i := range predictions {
+		prediction := predictions[i]
+		if prediction.Evaluated {
+			tracker.history = append(tracker.history, &prediction)
+		} else {
+			tracker.predictions[prediction.ID] = &prediction
+		}
+	}
+	tracker.recalculateStatsLocked()
+	return tracker, nil
+}
+
 // AddPrediction adds a new prediction to track.
 func (pt *PaperTracker) AddPrediction(p *Prediction) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	p.ID = fmt.Sprintf("%s-%d", p.Symbol, time.Now().UnixNano())
+	if p.ID == "" {
+		p.ID = fmt.Sprintf("%s-%d", p.Symbol, time.Now().UnixNano())
+	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = time.Now()
+	}
+	if p.ExpiresAt.IsZero() && p.TimeWindow > 0 {
+		p.ExpiresAt = p.CreatedAt.Add(p.TimeWindow)
+	}
 	pt.predictions[p.ID] = p
 	pt.stats.TotalPredictions++
 	pt.stats.AvgConfidence = ((pt.stats.AvgConfidence * float64(pt.stats.TotalPredictions-1)) + p.Confidence) / float64(pt.stats.TotalPredictions)
+	pt.savePredictionLocked(p)
 }
 
 // EvaluatePrediction evaluates a prediction against current price.
@@ -159,6 +165,7 @@ func (pt *PaperTracker) EvaluatePrediction(id string, currentPrice float64) *Pre
 		if decisiveCount > 0 {
 			pt.stats.WinRate = float64(pt.stats.RightPredictions) / float64(decisiveCount) * 100
 		}
+		pt.savePredictionLocked(p)
 	}
 
 	return p
@@ -235,8 +242,58 @@ func (pt *PaperTracker) CheckExpiredPredictions(prices map[string]float64) []*Pr
 			if decisiveCount > 0 {
 				pt.stats.WinRate = float64(pt.stats.RightPredictions) / float64(decisiveCount) * 100
 			}
+			pt.savePredictionLocked(p)
 		}
 	}
 
 	return expired
+}
+
+func (pt *PaperTracker) savePredictionLocked(prediction *Prediction) {
+	if pt.store == nil || prediction == nil {
+		return
+	}
+	_ = pt.store.SavePaperPrediction(context.Background(), prediction)
+}
+
+func (pt *PaperTracker) recalculateStatsLocked() {
+	var stats PaperStats
+	var confidenceSum float64
+	var pnlSum float64
+	var evaluated int
+
+	stats.TotalPredictions = len(pt.predictions) + len(pt.history)
+	for _, prediction := range pt.predictions {
+		confidenceSum += prediction.Confidence
+	}
+	for _, prediction := range pt.history {
+		confidenceSum += prediction.Confidence
+		switch prediction.Outcome {
+		case "RIGHT":
+			stats.RightPredictions++
+		case "WRONG":
+			stats.WrongPredictions++
+		case "EXPIRED":
+			stats.ExpiredPredictions++
+		}
+		pnlSum += prediction.PnLPercent
+		evaluated++
+		if prediction.PnLPercent > stats.BestPrediction {
+			stats.BestPrediction = prediction.PnLPercent
+		}
+		if prediction.PnLPercent < stats.WorstPrediction {
+			stats.WorstPrediction = prediction.PnLPercent
+		}
+	}
+	if stats.TotalPredictions > 0 {
+		stats.AvgConfidence = confidenceSum / float64(stats.TotalPredictions)
+	}
+	if evaluated > 0 {
+		stats.AvgPnLPercent = pnlSum / float64(evaluated)
+	}
+	decisiveCount := stats.RightPredictions + stats.WrongPredictions
+	if decisiveCount > 0 {
+		stats.WinRate = float64(stats.RightPredictions) / float64(decisiveCount) * 100
+	}
+	pt.stats = stats
 }

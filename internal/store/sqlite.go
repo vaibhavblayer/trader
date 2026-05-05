@@ -262,6 +262,26 @@ func (s *SQLiteStore) initSchema() error {
 		payload TEXT
 	);
 
+	-- Paper prediction tracker
+	CREATE TABLE IF NOT EXISTS paper_predictions (
+		id TEXT PRIMARY KEY,
+		symbol TEXT NOT NULL,
+		action TEXT NOT NULL,
+		confidence REAL NOT NULL,
+		entry_price REAL NOT NULL,
+		target_price REAL NOT NULL,
+		stop_loss REAL NOT NULL,
+		time_window_ns INTEGER NOT NULL,
+		created_at DATETIME NOT NULL,
+		expires_at DATETIME NOT NULL,
+		reasoning TEXT,
+		evaluated INTEGER DEFAULT 0,
+		exit_price REAL,
+		outcome TEXT,
+		pnl_percent REAL,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	-- Sync status table
 	CREATE TABLE IF NOT EXISTS sync_status (
 		data_type TEXT PRIMARY KEY,
@@ -287,6 +307,9 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_watchlist_list ON watchlist(list_name);
 	CREATE INDEX IF NOT EXISTS idx_paper_ledger_timestamp ON paper_ledger(timestamp);
 	CREATE INDEX IF NOT EXISTS idx_paper_ledger_ref ON paper_ledger(ref_id);
+	CREATE INDEX IF NOT EXISTS idx_paper_predictions_symbol ON paper_predictions(symbol);
+	CREATE INDEX IF NOT EXISTS idx_paper_predictions_created ON paper_predictions(created_at);
+	CREATE INDEX IF NOT EXISTS idx_paper_predictions_evaluated ON paper_predictions(evaluated);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -1044,7 +1067,7 @@ func (s *SQLiteStore) GetPaperLedger(ctx context.Context, limit int) ([]broker.P
 	}
 	defer rows.Close()
 
-	var events []broker.PaperLedgerEvent
+	events := make([]broker.PaperLedgerEvent, 0)
 	for rows.Next() {
 		var event broker.PaperLedgerEvent
 		var payloadJSON string
@@ -1059,6 +1082,117 @@ func (s *SQLiteStore) GetPaperLedger(ctx context.Context, limit int) ([]broker.P
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+// SavePaperPrediction inserts or updates a paper prediction.
+func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *models.PaperPrediction) error {
+	if prediction == nil {
+		return fmt.Errorf("paper prediction is required")
+	}
+	if strings.TrimSpace(prediction.ID) == "" {
+		return fmt.Errorf("paper prediction ID is required")
+	}
+
+	evaluated := 0
+	if prediction.Evaluated {
+		evaluated = 1
+	}
+
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO paper_predictions (
+			id, symbol, action, confidence, entry_price, target_price, stop_loss,
+			time_window_ns, created_at, expires_at, reasoning, evaluated,
+			exit_price, outcome, pnl_percent, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			symbol = excluded.symbol,
+			action = excluded.action,
+			confidence = excluded.confidence,
+			entry_price = excluded.entry_price,
+			target_price = excluded.target_price,
+			stop_loss = excluded.stop_loss,
+			time_window_ns = excluded.time_window_ns,
+			created_at = excluded.created_at,
+			expires_at = excluded.expires_at,
+			reasoning = excluded.reasoning,
+			evaluated = excluded.evaluated,
+			exit_price = excluded.exit_price,
+			outcome = excluded.outcome,
+			pnl_percent = excluded.pnl_percent,
+			updated_at = excluded.updated_at
+	`, prediction.ID, prediction.Symbol, prediction.Action, prediction.Confidence, prediction.EntryPrice,
+		prediction.TargetPrice, prediction.StopLoss, prediction.TimeWindow.Nanoseconds(),
+		prediction.CreatedAt, prediction.ExpiresAt, prediction.Reasoning, evaluated,
+		prediction.ExitPrice, prediction.Outcome, prediction.PnLPercent, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to save paper prediction: %w", err)
+	}
+	return nil
+}
+
+// GetPaperPredictions returns stored paper predictions.
+func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredictionFilter) ([]models.PaperPrediction, error) {
+	query := `
+		SELECT id, symbol, action, confidence, entry_price, target_price, stop_loss,
+			time_window_ns, created_at, expires_at, COALESCE(reasoning, ''), evaluated,
+			COALESCE(exit_price, 0), COALESCE(outcome, ''), COALESCE(pnl_percent, 0)
+		FROM paper_predictions WHERE 1=1
+	`
+	args := []interface{}{}
+	if filter.Symbol != "" {
+		query += " AND symbol = ?"
+		args = append(args, filter.Symbol)
+	}
+	if filter.Evaluated != nil {
+		evaluated := 0
+		if *filter.Evaluated {
+			evaluated = 1
+		}
+		query += " AND evaluated = ?"
+		args = append(args, evaluated)
+	}
+	query += " ORDER BY created_at DESC"
+	if filter.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, filter.Limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query paper predictions: %w", err)
+	}
+	defer rows.Close()
+
+	predictions := make([]models.PaperPrediction, 0)
+	for rows.Next() {
+		var prediction models.PaperPrediction
+		var timeWindowNS int64
+		var evaluated int
+		if err := rows.Scan(
+			&prediction.ID,
+			&prediction.Symbol,
+			&prediction.Action,
+			&prediction.Confidence,
+			&prediction.EntryPrice,
+			&prediction.TargetPrice,
+			&prediction.StopLoss,
+			&timeWindowNS,
+			&prediction.CreatedAt,
+			&prediction.ExpiresAt,
+			&prediction.Reasoning,
+			&evaluated,
+			&prediction.ExitPrice,
+			&prediction.Outcome,
+			&prediction.PnLPercent,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan paper prediction: %w", err)
+		}
+		prediction.TimeWindow = time.Duration(timeWindowNS)
+		prediction.Evaluated = evaluated == 1
+		predictions = append(predictions, prediction)
+	}
+	return predictions, rows.Err()
 }
 
 // UpdateDecisionOutcome updates the outcome and P&L of a decision.
