@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1144,6 +1145,14 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 		query += " AND symbol = ?"
 		args = append(args, filter.Symbol)
 	}
+	if !filter.StartDate.IsZero() {
+		query += " AND created_at >= ?"
+		args = append(args, filter.StartDate)
+	}
+	if !filter.EndDate.IsZero() {
+		query += " AND created_at <= ?"
+		args = append(args, filter.EndDate)
+	}
 	if filter.Evaluated != nil {
 		evaluated := 0
 		if *filter.Evaluated {
@@ -1193,6 +1202,195 @@ func (s *SQLiteStore) GetPaperPredictions(ctx context.Context, filter PaperPredi
 		predictions = append(predictions, prediction)
 	}
 	return predictions, rows.Err()
+}
+
+// GetPaperPredictionReport returns calibration and expectancy stats for paper predictions.
+func (s *SQLiteStore) GetPaperPredictionReport(ctx context.Context, filter PaperPredictionFilter) (*models.PaperPredictionReport, error) {
+	predictions, err := s.GetPaperPredictions(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+
+	report := &models.PaperPredictionReport{
+		GeneratedAt: time.Now(),
+		StartDate:   filter.StartDate,
+		EndDate:     filter.EndDate,
+		Symbol:      filter.Symbol,
+	}
+
+	overall := newPaperPredictionAccumulator("overall")
+	bySymbol := make(map[string]*paperPredictionAccumulator)
+	byAction := make(map[string]*paperPredictionAccumulator)
+	byConfidence := make(map[string]*paperPredictionAccumulator)
+
+	for _, prediction := range predictions {
+		overall.add(prediction)
+		paperPredictionGroup(bySymbol, prediction.Symbol).add(prediction)
+		paperPredictionGroup(byAction, prediction.Action).add(prediction)
+		paperPredictionGroup(byConfidence, confidenceBucket(prediction.Confidence)).add(prediction)
+	}
+
+	overallStats := overall.stats()
+	report.TotalPredictions = overallStats.TotalPredictions
+	report.ActivePredictions = overallStats.ActivePredictions
+	report.Evaluated = overallStats.Evaluated
+	report.Decisive = overallStats.Decisive
+	report.RightPredictions = overallStats.RightPredictions
+	report.WrongPredictions = overallStats.WrongPredictions
+	report.ExpiredPredictions = overallStats.ExpiredPredictions
+	report.WinRate = overallStats.WinRate
+	report.AvgConfidence = overallStats.AvgConfidence
+	report.AvgPnLPercent = overallStats.AvgPnLPercent
+	report.Expectancy = overallStats.Expectancy
+	report.BestPrediction = overallStats.BestPrediction
+	report.WorstPrediction = overallStats.WorstPrediction
+	report.ExpiredRate = overallStats.ExpiredRate
+
+	report.BySymbol = paperPredictionStatsSlice(bySymbol)
+	report.ByAction = paperPredictionStatsSlice(byAction)
+	report.ByConfidence = paperPredictionConfidenceStatsSlice(byConfidence)
+	for _, bucket := range report.ByConfidence {
+		if bucket.Decisive >= 5 && bucket.AvgConfidence-bucket.WinRate >= 15 {
+			report.Overconfidence = append(report.Overconfidence, models.CalibrationWarning{
+				Bucket:        bucket.Key,
+				AvgConfidence: bucket.AvgConfidence,
+				WinRate:       bucket.WinRate,
+				Gap:           bucket.AvgConfidence - bucket.WinRate,
+				SampleSize:    bucket.Decisive,
+			})
+		}
+	}
+
+	return report, nil
+}
+
+type paperPredictionAccumulator struct {
+	key            string
+	total          int
+	active         int
+	evaluated      int
+	right          int
+	wrong          int
+	expired        int
+	confidenceSum  float64
+	pnlSum         float64
+	decisivePnLSum float64
+	best           float64
+	worst          float64
+	seenPnL        bool
+}
+
+func newPaperPredictionAccumulator(key string) *paperPredictionAccumulator {
+	return &paperPredictionAccumulator{key: key}
+}
+
+func paperPredictionGroup(groups map[string]*paperPredictionAccumulator, key string) *paperPredictionAccumulator {
+	if key == "" {
+		key = "UNKNOWN"
+	}
+	group, ok := groups[key]
+	if !ok {
+		group = newPaperPredictionAccumulator(key)
+		groups[key] = group
+	}
+	return group
+}
+
+func (a *paperPredictionAccumulator) add(prediction models.PaperPrediction) {
+	a.total++
+	a.confidenceSum += prediction.Confidence
+	if !prediction.Evaluated {
+		a.active++
+		return
+	}
+
+	a.evaluated++
+	a.pnlSum += prediction.PnLPercent
+	if !a.seenPnL || prediction.PnLPercent > a.best {
+		a.best = prediction.PnLPercent
+	}
+	if !a.seenPnL || prediction.PnLPercent < a.worst {
+		a.worst = prediction.PnLPercent
+	}
+	a.seenPnL = true
+
+	switch prediction.Outcome {
+	case "RIGHT":
+		a.right++
+		a.decisivePnLSum += prediction.PnLPercent
+	case "WRONG":
+		a.wrong++
+		a.decisivePnLSum += prediction.PnLPercent
+	case "EXPIRED":
+		a.expired++
+	}
+}
+
+func (a *paperPredictionAccumulator) stats() models.PaperPredictionGroupStats {
+	stats := models.PaperPredictionGroupStats{
+		Key:                a.key,
+		TotalPredictions:   a.total,
+		ActivePredictions:  a.active,
+		Evaluated:          a.evaluated,
+		RightPredictions:   a.right,
+		WrongPredictions:   a.wrong,
+		ExpiredPredictions: a.expired,
+	}
+	stats.Decisive = stats.RightPredictions + stats.WrongPredictions
+	if a.total > 0 {
+		stats.AvgConfidence = a.confidenceSum / float64(a.total)
+	}
+	if stats.Evaluated > 0 {
+		stats.AvgPnLPercent = a.pnlSum / float64(stats.Evaluated)
+		stats.ExpiredRate = float64(stats.ExpiredPredictions) / float64(stats.Evaluated) * 100
+		stats.BestPrediction = a.best
+		stats.WorstPrediction = a.worst
+	}
+	if stats.Decisive > 0 {
+		stats.WinRate = float64(stats.RightPredictions) / float64(stats.Decisive) * 100
+		stats.Expectancy = a.decisivePnLSum / float64(stats.Decisive)
+	}
+	return stats
+}
+
+func paperPredictionStatsSlice(groups map[string]*paperPredictionAccumulator) []models.PaperPredictionGroupStats {
+	result := make([]models.PaperPredictionGroupStats, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, group.stats())
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Key < result[j].Key
+	})
+	return result
+}
+
+func paperPredictionConfidenceStatsSlice(groups map[string]*paperPredictionAccumulator) []models.PaperPredictionGroupStats {
+	buckets := []string{"<50", "50-59", "60-69", "70-79", "80-89", "90-100"}
+	result := make([]models.PaperPredictionGroupStats, 0, len(groups))
+	for _, bucket := range buckets {
+		group, ok := groups[bucket]
+		if ok {
+			result = append(result, group.stats())
+		}
+	}
+	return result
+}
+
+func confidenceBucket(confidence float64) string {
+	switch {
+	case confidence < 50:
+		return "<50"
+	case confidence < 60:
+		return "50-59"
+	case confidence < 70:
+		return "60-69"
+	case confidence < 80:
+		return "70-79"
+	case confidence < 90:
+		return "80-89"
+	default:
+		return "90-100"
+	}
 }
 
 // UpdateDecisionOutcome updates the outcome and P&L of a decision.

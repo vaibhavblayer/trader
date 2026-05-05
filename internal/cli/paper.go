@@ -512,8 +512,112 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	cmd.AddCommand(newPaperLedgerCmd(app))
 	cmd.AddCommand(newPaperStateCmd(app))
 	cmd.AddCommand(newPaperPredictionsCmd(app))
+	cmd.AddCommand(newPaperStatsCmd(app))
 
 	return cmd
+}
+
+func newPaperStatsCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "stats",
+		Short: "Show paper prediction calibration and expectancy",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if app.Store == nil {
+				output.Warning("Paper prediction store is not available")
+				return nil
+			}
+
+			days, _ := cmd.Flags().GetInt("days")
+			symbol, _ := cmd.Flags().GetString("symbol")
+			filter := store.PaperPredictionFilter{
+				Symbol: strings.ToUpper(strings.TrimSpace(symbol)),
+			}
+			if days > 0 {
+				filter.StartDate = time.Now().AddDate(0, 0, -days)
+				filter.EndDate = time.Now()
+			}
+
+			report, err := app.Store.GetPaperPredictionReport(ctx, filter)
+			if err != nil {
+				output.Error("Failed to get paper stats: %v", err)
+				return err
+			}
+			if output.IsJSON() {
+				return output.JSON(report)
+			}
+			if report.TotalPredictions == 0 {
+				output.Info("No paper predictions found")
+				return nil
+			}
+
+			output.Bold("Paper Prediction Calibration")
+			if days > 0 {
+				output.Printf("  Period: last %d days\n", days)
+			}
+			if filter.Symbol != "" {
+				output.Printf("  Symbol: %s\n", filter.Symbol)
+			}
+			output.Println()
+
+			output.Printf("  Total:       %d (%d active, %d evaluated)\n", report.TotalPredictions, report.ActivePredictions, report.Evaluated)
+			output.Printf("  Decisive:    %d | Right: %d | Wrong: %d | Expired: %d\n", report.Decisive, report.RightPredictions, report.WrongPredictions, report.ExpiredPredictions)
+			output.Printf("  Win Rate:    %.1f%%\n", report.WinRate)
+			output.Printf("  Avg Conf:    %.1f%%\n", report.AvgConfidence)
+			output.Printf("  Avg P&L:     %.2f%%\n", report.AvgPnLPercent)
+			output.Printf("  Expectancy:  %.2f%% per decisive prediction\n", report.Expectancy)
+			output.Printf("  Expired:     %.1f%% of evaluated\n", report.ExpiredRate)
+			output.Printf("  Best/Worst:  %.2f%% / %.2f%%\n", report.BestPrediction, report.WorstPrediction)
+			output.Println()
+
+			printPaperGroupStats(output, "By Confidence", report.ByConfidence)
+			printPaperGroupStats(output, "By Action", report.ByAction)
+			if filter.Symbol == "" {
+				printPaperGroupStats(output, "By Symbol", report.BySymbol)
+			}
+
+			if len(report.Overconfidence) > 0 {
+				output.Bold("Calibration Warnings")
+				for _, warning := range report.Overconfidence {
+					output.Warning("%s: avg confidence %.1f%% vs win rate %.1f%% over %d decisive predictions",
+						warning.Bucket,
+						warning.AvgConfidence,
+						warning.WinRate,
+						warning.SampleSize)
+				}
+			}
+
+			return nil
+		},
+	}
+	cmd.Flags().Int("days", 30, "Number of recent days to analyze")
+	cmd.Flags().String("symbol", "", "Filter by symbol")
+	return cmd
+}
+
+func printPaperGroupStats(output *Output, title string, groups []models.PaperPredictionGroupStats) {
+	if len(groups) == 0 {
+		return
+	}
+	output.Bold(title)
+	table := NewTable(output, "Group", "Total", "Decisive", "Win", "Avg Conf", "Avg P&L", "Expectancy", "Expired")
+	for _, group := range groups {
+		table.AddRow(
+			group.Key,
+			fmt.Sprintf("%d", group.TotalPredictions),
+			fmt.Sprintf("%d", group.Decisive),
+			fmt.Sprintf("%.1f%%", group.WinRate),
+			fmt.Sprintf("%.1f%%", group.AvgConfidence),
+			fmt.Sprintf("%.2f%%", group.AvgPnLPercent),
+			fmt.Sprintf("%.2f%%", group.Expectancy),
+			fmt.Sprintf("%.1f%%", group.ExpiredRate),
+		)
+	}
+	table.Render()
+	output.Println()
 }
 
 func newPaperPredictionsCmd(app *App) *cobra.Command {

@@ -35,3 +35,57 @@ type PaperPredictionStats struct {
 	BestPrediction     float64
 	WorstPrediction    float64
 }
+
+// PaperPredictionReport summarizes calibrated paper prediction performance.
+type PaperPredictionReport struct {
+	GeneratedAt        time.Time
+	StartDate          time.Time
+	EndDate            time.Time
+	Symbol             string
+	TotalPredictions   int
+	ActivePredictions  int
+	Evaluated          int
+	Decisive           int
+	RightPredictions   int
+	WrongPredictions   int
+	ExpiredPredictions int
+	WinRate            float64
+	AvgConfidence      float64
+	AvgPnLPercent      float64
+	Expectancy         float64
+	BestPrediction     float64
+	WorstPrediction    float64
+	ExpiredRate        float64
+	Overconfidence     []CalibrationWarning
+	BySymbol           []PaperPredictionGroupStats
+	ByAction           []PaperPredictionGroupStats
+	ByConfidence       []PaperPredictionGroupStats
+}
+
+// PaperPredictionGroupStats summarizes prediction performance for one group.
+type PaperPredictionGroupStats struct {
+	Key                string
+	TotalPredictions   int
+	ActivePredictions  int
+	Evaluated          int
+	Decisive           int
+	RightPredictions   int
+	WrongPredictions   int
+	ExpiredPredictions int
+	WinRate            float64
+	AvgConfidence      float64
+	AvgPnLPercent      float64
+	Expectancy         float64
+	BestPrediction     float64
+	WorstPrediction    float64
+	ExpiredRate        float64
+}
+
+// CalibrationWarning flags confidence buckets that underperform their stated confidence.
+type CalibrationWarning struct {
+	Bucket        string
+	AvgConfidence float64
+	WinRate       float64
+	Gap           float64
+	SampleSize    int
+}

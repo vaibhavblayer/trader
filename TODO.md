@@ -18,6 +18,7 @@ None.
 
 ## Done
 
+- [x] Paper prediction calibration and expectancy reports by confidence, action, and symbol.
 - [x] Persistent paper prediction tracker history and accuracy restore for live paper mode.
 - [x] Persistent paper broker ledger for orders, GTTs, positions, balances, and paper execution events.
 - [x] LLM role reduction: explanation, summarization, news classification, and review only; no direct live order authority.

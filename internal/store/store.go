@@ -39,6 +39,7 @@ type DataStore interface {
 	// Paper prediction tracking
 	SavePaperPrediction(ctx context.Context, prediction *models.PaperPrediction) error
 	GetPaperPredictions(ctx context.Context, filter PaperPredictionFilter) ([]models.PaperPrediction, error)
+	GetPaperPredictionReport(ctx context.Context, filter PaperPredictionFilter) (*models.PaperPredictionReport, error)
 
 	// Watchlist
 	AddToWatchlist(ctx context.Context, symbol, listName string) error
@@ -110,6 +111,8 @@ type DecisionFilter struct {
 // PaperPredictionFilter represents filters for querying paper predictions.
 type PaperPredictionFilter struct {
 	Symbol    string
+	StartDate time.Time
+	EndDate   time.Time
 	Evaluated *bool
 	Limit     int
 }
