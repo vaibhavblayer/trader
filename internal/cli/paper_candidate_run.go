@@ -11,6 +11,7 @@ import (
 
 	"zerodha-trader/internal/broker"
 	"zerodha-trader/internal/models"
+	"zerodha-trader/internal/store"
 	"zerodha-trader/internal/trading"
 )
 
@@ -141,6 +142,21 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 			results = append(results, result)
 			continue
 		}
+		if app.Store != nil {
+			active, err := hasActivePaperCandidatePrediction(ctx, app.Store, candidate.ID)
+			if err != nil {
+				result.Status = "ERROR"
+				result.Reason = err.Error()
+				results = append(results, result)
+				continue
+			}
+			if active {
+				result.Status = "OPEN"
+				result.Reason = "active_prediction_exists"
+				results = append(results, result)
+				continue
+			}
+		}
 
 		candles, _, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 			Symbol:    candidate.Symbol,
@@ -223,6 +239,24 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 		results = append(results, result)
 	}
 	return results
+}
+
+func hasActivePaperCandidatePrediction(ctx context.Context, dataStore interface {
+	GetPaperPredictions(context.Context, store.PaperPredictionFilter) ([]models.PaperPrediction, error)
+}, candidateID string) (bool, error) {
+	if dataStore == nil {
+		return false, nil
+	}
+	evaluated := false
+	predictions, err := dataStore.GetPaperPredictions(ctx, store.PaperPredictionFilter{
+		SetupName: fmt.Sprintf("candidate:%s", candidateID),
+		Evaluated: &evaluated,
+		Limit:     1,
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(predictions) > 0, nil
 }
 
 func paperPredictionFromCandidate(candidate models.PaperCandidate, candle models.Candle, signal string, confidence float64, regime string, window time.Duration) *models.PaperPrediction {

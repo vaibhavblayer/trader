@@ -516,6 +516,7 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	cmd.AddCommand(newPaperCandidateRunCmd(app))
 	cmd.AddCommand(newPaperCandidateReviewCmd(app))
 	cmd.AddCommand(newPaperEvaluateCmd(app))
+	cmd.AddCommand(newPaperSoakRunCmd(app))
 	cmd.AddCommand(newPaperStatsCmd(app))
 
 	return cmd

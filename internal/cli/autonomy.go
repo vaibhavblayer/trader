@@ -596,27 +596,20 @@ func paperSoakCommandFromFlags(cmd *cobra.Command) string {
 	minWinRate, _ := cmd.Flags().GetFloat64("min-win-rate")
 	minExpectancy, _ := cmd.Flags().GetFloat64("min-expectancy")
 
-	candidateRun := []string{"trader", "paper", "candidate-run", "--window", window, "--limit", "100"}
-	symbolList := parseAutonomySoakSymbols(symbols)
-	if len(symbolList) == 1 {
-		candidateRun = append(candidateRun, "--symbol", symbolList[0])
-	}
-	evaluate := []string{"trader", "paper", "evaluate", "--limit", "100"}
-	review := []string{"trader", "paper", "candidate-review", "--limit", "100"}
-	readiness := []string{
-		"trader", "autonomy", "readiness",
-		"--phase", autonomyPhasePaperSoak,
+	parts := []string{
+		"trader", "paper", "soak-run",
+		"--window", window,
+		"--limit", "100",
 		"--min-decisive", fmt.Sprintf("%d", minDecisive),
 		"--min-reviewed-trades", fmt.Sprintf("%d", minReviewed),
 		"--min-win-rate", fmt.Sprintf("%.0f", minWinRate),
 		"--min-expectancy", fmt.Sprintf("%.2f", minExpectancy),
 	}
-	return strings.Join([]string{
-		strings.Join(candidateRun, " "),
-		strings.Join(evaluate, " "),
-		strings.Join(review, " "),
-		strings.Join(readiness, " "),
-	}, " && ")
+	symbolList := parseAutonomySoakSymbols(symbols)
+	if len(symbolList) == 1 {
+		parts = append(parts, "--symbol", symbolList[0])
+	}
+	return strings.Join(parts, " ")
 }
 
 func parseAutonomySoakSymbols(symbols string) []string {
