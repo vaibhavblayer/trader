@@ -1104,6 +1104,468 @@ func (s *SQLiteStore) GetPaperLedger(ctx context.Context, limit int) ([]broker.P
 	return events, rows.Err()
 }
 
+// GetExecutionQualityReport summarizes persisted execution quality signals.
+func (s *SQLiteStore) GetExecutionQualityReport(ctx context.Context, filter models.ExecutionQualityFilter) (*models.ExecutionQualityReport, error) {
+	if filter.SlippageAlertBp <= 0 {
+		filter.SlippageAlertBp = 50
+	}
+	if filter.Limit <= 0 {
+		filter.Limit = 20
+	}
+	report := &models.ExecutionQualityReport{
+		GeneratedAt: time.Now(),
+		StartDate:   filter.StartDate,
+		EndDate:     filter.EndDate,
+		Symbol:      filter.Symbol,
+	}
+
+	overall := newExecutionQualityAccumulator("overall")
+	bySymbol := make(map[string]*executionQualityAccumulator)
+	byOrderType := make(map[string]*executionQualityAccumulator)
+	bySide := make(map[string]*executionQualityAccumulator)
+
+	orders, err := s.loadPaperExecutionOrders(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	for _, order := range orders {
+		overall.addOrder(order)
+		executionQualityGroup(bySymbol, order.Symbol).addOrder(order)
+		executionQualityGroup(byOrderType, order.OrderType).addOrder(order)
+		executionQualityGroup(bySide, order.Side).addOrder(order)
+		if order.Filled() && order.SlippageBp >= filter.SlippageAlertBp {
+			report.HighSlippageOrders = append(report.HighSlippageOrders, order.Sample())
+		}
+	}
+
+	issues, err := s.loadExecutionIssues(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	for _, issue := range issues {
+		overall.addIssue(issue)
+		executionQualityGroup(bySymbol, issue.Symbol).addIssue(issue)
+		executionQualityGroup(bySide, issue.Action).addIssue(issue)
+		if len(report.RecentIssues) < filter.Limit {
+			report.RecentIssues = append(report.RecentIssues, issue)
+		}
+	}
+
+	overallStats := overall.stats()
+	report.TotalOrders = overallStats.TotalOrders
+	report.FilledOrders = overallStats.FilledOrders
+	report.OpenOrders = overallStats.OpenOrders
+	report.CancelledOrders = overallStats.CancelledOrders
+	report.PartialFills = overallStats.PartialFills
+	report.RejectedOrders = overallStats.RejectedOrders
+	report.BlockedExecutions = overallStats.BlockedExecutions
+	report.ProtectiveFailures = overall.protectiveFailures
+	report.FillRate = overallStats.FillRate
+	report.PartialFillRate = overallStats.PartialFillRate
+	report.RejectionRate = overallStats.RejectionRate
+	report.AvgFilledQty = overallStats.AvgFilledQty
+	report.AvgSlippageBp = overallStats.AvgSlippageBp
+	report.MaxAdverseSlippageBp = overallStats.MaxAdverseSlippageBp
+	report.TotalCosts = overallStats.TotalCosts
+	report.TotalTurnover = overallStats.TotalTurnover
+	report.CostBp = overallStats.CostBp
+	report.BySymbol = executionQualityStatsSlice(bySymbol)
+	report.ByOrderType = executionQualityStatsSlice(byOrderType)
+	report.BySide = executionQualityStatsSlice(bySide)
+	sort.Slice(report.HighSlippageOrders, func(i, j int) bool {
+		return report.HighSlippageOrders[i].SlippageBp > report.HighSlippageOrders[j].SlippageBp
+	})
+	if len(report.HighSlippageOrders) > filter.Limit {
+		report.HighSlippageOrders = report.HighSlippageOrders[:filter.Limit]
+	}
+
+	return report, nil
+}
+
+type executionQualityOrder struct {
+	Timestamp  time.Time
+	OrderID    string
+	Symbol     string
+	Side       string
+	OrderType  string
+	Status     string
+	Quantity   int
+	FilledQty  int
+	Expected   float64
+	Actual     float64
+	SlippageBp float64
+	Costs      float64
+	Turnover   float64
+}
+
+func (o executionQualityOrder) Filled() bool {
+	return o.FilledQty > 0 || o.Status == "COMPLETE" || o.Status == "PARTIAL"
+}
+
+func (o executionQualityOrder) Sample() models.ExecutionQualitySample {
+	return models.ExecutionQualitySample{
+		Timestamp:  o.Timestamp,
+		OrderID:    o.OrderID,
+		Symbol:     o.Symbol,
+		Side:       o.Side,
+		OrderType:  o.OrderType,
+		Status:     o.Status,
+		Quantity:   o.Quantity,
+		FilledQty:  o.FilledQty,
+		Expected:   o.Expected,
+		Actual:     o.Actual,
+		SlippageBp: o.SlippageBp,
+		Costs:      o.Costs,
+	}
+}
+
+func (s *SQLiteStore) loadPaperExecutionOrders(ctx context.Context, filter models.ExecutionQualityFilter) ([]executionQualityOrder, error) {
+	query := `
+		SELECT timestamp, type, COALESCE(ref_id, ''), COALESCE(symbol, ''), COALESCE(payload, '{}')
+		FROM paper_ledger
+		WHERE type IN ('ORDER_PLACED', 'ORDER_CANCELLED', 'ORDER_REJECTED')
+	`
+	args := []interface{}{}
+	if filter.Symbol != "" {
+		query += " AND symbol = ?"
+		args = append(args, filter.Symbol)
+	}
+	if !filter.StartDate.IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, filter.StartDate)
+	}
+	if !filter.EndDate.IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, filter.EndDate)
+	}
+	query += " ORDER BY timestamp ASC"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query paper execution ledger: %w", err)
+	}
+	defer rows.Close()
+
+	orders := make(map[string]*executionQualityOrder)
+	orderSequence := make([]string, 0)
+	for rows.Next() {
+		var timestamp time.Time
+		var eventType, refID, symbol, payloadJSON string
+		if err := rows.Scan(&timestamp, &eventType, &refID, &symbol, &payloadJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan paper execution ledger: %w", err)
+		}
+		payload := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+			payload = map[string]interface{}{}
+		}
+		if refID == "" {
+			refID = fmt.Sprintf("%s_%d", eventType, timestamp.UnixNano())
+		}
+		order, ok := orders[refID]
+		if !ok {
+			order = &executionQualityOrder{OrderID: refID, Timestamp: timestamp, Symbol: symbol}
+			orders[refID] = order
+			orderSequence = append(orderSequence, refID)
+		}
+		if timestamp.After(order.Timestamp) {
+			order.Timestamp = timestamp
+		}
+		if order.Symbol == "" {
+			order.Symbol = symbol
+		}
+		switch eventType {
+		case "ORDER_PLACED":
+			order.Status = strings.ToUpper(stringFromPayload(payload, "status"))
+			order.Side = strings.ToUpper(stringFromPayload(payload, "side"))
+			order.OrderType = strings.ToUpper(stringFromPayload(payload, "order_type"))
+			order.Quantity = intFromPayload(payload, "quantity")
+			order.FilledQty = intFromPayload(payload, "filled_qty")
+			order.Expected = firstNonZeroFloat(floatFromPayload(payload, "expected_price"), floatFromPayload(payload, "requested_price"))
+			order.Actual = firstNonZeroFloat(floatFromPayload(payload, "actual_price"), floatFromPayload(payload, "average_price"))
+			order.SlippageBp = firstNonZeroFloat(floatFromPayload(payload, "slippage_bp"), sideAdjustedSlippageBp(order.Side, order.Expected, order.Actual))
+			order.Costs = floatFromPayload(payload, "costs")
+			order.Turnover = firstNonZeroFloat(floatFromPayload(payload, "order_value"), order.Actual*float64(order.FilledQty))
+		case "ORDER_CANCELLED":
+			order.Status = "CANCELLED"
+		case "ORDER_REJECTED":
+			order.Status = "REJECTED"
+			order.Side = strings.ToUpper(stringFromPayload(payload, "side"))
+			order.OrderType = strings.ToUpper(stringFromPayload(payload, "order_type"))
+			order.Quantity = intFromPayload(payload, "quantity")
+			order.Expected = firstNonZeroFloat(floatFromPayload(payload, "expected_price"), floatFromPayload(payload, "requested_price"))
+			order.Actual = floatFromPayload(payload, "actual_price")
+			order.Costs = floatFromPayload(payload, "costs")
+			order.Turnover = floatFromPayload(payload, "order_value")
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	result := make([]executionQualityOrder, 0, len(orders))
+	for _, id := range orderSequence {
+		order := orders[id]
+		if order.Status == "" {
+			order.Status = "UNKNOWN"
+		}
+		if order.Symbol == "" {
+			order.Symbol = "UNKNOWN"
+		}
+		if order.Side == "" {
+			order.Side = "UNKNOWN"
+		}
+		if order.OrderType == "" {
+			order.OrderType = "UNKNOWN"
+		}
+		result = append(result, *order)
+	}
+	return result, nil
+}
+
+func (s *SQLiteStore) loadExecutionIssues(ctx context.Context, filter models.ExecutionQualityFilter) ([]models.ExecutionQualityIssue, error) {
+	query := `
+		SELECT timestamp, decision_id, symbol, action, stage, status, COALESCE(message, ''), COALESCE(payload, '{}')
+		FROM decision_logs
+		WHERE (
+			stage = 'EXECUTION_BLOCKED'
+			OR stage = 'ORDER_REJECTED'
+			OR (stage = 'PROTECTIVE_ORDER' AND status IN ('BLOCKED', 'FAILED'))
+		)
+	`
+	args := []interface{}{}
+	if filter.Symbol != "" {
+		query += " AND symbol = ?"
+		args = append(args, filter.Symbol)
+	}
+	if !filter.StartDate.IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, filter.StartDate)
+	}
+	if !filter.EndDate.IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, filter.EndDate)
+	}
+	query += " ORDER BY timestamp DESC"
+	if filter.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, filter.Limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query execution issues: %w", err)
+	}
+	defer rows.Close()
+
+	issues := make([]models.ExecutionQualityIssue, 0)
+	for rows.Next() {
+		var issue models.ExecutionQualityIssue
+		var payloadJSON string
+		if err := rows.Scan(&issue.Timestamp, &issue.DecisionID, &issue.Symbol, &issue.Action, &issue.Stage, &issue.Status, &issue.Message, &payloadJSON); err != nil {
+			return nil, fmt.Errorf("failed to scan execution issue: %w", err)
+		}
+		payload := map[string]interface{}{}
+		_ = json.Unmarshal([]byte(payloadJSON), &payload)
+		issue.Source = "decision_log"
+		issue.OrderID = stringFromPayload(payload, "order_id")
+		issues = append(issues, issue)
+	}
+	return issues, rows.Err()
+}
+
+type executionQualityAccumulator struct {
+	key                string
+	totalOrders        int
+	filledOrders       int
+	openOrders         int
+	cancelledOrders    int
+	partialFills       int
+	rejectedOrders     int
+	blockedExecutions  int
+	protectiveFailures int
+	filledQtySum       int
+	slippageSum        float64
+	maxAdverseSlip     float64
+	costs              float64
+	turnover           float64
+}
+
+func newExecutionQualityAccumulator(key string) *executionQualityAccumulator {
+	return &executionQualityAccumulator{key: key}
+}
+
+func executionQualityGroup(groups map[string]*executionQualityAccumulator, key string) *executionQualityAccumulator {
+	if key == "" {
+		key = "UNKNOWN"
+	}
+	group, ok := groups[key]
+	if !ok {
+		group = newExecutionQualityAccumulator(key)
+		groups[key] = group
+	}
+	return group
+}
+
+func (a *executionQualityAccumulator) addOrder(order executionQualityOrder) {
+	a.totalOrders++
+	switch order.Status {
+	case "COMPLETE":
+		a.filledOrders++
+	case "PARTIAL":
+		a.filledOrders++
+		a.partialFills++
+	case "OPEN":
+		a.openOrders++
+	case "CANCELLED":
+		a.cancelledOrders++
+	case "REJECTED":
+		a.rejectedOrders++
+	default:
+		if order.Filled() {
+			a.filledOrders++
+		}
+	}
+	if order.FilledQty > 0 {
+		a.filledQtySum += order.FilledQty
+	}
+	if order.Filled() {
+		a.slippageSum += order.SlippageBp
+		if order.SlippageBp > a.maxAdverseSlip {
+			a.maxAdverseSlip = order.SlippageBp
+		}
+	}
+	a.costs += order.Costs
+	a.turnover += order.Turnover
+}
+
+func (a *executionQualityAccumulator) addIssue(issue models.ExecutionQualityIssue) {
+	switch issue.Stage {
+	case string(models.DecisionStageExecutionBlocked):
+		a.blockedExecutions++
+	case string(models.DecisionStageOrderRejected):
+		a.rejectedOrders++
+	case string(models.DecisionStageProtectiveOrder):
+		a.protectiveFailures++
+	}
+}
+
+func (a *executionQualityAccumulator) stats() models.ExecutionQualityGroup {
+	stats := models.ExecutionQualityGroup{
+		Key:                  a.key,
+		TotalOrders:          a.totalOrders,
+		FilledOrders:         a.filledOrders,
+		OpenOrders:           a.openOrders,
+		CancelledOrders:      a.cancelledOrders,
+		PartialFills:         a.partialFills,
+		RejectedOrders:       a.rejectedOrders,
+		BlockedExecutions:    a.blockedExecutions,
+		ProtectiveFailures:   a.protectiveFailures,
+		TotalCosts:           a.costs,
+		TotalTurnover:        a.turnover,
+		MaxAdverseSlippageBp: a.maxAdverseSlip,
+	}
+	if a.totalOrders > 0 {
+		stats.FillRate = float64(a.filledOrders) / float64(a.totalOrders) * 100
+		stats.RejectionRate = float64(a.rejectedOrders) / float64(a.totalOrders) * 100
+	}
+	if a.filledOrders > 0 {
+		stats.PartialFillRate = float64(a.partialFills) / float64(a.filledOrders) * 100
+		stats.AvgFilledQty = float64(a.filledQtySum) / float64(a.filledOrders)
+		stats.AvgSlippageBp = a.slippageSum / float64(a.filledOrders)
+	}
+	if a.turnover > 0 {
+		stats.CostBp = a.costs / a.turnover * 10000
+	}
+	return stats
+}
+
+func executionQualityStatsSlice(groups map[string]*executionQualityAccumulator) []models.ExecutionQualityGroup {
+	result := make([]models.ExecutionQualityGroup, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, group.stats())
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Key < result[j].Key
+	})
+	return result
+}
+
+func stringFromPayload(payload map[string]interface{}, key string) string {
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch v := value.(type) {
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func intFromPayload(payload map[string]interface{}, key string) int {
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		i, _ := v.Int64()
+		return int(i)
+	default:
+		return 0
+	}
+}
+
+func floatFromPayload(payload map[string]interface{}, key string) float64 {
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch v := value.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case json.Number:
+		f, _ := v.Float64()
+		return f
+	default:
+		return 0
+	}
+}
+
+func firstNonZeroFloat(values ...float64) float64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func sideAdjustedSlippageBp(side string, expected, actual float64) float64 {
+	if expected <= 0 || actual <= 0 {
+		return 0
+	}
+	if side == "SELL" {
+		return (expected - actual) / expected * 10000
+	}
+	return (actual - expected) / expected * 10000
+}
+
 // SavePaperPrediction inserts or updates a paper prediction.
 func (s *SQLiteStore) SavePaperPrediction(ctx context.Context, prediction *models.PaperPrediction) error {
 	if prediction == nil {

@@ -58,6 +58,7 @@ type PaperFillModel struct {
 
 type paperFill struct {
 	CanFill      bool
+	Reference    float64
 	Price        float64
 	Quantity     int
 	OrderValue   float64
@@ -182,12 +183,43 @@ func (p *PaperBroker) PlaceOrder(ctx context.Context, order *models.Order) (*Ord
 
 	fill := p.simulateFillLocked(ctx, order)
 	if fill.RejectReason != "" {
+		_ = p.persistLocked(ctx, &PaperLedgerEvent{
+			Type:   "ORDER_REJECTED",
+			RefID:  orderID,
+			Symbol: order.Symbol,
+			Payload: map[string]interface{}{
+				"side":            order.Side,
+				"order_type":      order.Type,
+				"product":         order.Product,
+				"quantity":        order.Quantity,
+				"requested_price": order.Price,
+				"reason":          fill.RejectReason,
+			},
+		})
 		return nil, fmt.Errorf("%s", fill.RejectReason)
 	}
 
 	if order.Side == models.OrderSideBuy && fill.CanFill {
 		required := fill.OrderValue + fill.Costs
 		if p.balance.AvailableCash < required {
+			reason := fmt.Sprintf("insufficient funds: need %.2f, have %.2f", required, p.balance.AvailableCash)
+			_ = p.persistLocked(ctx, &PaperLedgerEvent{
+				Type:   "ORDER_REJECTED",
+				RefID:  orderID,
+				Symbol: order.Symbol,
+				Payload: map[string]interface{}{
+					"side":            order.Side,
+					"order_type":      order.Type,
+					"product":         order.Product,
+					"quantity":        order.Quantity,
+					"requested_price": order.Price,
+					"expected_price":  fill.Reference,
+					"actual_price":    fill.Price,
+					"costs":           fill.Costs,
+					"order_value":     fill.OrderValue,
+					"reason":          reason,
+				},
+			})
 			return nil, fmt.Errorf("insufficient funds: need %.2f, have %.2f", required, p.balance.AvailableCash)
 		}
 	}
@@ -235,12 +267,26 @@ func (p *PaperBroker) PlaceOrder(ctx context.Context, order *models.Order) (*Ord
 		RefID:  orderID,
 		Symbol: newOrder.Symbol,
 		Payload: map[string]interface{}{
-			"status":        newOrder.Status,
-			"side":          newOrder.Side,
-			"quantity":      newOrder.Quantity,
-			"filled_qty":    newOrder.FilledQty,
-			"average_price": newOrder.AveragePrice,
-			"tag":           newOrder.Tag,
+			"status":            newOrder.Status,
+			"side":              newOrder.Side,
+			"order_type":        newOrder.Type,
+			"product":           newOrder.Product,
+			"quantity":          newOrder.Quantity,
+			"filled_qty":        newOrder.FilledQty,
+			"average_price":     newOrder.AveragePrice,
+			"requested_price":   newOrder.Price,
+			"expected_price":    fill.Reference,
+			"actual_price":      fill.Price,
+			"slippage_bp":       paperSlippageBp(order.Side, fill.Reference, fill.Price),
+			"order_value":       fill.OrderValue,
+			"costs":             fill.Costs,
+			"partial":           fill.Partial,
+			"fill_model":        "spread_slippage_depth",
+			"slippage_rate":     p.fillModel.SlippageRate,
+			"spread_rate":       p.fillModel.SpreadRate,
+			"commission_rate":   p.fillModel.CommissionRate,
+			"max_depth_percent": p.fillModel.MaxFillDepthPercent,
+			"tag":               newOrder.Tag,
 		},
 	}); err != nil {
 		return nil, err
@@ -309,12 +355,23 @@ func (p *PaperBroker) simulateFillLocked(ctx context.Context, order *models.Orde
 	costs := orderValue*p.fillModel.CommissionRate + p.fillModel.FlatFee
 	return paperFill{
 		CanFill:    true,
+		Reference:  ltp,
 		Price:      price,
 		Quantity:   qty,
 		OrderValue: orderValue,
 		Costs:      costs,
 		Partial:    partial,
 	}
+}
+
+func paperSlippageBp(side models.OrderSide, reference, actual float64) float64 {
+	if reference <= 0 || actual <= 0 {
+		return 0
+	}
+	if side == models.OrderSideSell {
+		return (reference - actual) / reference * 10000
+	}
+	return (actual - reference) / reference * 10000
 }
 
 func (p *PaperBroker) paperExecutablePrice(order *models.Order, ltp float64) float64 {

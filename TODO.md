@@ -10,7 +10,6 @@ None.
 
 - [ ] Historical calibration per setup/gate/symbol/timeframe.
 - [ ] Per-gate expectancy reports.
-- [ ] Slippage and execution-quality reports by symbol and order type.
 - [ ] Implement broker-backed REST API server or remove the public `api start` surface.
 - [ ] Replace portfolio beta, VaR, Greeks, and hedge placeholders with data-backed analytics before exposing them in active workflows.
 - [ ] Post-trade review workflow that links setup, order, fill, exit, and P&L.
@@ -19,6 +18,7 @@ None.
 
 - [x] Paper prediction calibration and expectancy reports by confidence, action, and symbol.
 - [x] Kill-switch command and persistent daemon state.
+- [x] Slippage and execution-quality reports by symbol, side, and order type.
 - [x] Persistent paper prediction tracker history and accuracy restore for live paper mode.
 - [x] Persistent paper broker ledger for orders, GTTs, positions, balances, and paper execution events.
 - [x] LLM role reduction: explanation, summarization, news classification, and review only; no direct live order authority.

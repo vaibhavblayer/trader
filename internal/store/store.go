@@ -47,6 +47,9 @@ type DataStore interface {
 	AppendDaemonEvent(ctx context.Context, event *models.DaemonEvent) error
 	GetDaemonEvents(ctx context.Context, limit int) ([]models.DaemonEvent, error)
 
+	// Execution quality reporting
+	GetExecutionQualityReport(ctx context.Context, filter models.ExecutionQualityFilter) (*models.ExecutionQualityReport, error)
+
 	// Watchlist
 	AddToWatchlist(ctx context.Context, symbol, listName string) error
 	RemoveFromWatchlist(ctx context.Context, symbol, listName string) error
