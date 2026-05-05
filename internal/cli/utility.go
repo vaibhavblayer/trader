@@ -25,6 +25,7 @@ func addUtilityCommands(rootCmd *cobra.Command, app *App) {
 	rootCmd.AddCommand(newCalibrationCmd(app))
 	rootCmd.AddCommand(newExecutionCmd(app))
 	rootCmd.AddCommand(newPostTradeReviewCmd(app))
+	rootCmd.AddCommand(newAutonomyCmd(app))
 	rootCmd.AddCommand(newExportCmd(app))
 	rootCmd.AddCommand(newNotifyTestCmd(app))
 }

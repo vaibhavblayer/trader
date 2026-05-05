@@ -157,6 +157,8 @@ func newCommandsCmd(app *App) *cobra.Command {
 						desc string
 					}{
 						{"backtest", "Strategy backtesting"},
+						{"autonomy readiness", "Autonomy go/no-go report"},
+						{"autonomy soak report", "Paper soak workflow status"},
 						{"export candles/trades/journal", "Data export"},
 						{"config show/edit/validate", "Configuration"},
 					},

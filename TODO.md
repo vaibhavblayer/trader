@@ -12,6 +12,8 @@ None.
 
 ## Done
 
+- [x] Autonomy readiness report with pass/warn/block decisions across safety, kill switch, calibration, execution quality, and post-trade review.
+- [x] Paper soak workflow for readiness-gated soak planning, status, and reporting.
 - [x] Removed the unimplemented public `api start` surface.
 - [x] Disabled portfolio beta, VaR, Greeks, and hedge placeholder workflows until data-backed analytics are implemented.
 - [x] Post-trade review workflow that links setup, order, fill, exit, execution quality, and P&L.
