@@ -512,9 +512,108 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	cmd.AddCommand(newPaperLedgerCmd(app))
 	cmd.AddCommand(newPaperStateCmd(app))
 	cmd.AddCommand(newPaperPredictionsCmd(app))
+	cmd.AddCommand(newPaperCandidatesCmd(app))
+	cmd.AddCommand(newPaperCandidateRunCmd(app))
+	cmd.AddCommand(newPaperCandidateReviewCmd(app))
+	cmd.AddCommand(newPaperEvaluateCmd(app))
 	cmd.AddCommand(newPaperStatsCmd(app))
 
 	return cmd
+}
+
+func newPaperCandidatesCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "candidates",
+		Short: "Show promoted paper-soak candidates",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if app.Store == nil {
+				output.Warning("Paper candidate store is not available")
+				return nil
+			}
+
+			limit, _ := cmd.Flags().GetInt("limit")
+			symbol, _ := cmd.Flags().GetString("symbol")
+			strategy, _ := cmd.Flags().GetString("strategy")
+			status, _ := cmd.Flags().GetString("status")
+			regime, _ := cmd.Flags().GetString("regime")
+			regime = strings.ToLower(strings.TrimSpace(regime))
+			filter := models.PaperCandidateFilter{
+				Symbol:   strings.ToUpper(strings.TrimSpace(symbol)),
+				Strategy: strings.ToLower(strings.TrimSpace(strategy)),
+				Status:   strings.ToUpper(strings.TrimSpace(status)),
+				Limit:    limit,
+			}
+
+			candidates, err := app.Store.GetPaperCandidates(ctx, filter)
+			if err != nil {
+				output.Error("Failed to get paper candidates: %v", err)
+				return err
+			}
+			if output.IsJSON() {
+				return output.JSON(candidates)
+			}
+			if len(candidates) == 0 {
+				output.Info("No promoted paper candidates found")
+				return nil
+			}
+
+			output.Bold("Paper Soak Candidates")
+			output.Println()
+			headers := []string{"Status", "Symbol", "Strategy", "Variant", "TF", "Setup", "Ret", "Val", "Tr", "VTr", "PF", "DD", "Allowed", "Blocked"}
+			if regime != "" {
+				headers = append(headers, "Regime Gate")
+			}
+			table := NewTable(output, headers...)
+			for _, candidate := range candidates {
+				row := []string{
+					candidate.Status,
+					candidate.Symbol,
+					candidate.Strategy,
+					candidate.ParamVariant,
+					candidate.Timeframe,
+					candidate.Setup,
+					FormatPercent(candidate.ReturnPct),
+					FormatPercent(candidate.ValidationReturnPct),
+					fmt.Sprintf("%d", candidate.Trades),
+					fmt.Sprintf("%d", candidate.ValidationTrades),
+					fmt.Sprintf("%.2f", candidate.ProfitFactor),
+					fmt.Sprintf("%.1f%%", candidate.MaxDrawdownPct),
+					strings.Join(candidate.AllowedRegimes, ","),
+					strings.Join(candidate.BlockedRegimes, ","),
+				}
+				if regime != "" {
+					row = append(row, paperCandidateRegimeGate(candidate, regime))
+				}
+				table.AddRow(row...)
+			}
+			table.Render()
+			return nil
+		},
+	}
+	cmd.Flags().Int("limit", 20, "Maximum candidates to show")
+	cmd.Flags().String("symbol", "", "Filter by symbol")
+	cmd.Flags().String("strategy", "", "Filter by strategy")
+	cmd.Flags().String("status", models.PaperCandidateStatusActive, "Filter by status")
+	cmd.Flags().String("regime", "", "Show candidate gate decision for a current regime")
+	return cmd
+}
+
+func paperCandidateRegimeGate(candidate models.PaperCandidate, regime string) string {
+	for _, blocked := range candidate.BlockedRegimes {
+		if strings.EqualFold(blocked, regime) {
+			return "BLOCK"
+		}
+	}
+	for _, allowed := range candidate.AllowedRegimes {
+		if strings.EqualFold(allowed, regime) {
+			return "ALLOW"
+		}
+	}
+	return "UNKNOWN"
 }
 
 func newPaperStatsCmd(app *App) *cobra.Command {

@@ -26,6 +26,12 @@ type backtestSetup struct {
 	AllowShort   bool
 }
 
+type backtestParamVariant struct {
+	Name       string
+	Parameter  map[string]interface{}
+	ParameterS string
+}
+
 type backtestGridThresholds struct {
 	MinTrades           int
 	MinValidationTrades int
@@ -36,38 +42,51 @@ type backtestGridThresholds struct {
 }
 
 type backtestGridResult struct {
-	Verdict              string  `json:"verdict"`
-	Reason               string  `json:"reason,omitempty"`
-	Symbol               string  `json:"symbol"`
-	Exchange             string  `json:"exchange"`
-	Strategy             string  `json:"strategy"`
-	Timeframe            string  `json:"timeframe"`
-	Days                 int     `json:"days"`
-	Setup                string  `json:"setup"`
-	Regime               string  `json:"regime"`
-	Candles              int     `json:"candles"`
-	Trades               int     `json:"trades"`
-	ValidationTrades     int     `json:"validation_trades"`
-	ReturnPct            float64 `json:"return_pct"`
-	AnnualizedReturnPct  float64 `json:"annualized_return_pct"`
-	ValidationReturnPct  float64 `json:"validation_return_pct"`
-	TrainReturnPct       float64 `json:"train_return_pct"`
-	WinRate              float64 `json:"win_rate"`
-	ProfitFactor         float64 `json:"profit_factor"`
-	Expectancy           float64 `json:"expectancy"`
-	MaxDrawdownPct       float64 `json:"max_drawdown_pct"`
-	SharpeRatio          float64 `json:"sharpe_ratio"`
-	Score                float64 `json:"score"`
-	Error                string  `json:"error,omitempty"`
-	StopLossPercent      float64 `json:"stop_loss_percent,omitempty"`
-	TakeProfitPercent    float64 `json:"take_profit_percent,omitempty"`
-	TrailingStopPercent  float64 `json:"trailing_stop_percent,omitempty"`
-	AllowShort           bool    `json:"allow_short"`
-	ExecutionTiming      string  `json:"execution_timing"`
-	SlippagePercent      float64 `json:"slippage_percent"`
-	CommissionPercent    float64 `json:"commission_percent"`
-	PartialFillsEnabled  bool    `json:"partial_fills_enabled"`
-	MaxFillVolumePercent float64 `json:"max_fill_volume_percent,omitempty"`
+	Verdict              string                    `json:"verdict"`
+	Reason               string                    `json:"reason,omitempty"`
+	Symbol               string                    `json:"symbol"`
+	Exchange             string                    `json:"exchange"`
+	Strategy             string                    `json:"strategy"`
+	Timeframe            string                    `json:"timeframe"`
+	Days                 int                       `json:"days"`
+	Setup                string                    `json:"setup"`
+	ParamVariant         string                    `json:"param_variant"`
+	Parameters           string                    `json:"parameters,omitempty"`
+	Regime               string                    `json:"regime"`
+	Candles              int                       `json:"candles"`
+	Trades               int                       `json:"trades"`
+	ValidationTrades     int                       `json:"validation_trades"`
+	ReturnPct            float64                   `json:"return_pct"`
+	AnnualizedReturnPct  float64                   `json:"annualized_return_pct"`
+	ValidationReturnPct  float64                   `json:"validation_return_pct"`
+	TrainReturnPct       float64                   `json:"train_return_pct"`
+	WinRate              float64                   `json:"win_rate"`
+	ProfitFactor         float64                   `json:"profit_factor"`
+	Expectancy           float64                   `json:"expectancy"`
+	MaxDrawdownPct       float64                   `json:"max_drawdown_pct"`
+	SharpeRatio          float64                   `json:"sharpe_ratio"`
+	Score                float64                   `json:"score"`
+	Error                string                    `json:"error,omitempty"`
+	StopLossPercent      float64                   `json:"stop_loss_percent,omitempty"`
+	TakeProfitPercent    float64                   `json:"take_profit_percent,omitempty"`
+	TrailingStopPercent  float64                   `json:"trailing_stop_percent,omitempty"`
+	AllowShort           bool                      `json:"allow_short"`
+	ExecutionTiming      string                    `json:"execution_timing"`
+	SlippagePercent      float64                   `json:"slippage_percent"`
+	CommissionPercent    float64                   `json:"commission_percent"`
+	PartialFillsEnabled  bool                      `json:"partial_fills_enabled"`
+	MaxFillVolumePercent float64                   `json:"max_fill_volume_percent,omitempty"`
+	Regimes              []backtestRegimeTradeStat `json:"regimes,omitempty"`
+}
+
+type backtestRegimeTradeStat struct {
+	Regime      string  `json:"regime"`
+	Trades      int     `json:"trades"`
+	Wins        int     `json:"wins"`
+	WinRate     float64 `json:"win_rate"`
+	TotalPnL    float64 `json:"total_pnl"`
+	Expectancy  float64 `json:"expectancy"`
+	AvgHoldBars float64 `json:"avg_hold_bars"`
 }
 
 func newBacktestGridCmd(app *App) *cobra.Command {
@@ -93,6 +112,7 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 			timeframesFlag, _ := cmd.Flags().GetString("timeframes")
 			periodsFlag, _ := cmd.Flags().GetString("periods")
 			setupsFlag, _ := cmd.Flags().GetString("setups")
+			paramGrid, _ := cmd.Flags().GetString("param-grid")
 			exchange, _ := cmd.Flags().GetString("exchange")
 			capital, _ := cmd.Flags().GetFloat64("capital")
 			slippagePct, _ := cmd.Flags().GetFloat64("slippage")
@@ -102,6 +122,12 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 			maxFillVolumePct, _ := cmd.Flags().GetFloat64("max-fill-volume")
 			limit, _ := cmd.Flags().GetInt("limit")
 			outputPath, _ := cmd.Flags().GetString("output")
+			regimeReport, _ := cmd.Flags().GetBool("regime-report")
+			regimeWindow, _ := cmd.Flags().GetInt("regime-window")
+			promote, _ := cmd.Flags().GetBool("promote-paper-candidates")
+			promoteVerdictsFlag, _ := cmd.Flags().GetString("promote-verdicts")
+			candidateStatus, _ := cmd.Flags().GetString("candidate-status")
+			minRegimeTrades, _ := cmd.Flags().GetInt("min-regime-trades")
 
 			thresholds := backtestGridThresholds{}
 			thresholds.MinTrades, _ = cmd.Flags().GetInt("min-trades")
@@ -138,6 +164,13 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 			if err != nil {
 				return err
 			}
+			paramGrid = strings.ToLower(strings.TrimSpace(paramGrid))
+			if paramGrid == "" {
+				paramGrid = "default"
+			}
+			if paramGrid != "default" && paramGrid != "research" {
+				return fmt.Errorf("unknown param grid %q", paramGrid)
+			}
 
 			if app.Broker == nil {
 				return fmt.Errorf("broker not configured")
@@ -150,6 +183,7 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 				output.Printf("  Timeframes: %s\n", strings.Join(timeframes, ", "))
 				output.Printf("  Periods:    %s days\n", strings.Join(intsToStrings(periods), ", "))
 				output.Printf("  Setups:     %s\n", strings.Join(setupNames(setups), ", "))
+				output.Printf("  Param grid: %s\n", paramGrid)
 				output.Println()
 			}
 
@@ -166,6 +200,8 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 				ExecutionTiming:       executionTiming,
 				PartialFills:          partialFills,
 				MaxFillVolumePct:      maxFillVolumePct,
+				ParamGrid:             paramGrid,
+				RegimeWindow:          regimeWindow,
 				ReliabilityThresholds: thresholds,
 			})
 			sortBacktestGridResults(results)
@@ -179,11 +215,33 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 					output.Println()
 				}
 			}
+			var promoted []models.PaperCandidate
+			if promote {
+				if app.Store == nil {
+					return fmt.Errorf("paper candidate store is not available")
+				}
+				promoteVerdicts := parseVerdictSet(promoteVerdictsFlag)
+				promoted, err = promoteBacktestGridCandidates(ctx, app.Store, results, promoteVerdicts, strings.ToUpper(strings.TrimSpace(candidateStatus)), minRegimeTrades)
+				if err != nil {
+					return err
+				}
+				if !output.IsJSON() {
+					output.Success("Promoted %d paper candidate(s)", len(promoted))
+					output.Println()
+				}
+			}
 
 			if output.IsJSON() {
+				if promote {
+					return output.JSON(map[string]interface{}{"results": results, "promoted": promoted})
+				}
 				return output.JSON(results)
 			}
 			displayBacktestGridResults(output, results, limit)
+			if regimeReport {
+				output.Println()
+				displayBacktestRegimeSummary(output, results, limit)
+			}
 			return nil
 		},
 	}
@@ -194,6 +252,7 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 	cmd.Flags().String("timeframes", "1day", "Comma-separated candle timeframes")
 	cmd.Flags().String("periods", "365", "Comma-separated lookback periods in days")
 	cmd.Flags().String("setups", "base,sl2tp4,short_sl2tp4", "Comma-separated setups (base, sl2tp4, sl25tp5, trail2, short_base, short_sl2tp4)")
+	cmd.Flags().String("param-grid", "default", "Strategy parameter grid (default, research)")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 	cmd.Flags().Float64("capital", 1000000, "Starting capital")
 	cmd.Flags().Float64("slippage", 0.1, "Slippage percentage")
@@ -209,6 +268,12 @@ Verdicts are meant to reject weak candidates before paper soak testing.`,
 	cmd.Flags().Float64("max-drawdown", 10, "Maximum full-period drawdown percentage for PASS")
 	cmd.Flags().Int("limit", 25, "Rows to print in table output (0 for all)")
 	cmd.Flags().String("output", "", "Optional CSV output path")
+	cmd.Flags().Bool("regime-report", false, "Print trade expectancy grouped by entry regime")
+	cmd.Flags().Int("regime-window", 50, "Candles used to classify each trade entry regime")
+	cmd.Flags().Bool("promote-paper-candidates", false, "Save eligible grid rows as controlled paper-soak candidates")
+	cmd.Flags().String("promote-verdicts", "PASS", "Comma-separated verdicts eligible for promotion")
+	cmd.Flags().String("candidate-status", models.PaperCandidateStatusActive, "Status for promoted candidates (ACTIVE, PAUSED)")
+	cmd.Flags().Int("min-regime-trades", 2, "Minimum trades for a regime to become an allowed/blocked guardrail")
 	return cmd
 }
 
@@ -225,6 +290,8 @@ type backtestGridRunConfig struct {
 	ExecutionTiming       string
 	PartialFills          bool
 	MaxFillVolumePct      float64
+	ParamGrid             string
+	RegimeWindow          int
 	ReliabilityThresholds backtestGridThresholds
 }
 
@@ -258,24 +325,28 @@ func runBacktestGrid(ctx context.Context, app *App, cfg backtestGridRunConfig) [
 
 				regime := classifyBacktestRegime(candles)
 				for _, strategy := range cfg.Strategies {
-					for _, setup := range cfg.Setups {
-						btConfig := trading.BacktestConfig{
-							Symbol:               symbol,
-							Timeframe:            timeframe,
-							InitialCapital:       cfg.Capital,
-							Strategy:             strategy,
-							Slippage:             cfg.SlippagePct / 100,
-							Commission:           cfg.CommissionPct / 100,
-							ExecutionTiming:      cfg.ExecutionTiming,
-							AllowPartialFills:    cfg.PartialFills,
-							MaxFillVolumePercent: cfg.MaxFillVolumePct,
-							StopLossPercent:      setup.StopLoss,
-							TakeProfitPercent:    setup.TakeProfit,
-							TrailingStopPercent:  setup.TrailingStop,
-							AllowShort:           setup.AllowShort,
+					paramVariants := strategyParameterVariants(strategy, cfg.ParamGrid)
+					for _, variant := range paramVariants {
+						for _, setup := range cfg.Setups {
+							btConfig := trading.BacktestConfig{
+								Symbol:               symbol,
+								Timeframe:            timeframe,
+								InitialCapital:       cfg.Capital,
+								Strategy:             strategy,
+								Parameters:           cloneParams(variant.Parameter),
+								Slippage:             cfg.SlippagePct / 100,
+								Commission:           cfg.CommissionPct / 100,
+								ExecutionTiming:      cfg.ExecutionTiming,
+								AllowPartialFills:    cfg.PartialFills,
+								MaxFillVolumePercent: cfg.MaxFillVolumePct,
+								StopLossPercent:      setup.StopLoss,
+								TakeProfitPercent:    setup.TakeProfit,
+								TrailingStopPercent:  setup.TrailingStop,
+								AllowShort:           setup.AllowShort,
+							}
+							result := evaluateBacktestGridCandidate(ctx, engine, btConfig, candles, cfg, setup, variant, regime, days)
+							results = append(results, result)
 						}
-						result := evaluateBacktestGridCandidate(ctx, engine, btConfig, candles, cfg, setup, regime, days)
-						results = append(results, result)
 					}
 				}
 			}
@@ -284,7 +355,7 @@ func runBacktestGrid(ctx context.Context, app *App, cfg backtestGridRunConfig) [
 	return results
 }
 
-func evaluateBacktestGridCandidate(ctx context.Context, engine *trading.DefaultBacktestEngine, btConfig trading.BacktestConfig, candles []models.Candle, runCfg backtestGridRunConfig, setup backtestSetup, regime string, days int) backtestGridResult {
+func evaluateBacktestGridCandidate(ctx context.Context, engine *trading.DefaultBacktestEngine, btConfig trading.BacktestConfig, candles []models.Candle, runCfg backtestGridRunConfig, setup backtestSetup, variant backtestParamVariant, regime string, days int) backtestGridResult {
 	full, err := engine.RunOnCandles(ctx, btConfig, candles)
 	base := backtestGridResult{
 		Symbol:               btConfig.Symbol,
@@ -293,6 +364,8 @@ func evaluateBacktestGridCandidate(ctx context.Context, engine *trading.DefaultB
 		Timeframe:            btConfig.Timeframe,
 		Days:                 days,
 		Setup:                setup.Name,
+		ParamVariant:         variant.Name,
+		Parameters:           variant.ParameterS,
 		Regime:               regime,
 		Candles:              len(candles),
 		StopLossPercent:      setup.StopLoss,
@@ -320,6 +393,7 @@ func evaluateBacktestGridCandidate(ctx context.Context, engine *trading.DefaultB
 	base.Expectancy = full.Expectancy
 	base.MaxDrawdownPct = full.MaxDrawdown
 	base.SharpeRatio = finiteMetric(full.SharpeRatio)
+	base.Regimes = classifyTradeRegimeStats(candles, full.Trades, runCfg.RegimeWindow)
 
 	train, validation, splitOK := runWalkForward(ctx, engine, btConfig, candles)
 	if splitOK {
@@ -500,6 +574,76 @@ func parseBacktestSetups(flag string) ([]backtestSetup, error) {
 	return setups, nil
 }
 
+func strategyParameterVariants(strategy, grid string) []backtestParamVariant {
+	strategy = trading.NormalizeStrategyName(strategy)
+	if strings.EqualFold(strings.TrimSpace(grid), "default") || strings.TrimSpace(grid) == "" {
+		return []backtestParamVariant{newParamVariant("default", nil)}
+	}
+
+	switch strategy {
+	case "supertrend":
+		return []backtestParamVariant{
+			newParamVariant("atr7_mult2", map[string]interface{}{"atr_period": 7, "multiplier": 2.0}),
+			newParamVariant("atr10_mult2", map[string]interface{}{"atr_period": 10, "multiplier": 2.0}),
+			newParamVariant("atr10_mult3", map[string]interface{}{"atr_period": 10, "multiplier": 3.0}),
+			newParamVariant("atr14_mult3", map[string]interface{}{"atr_period": 14, "multiplier": 3.0}),
+			newParamVariant("atr14_mult4", map[string]interface{}{"atr_period": 14, "multiplier": 4.0}),
+		}
+	case "donchian_breakout":
+		return []backtestParamVariant{
+			newParamVariant("donchian10", map[string]interface{}{"period": 10}),
+			newParamVariant("donchian20", map[string]interface{}{"period": 20}),
+			newParamVariant("donchian30", map[string]interface{}{"period": 30}),
+			newParamVariant("donchian55", map[string]interface{}{"period": 55}),
+		}
+	case "multi_indicator":
+		return []backtestParamVariant{
+			newParamVariant("balanced", map[string]interface{}{"short_period": 9, "long_period": 21, "rsi_min": 30.0, "rsi_max": 70.0, "adx_threshold": 20.0, "volume_multiplier": 1.2}),
+			newParamVariant("fast", map[string]interface{}{"short_period": 5, "long_period": 13, "rsi_min": 28.0, "rsi_max": 72.0, "adx_threshold": 18.0, "volume_multiplier": 1.1}),
+			newParamVariant("trend_strict", map[string]interface{}{"short_period": 9, "long_period": 21, "rsi_min": 35.0, "rsi_max": 65.0, "adx_threshold": 25.0, "volume_multiplier": 1.1, "require_adx": true}),
+			newParamVariant("volume_strict", map[string]interface{}{"short_period": 9, "long_period": 21, "rsi_min": 30.0, "rsi_max": 70.0, "adx_threshold": 18.0, "volume_multiplier": 1.5, "require_volume": true}),
+			newParamVariant("slow_quality", map[string]interface{}{"short_period": 13, "long_period": 34, "rsi_min": 35.0, "rsi_max": 65.0, "adx_threshold": 22.0, "volume_multiplier": 1.2}),
+		}
+	default:
+		return []backtestParamVariant{newParamVariant("default", nil)}
+	}
+}
+
+func newParamVariant(name string, params map[string]interface{}) backtestParamVariant {
+	return backtestParamVariant{
+		Name:       name,
+		Parameter:  cloneParams(params),
+		ParameterS: formatParameters(params),
+	}
+}
+
+func cloneParams(params map[string]interface{}) map[string]interface{} {
+	if len(params) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(params))
+	for key, value := range params {
+		out[key] = value
+	}
+	return out
+}
+
+func formatParameters(params map[string]interface{}) string {
+	if len(params) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", key, params[key]))
+	}
+	return strings.Join(parts, ";")
+}
+
 func parseCSVFlag(flag string) []string {
 	parts := strings.Split(flag, ",")
 	values := make([]string, 0, len(parts))
@@ -539,7 +683,7 @@ func displayBacktestGridResults(output *Output, results []backtestGridResult, li
 	if limit <= 0 || limit > len(results) {
 		limit = len(results)
 	}
-	table := NewTable(output, "Verdict", "Symbol", "Strategy", "TF", "Days", "Setup", "Ret", "Val", "Tr", "VTr", "PF", "DD", "Regime", "Reason")
+	table := NewTable(output, "Verdict", "Symbol", "Strategy", "Variant", "TF", "Days", "Setup", "Ret", "Val", "Tr", "VTr", "PF", "DD", "Regime", "Reason")
 	for i := 0; i < limit; i++ {
 		r := results[i]
 		verdict := r.Verdict
@@ -555,6 +699,7 @@ func displayBacktestGridResults(output *Output, results []backtestGridResult, li
 			verdict,
 			r.Symbol,
 			r.Strategy,
+			r.ParamVariant,
 			r.Timeframe,
 			strconv.Itoa(r.Days),
 			r.Setup,
@@ -586,6 +731,330 @@ func sortBacktestGridResults(results []backtestGridResult) {
 	})
 }
 
+func classifyTradeRegimeStats(candles []models.Candle, trades []trading.BacktestTrade, window int) []backtestRegimeTradeStat {
+	if window <= 1 {
+		window = 50
+	}
+	stats := make(map[string]*backtestRegimeTradeStat)
+	for _, trade := range trades {
+		index := candleIndexAtOrAfter(candles, trade.EntryTime)
+		if index < 0 {
+			continue
+		}
+		start := index - window + 1
+		if start < 0 {
+			start = 0
+		}
+		regime := classifyBacktestRegime(candles[start : index+1])
+		stat := stats[regime]
+		if stat == nil {
+			stat = &backtestRegimeTradeStat{Regime: regime}
+			stats[regime] = stat
+		}
+		stat.Trades++
+		if trade.PnL > 0 {
+			stat.Wins++
+		}
+		stat.TotalPnL += trade.PnL
+		stat.AvgHoldBars += float64(trade.HoldBars)
+	}
+
+	out := make([]backtestRegimeTradeStat, 0, len(stats))
+	for _, stat := range stats {
+		if stat.Trades > 0 {
+			stat.WinRate = float64(stat.Wins) / float64(stat.Trades) * 100
+			stat.Expectancy = stat.TotalPnL / float64(stat.Trades)
+			stat.AvgHoldBars = stat.AvgHoldBars / float64(stat.Trades)
+		}
+		out = append(out, *stat)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Regime != out[j].Regime {
+			return out[i].Regime < out[j].Regime
+		}
+		return out[i].Expectancy > out[j].Expectancy
+	})
+	return out
+}
+
+func candleIndexAtOrAfter(candles []models.Candle, timestamp time.Time) int {
+	for i, candle := range candles {
+		if !candle.Timestamp.Before(timestamp) {
+			return i
+		}
+	}
+	return -1
+}
+
+type backtestRegimeSummary struct {
+	Regime       string
+	Strategy     string
+	Variant      string
+	Setup        string
+	Rows         int
+	Trades       int
+	Wins         int
+	TotalPnL     float64
+	AvgHoldBars  float64
+	BestVerdict  string
+	Expectancy   float64
+	WinRate      float64
+	RankingScore float64
+}
+
+func displayBacktestRegimeSummary(output *Output, results []backtestGridResult, limit int) {
+	summary := aggregateBacktestRegimeSummary(results)
+	if len(summary) == 0 {
+		output.Dim("No regime trade stats to report.")
+		return
+	}
+	if limit <= 0 || limit > len(summary) {
+		limit = len(summary)
+	}
+	output.Bold("Regime Expectancy")
+	table := NewTable(output, "Regime", "Strategy", "Variant", "Setup", "Rows", "Trades", "Win", "Expectancy", "Total P&L", "Avg Hold", "Best")
+	for i := 0; i < limit; i++ {
+		row := summary[i]
+		table.AddRow(
+			row.Regime,
+			row.Strategy,
+			row.Variant,
+			row.Setup,
+			strconv.Itoa(row.Rows),
+			strconv.Itoa(row.Trades),
+			fmt.Sprintf("%.1f%%", row.WinRate),
+			FormatIndianCurrency(row.Expectancy),
+			FormatIndianCurrency(row.TotalPnL),
+			fmt.Sprintf("%.1f", row.AvgHoldBars),
+			row.BestVerdict,
+		)
+	}
+	table.Render()
+	if limit < len(summary) {
+		output.Println()
+		output.Dim("Showing %d of %d regime rows. Use --limit 0 to print all rows.", limit, len(summary))
+	}
+}
+
+func aggregateBacktestRegimeSummary(results []backtestGridResult) []backtestRegimeSummary {
+	type key struct {
+		regime   string
+		strategy string
+		variant  string
+		setup    string
+	}
+	summaries := make(map[key]*backtestRegimeSummary)
+	for _, result := range results {
+		if result.Error != "" {
+			continue
+		}
+		for _, regime := range result.Regimes {
+			k := key{
+				regime:   regime.Regime,
+				strategy: result.Strategy,
+				variant:  result.ParamVariant,
+				setup:    result.Setup,
+			}
+			summary := summaries[k]
+			if summary == nil {
+				summary = &backtestRegimeSummary{
+					Regime:      regime.Regime,
+					Strategy:    result.Strategy,
+					Variant:     result.ParamVariant,
+					Setup:       result.Setup,
+					BestVerdict: result.Verdict,
+				}
+				summaries[k] = summary
+			}
+			summary.Rows++
+			summary.Trades += regime.Trades
+			summary.Wins += regime.Wins
+			summary.TotalPnL += regime.TotalPnL
+			summary.AvgHoldBars += regime.AvgHoldBars * float64(regime.Trades)
+			if verdictRank(result.Verdict) < verdictRank(summary.BestVerdict) {
+				summary.BestVerdict = result.Verdict
+			}
+		}
+	}
+
+	out := make([]backtestRegimeSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		if summary.Trades == 0 {
+			continue
+		}
+		summary.WinRate = float64(summary.Wins) / float64(summary.Trades) * 100
+		summary.Expectancy = summary.TotalPnL / float64(summary.Trades)
+		summary.AvgHoldBars = summary.AvgHoldBars / float64(summary.Trades)
+		summary.RankingScore = summary.Expectancy * math.Sqrt(float64(summary.Trades))
+		if summary.Expectancy > 0 {
+			if summary.BestVerdict == "PASS" {
+				summary.RankingScore += 100000
+			} else if summary.BestVerdict == "WATCH" {
+				summary.RankingScore += 10000
+			}
+		}
+		out = append(out, *summary)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].RankingScore > out[j].RankingScore
+	})
+	return out
+}
+
+func verdictRank(verdict string) int {
+	switch verdict {
+	case "PASS":
+		return 0
+	case "WATCH":
+		return 1
+	default:
+		return 2
+	}
+}
+
+type paperCandidateStore interface {
+	SavePaperCandidate(ctx context.Context, candidate *models.PaperCandidate) error
+}
+
+func promoteBacktestGridCandidates(ctx context.Context, dataStore paperCandidateStore, results []backtestGridResult, verdicts map[string]bool, status string, minRegimeTrades int) ([]models.PaperCandidate, error) {
+	if status == "" {
+		status = models.PaperCandidateStatusActive
+	}
+	if minRegimeTrades <= 0 {
+		minRegimeTrades = 1
+	}
+	promoted := make([]models.PaperCandidate, 0)
+	for _, result := range results {
+		if result.Error != "" || !verdicts[result.Verdict] {
+			continue
+		}
+		candidate := paperCandidateFromGridResult(result, status, minRegimeTrades)
+		if len(candidate.AllowedRegimes) == 0 {
+			continue
+		}
+		if err := dataStore.SavePaperCandidate(ctx, &candidate); err != nil {
+			return promoted, err
+		}
+		promoted = append(promoted, candidate)
+	}
+	return promoted, nil
+}
+
+func paperCandidateFromGridResult(result backtestGridResult, status string, minRegimeTrades int) models.PaperCandidate {
+	allowed, blocked := regimeGuardrails(result.Regimes, minRegimeTrades)
+	return models.PaperCandidate{
+		ID:                  paperCandidateID(result),
+		Status:              status,
+		Symbol:              result.Symbol,
+		Exchange:            result.Exchange,
+		Strategy:            result.Strategy,
+		ParamVariant:        result.ParamVariant,
+		Parameters:          result.Parameters,
+		Timeframe:           result.Timeframe,
+		Setup:               result.Setup,
+		Source:              "backtest_grid",
+		Verdict:             result.Verdict,
+		Reason:              result.Reason,
+		Days:                result.Days,
+		Candles:             result.Candles,
+		Trades:              result.Trades,
+		ValidationTrades:    result.ValidationTrades,
+		ReturnPct:           result.ReturnPct,
+		TrainReturnPct:      result.TrainReturnPct,
+		ValidationReturnPct: result.ValidationReturnPct,
+		WinRate:             result.WinRate,
+		ProfitFactor:        result.ProfitFactor,
+		Expectancy:          result.Expectancy,
+		MaxDrawdownPct:      result.MaxDrawdownPct,
+		SharpeRatio:         result.SharpeRatio,
+		StopLossPercent:     result.StopLossPercent,
+		TakeProfitPercent:   result.TakeProfitPercent,
+		TrailingStopPercent: result.TrailingStopPercent,
+		AllowShort:          result.AllowShort,
+		AllowedRegimes:      allowed,
+		BlockedRegimes:      blocked,
+		RegimeStats:         paperCandidateRegimeStats(result.Regimes),
+		PromotedAt:          time.Now(),
+		UpdatedAt:           time.Now(),
+	}
+}
+
+func regimeGuardrails(regimes []backtestRegimeTradeStat, minTrades int) ([]string, []string) {
+	allowed := make([]string, 0)
+	blocked := make([]string, 0)
+	for _, stat := range regimes {
+		if stat.Trades < minTrades {
+			continue
+		}
+		if stat.Expectancy > 0 {
+			allowed = append(allowed, stat.Regime)
+		} else {
+			blocked = append(blocked, stat.Regime)
+		}
+	}
+	sort.Strings(allowed)
+	sort.Strings(blocked)
+	return allowed, blocked
+}
+
+func paperCandidateRegimeStats(regimes []backtestRegimeTradeStat) []models.PaperCandidateRegimeStat {
+	stats := make([]models.PaperCandidateRegimeStat, 0, len(regimes))
+	for _, regime := range regimes {
+		stats = append(stats, models.PaperCandidateRegimeStat{
+			Regime:      regime.Regime,
+			Trades:      regime.Trades,
+			Wins:        regime.Wins,
+			WinRate:     regime.WinRate,
+			TotalPnL:    regime.TotalPnL,
+			Expectancy:  regime.Expectancy,
+			AvgHoldBars: regime.AvgHoldBars,
+		})
+	}
+	return stats
+}
+
+func paperCandidateID(result backtestGridResult) string {
+	parts := []string{
+		result.Symbol,
+		result.Exchange,
+		result.Strategy,
+		result.ParamVariant,
+		result.Timeframe,
+		result.Setup,
+		strconv.Itoa(result.Days),
+	}
+	return strings.ToLower(sanitizeCandidateID(strings.Join(parts, "_")))
+}
+
+func sanitizeCandidateID(value string) string {
+	var b strings.Builder
+	lastUnderscore := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func parseVerdictSet(flag string) map[string]bool {
+	values := parseCSVFlag(flag)
+	if len(values) == 0 {
+		values = []string{"PASS"}
+	}
+	out := make(map[string]bool, len(values))
+	for _, value := range values {
+		out[strings.ToUpper(value)] = true
+	}
+	return out
+}
+
 func writeBacktestGridCSV(path string, results []backtestGridResult) error {
 	file, err := os.Create(path)
 	if err != nil {
@@ -596,7 +1065,7 @@ func writeBacktestGridCSV(path string, results []backtestGridResult) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	header := []string{"verdict", "reason", "symbol", "exchange", "strategy", "timeframe", "days", "setup", "regime", "candles", "trades", "validation_trades", "return_pct", "validation_return_pct", "train_return_pct", "win_rate", "profit_factor", "expectancy", "max_drawdown_pct", "sharpe_ratio", "score", "error"}
+	header := []string{"verdict", "reason", "symbol", "exchange", "strategy", "param_variant", "parameters", "timeframe", "days", "setup", "regime", "candles", "trades", "validation_trades", "return_pct", "validation_return_pct", "train_return_pct", "win_rate", "profit_factor", "expectancy", "max_drawdown_pct", "sharpe_ratio", "score", "error"}
 	if err := writer.Write(header); err != nil {
 		return err
 	}
@@ -607,6 +1076,8 @@ func writeBacktestGridCSV(path string, results []backtestGridResult) error {
 			r.Symbol,
 			r.Exchange,
 			r.Strategy,
+			r.ParamVariant,
+			r.Parameters,
 			r.Timeframe,
 			strconv.Itoa(r.Days),
 			r.Setup,

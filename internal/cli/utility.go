@@ -316,6 +316,7 @@ func newBacktestCmd(app *App) *cobra.Command {
 	cmd.Flags().Bool("short", false, "Allow short selling")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 	cmd.AddCommand(newBacktestGridCmd(app))
+	cmd.AddCommand(newBacktestDiscoverCmd(app))
 
 	return cmd
 }

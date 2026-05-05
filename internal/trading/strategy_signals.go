@@ -241,26 +241,38 @@ func (be *DefaultBacktestEngine) donchianStrategy(params map[string]interface{},
 
 // multiIndicatorStrategy combines EMA crossover with RSI, ADX, and volume filters.
 func (be *DefaultBacktestEngine) multiIndicatorStrategy(params map[string]interface{}, allCandles []models.Candle) SignalGenerator {
-	shortEMA := indicators.NewEMA(9)
-	longEMA := indicators.NewEMA(21)
+	shortPeriod := getIntParam(params, "short_period", 9)
+	longPeriod := getIntParam(params, "long_period", 21)
+	rsiPeriod := getIntParam(params, "rsi_period", 14)
+	rsiMin := getFloatParam(params, "rsi_min", 30.0)
+	rsiMax := getFloatParam(params, "rsi_max", 70.0)
+	adxPeriod := getIntParam(params, "adx_period", 14)
+	adxThreshold := getFloatParam(params, "adx_threshold", 20.0)
+	volumePeriod := getIntParam(params, "volume_period", 20)
+	volumeMultiplier := getFloatParam(params, "volume_multiplier", 1.2)
+	requireVolume := getBoolParam(params, "require_volume", false)
+	requireADX := getBoolParam(params, "require_adx", false)
+
+	shortEMA := indicators.NewEMA(shortPeriod)
+	longEMA := indicators.NewEMA(longPeriod)
 	shortVals, _ := shortEMA.Calculate(allCandles)
 	longVals, _ := longEMA.Calculate(allCandles)
 
-	rsi := indicators.NewRSI(14)
+	rsi := indicators.NewRSI(rsiPeriod)
 	rsiVals, _ := rsi.Calculate(allCandles)
 
-	adx := indicators.NewADX(14)
+	adx := indicators.NewADX(adxPeriod)
 	adxVals, _ := adx.Calculate(allCandles)
 
 	var avgVolumes []float64
-	if len(allCandles) >= 20 {
+	if volumePeriod > 1 && len(allCandles) >= volumePeriod {
 		avgVolumes = make([]float64, len(allCandles))
-		for i := 19; i < len(allCandles); i++ {
+		for i := volumePeriod - 1; i < len(allCandles); i++ {
 			var volSum float64
-			for j := i - 19; j <= i; j++ {
+			for j := i - volumePeriod + 1; j <= i; j++ {
 				volSum += float64(allCandles[j].Volume)
 			}
-			avgVolumes[i] = volSum / 20
+			avgVolumes[i] = volSum / float64(volumePeriod)
 		}
 	}
 
@@ -274,17 +286,17 @@ func (be *DefaultBacktestEngine) multiIndicatorStrategy(params map[string]interf
 
 		emaCross := shortVals[index-1] <= longVals[index-1] && shortVals[index] > longVals[index]
 		emaCrossDown := shortVals[index-1] >= longVals[index-1] && shortVals[index] < longVals[index]
-		rsiOK := rsiVals[index] > 30 && rsiVals[index] < 70
+		rsiOK := rsiVals[index] > rsiMin && rsiVals[index] < rsiMax
 
 		volumeOK := true
 		if avgVolumes != nil && index < len(avgVolumes) && avgVolumes[index] > 0 {
-			volumeOK = float64(candles[index].Volume) > avgVolumes[index]*1.2
+			volumeOK = float64(candles[index].Volume) > avgVolumes[index]*volumeMultiplier
 		}
 
 		trendStrong := true
 		if adxVals != nil {
 			if adxLine, ok := adxVals["adx"]; ok && index < len(adxLine) {
-				trendStrong = adxLine[index] > 20
+				trendStrong = adxLine[index] > adxThreshold
 			}
 		}
 
@@ -296,10 +308,18 @@ func (be *DefaultBacktestEngine) multiIndicatorStrategy(params map[string]interf
 			confidence += 10
 		}
 
-		if emaCross && rsiOK && (volumeOK || trendStrong) {
+		confirmationOK := volumeOK || trendStrong
+		if requireVolume {
+			confirmationOK = confirmationOK && volumeOK
+		}
+		if requireADX {
+			confirmationOK = confirmationOK && trendStrong
+		}
+
+		if emaCross && rsiOK && confirmationOK {
 			return "BUY", confidence
 		}
-		if emaCrossDown && rsiOK && (volumeOK || trendStrong) {
+		if emaCrossDown && rsiOK && confirmationOK {
 			return "SELL", confidence
 		}
 		return "HOLD", 0

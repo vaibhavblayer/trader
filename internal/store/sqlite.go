@@ -286,6 +286,43 @@ func (s *SQLiteStore) initSchema() error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	-- Promoted backtest candidates for disciplined paper soak
+	CREATE TABLE IF NOT EXISTS paper_candidates (
+		id TEXT PRIMARY KEY,
+		status TEXT NOT NULL,
+		symbol TEXT NOT NULL,
+		exchange TEXT NOT NULL,
+		strategy TEXT NOT NULL,
+		param_variant TEXT NOT NULL,
+		parameters TEXT,
+		timeframe TEXT NOT NULL,
+		setup TEXT NOT NULL,
+		source TEXT NOT NULL,
+		verdict TEXT NOT NULL,
+		reason TEXT,
+		days INTEGER NOT NULL,
+		candles INTEGER NOT NULL,
+		trades INTEGER NOT NULL,
+		validation_trades INTEGER NOT NULL,
+		return_pct REAL NOT NULL,
+		train_return_pct REAL NOT NULL,
+		validation_return_pct REAL NOT NULL,
+		win_rate REAL NOT NULL,
+		profit_factor REAL NOT NULL,
+		expectancy REAL NOT NULL,
+		max_drawdown_pct REAL NOT NULL,
+		sharpe_ratio REAL NOT NULL,
+		stop_loss_percent REAL,
+		take_profit_percent REAL,
+		trailing_stop_percent REAL,
+		allow_short INTEGER DEFAULT 0,
+		allowed_regimes TEXT NOT NULL DEFAULT '[]',
+		blocked_regimes TEXT NOT NULL DEFAULT '[]',
+		regime_stats TEXT NOT NULL DEFAULT '[]',
+		promoted_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	);
+
 	-- Durable autonomous daemon state and control gates
 	CREATE TABLE IF NOT EXISTS daemon_state (
 		id TEXT PRIMARY KEY,
@@ -332,6 +369,9 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_paper_predictions_symbol ON paper_predictions(symbol);
 	CREATE INDEX IF NOT EXISTS idx_paper_predictions_created ON paper_predictions(created_at);
 	CREATE INDEX IF NOT EXISTS idx_paper_predictions_evaluated ON paper_predictions(evaluated);
+	CREATE INDEX IF NOT EXISTS idx_paper_candidates_symbol ON paper_candidates(symbol);
+	CREATE INDEX IF NOT EXISTS idx_paper_candidates_status ON paper_candidates(status);
+	CREATE INDEX IF NOT EXISTS idx_paper_candidates_strategy ON paper_candidates(strategy);
 	CREATE INDEX IF NOT EXISTS idx_daemon_events_timestamp ON daemon_events(timestamp);
 	`
 
@@ -2131,6 +2171,200 @@ func (s *SQLiteStore) GetHistoricalCalibrationReport(ctx context.Context, filter
 	report.ByAction = calibrationStatsSlice(byAction)
 
 	return report, nil
+}
+
+// SavePaperCandidate inserts or updates a promoted paper-soak candidate.
+func (s *SQLiteStore) SavePaperCandidate(ctx context.Context, candidate *models.PaperCandidate) error {
+	if candidate == nil {
+		return fmt.Errorf("paper candidate is required")
+	}
+	if strings.TrimSpace(candidate.ID) == "" {
+		return fmt.Errorf("paper candidate ID is required")
+	}
+	if strings.TrimSpace(candidate.Symbol) == "" {
+		return fmt.Errorf("paper candidate symbol is required")
+	}
+	if strings.TrimSpace(candidate.Strategy) == "" {
+		return fmt.Errorf("paper candidate strategy is required")
+	}
+	if strings.TrimSpace(candidate.Timeframe) == "" {
+		return fmt.Errorf("paper candidate timeframe is required")
+	}
+	if strings.TrimSpace(candidate.Setup) == "" {
+		return fmt.Errorf("paper candidate setup is required")
+	}
+	if candidate.Status == "" {
+		candidate.Status = models.PaperCandidateStatusActive
+	}
+	if candidate.PromotedAt.IsZero() {
+		candidate.PromotedAt = time.Now()
+	}
+	candidate.UpdatedAt = time.Now()
+
+	allowedJSON, err := json.Marshal(candidate.AllowedRegimes)
+	if err != nil {
+		return fmt.Errorf("failed to encode allowed regimes: %w", err)
+	}
+	blockedJSON, err := json.Marshal(candidate.BlockedRegimes)
+	if err != nil {
+		return fmt.Errorf("failed to encode blocked regimes: %w", err)
+	}
+	regimeStatsJSON, err := json.Marshal(candidate.RegimeStats)
+	if err != nil {
+		return fmt.Errorf("failed to encode regime stats: %w", err)
+	}
+	allowShort := 0
+	if candidate.AllowShort {
+		allowShort = 1
+	}
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO paper_candidates (
+			id, status, symbol, exchange, strategy, param_variant, parameters, timeframe, setup,
+			source, verdict, reason, days, candles, trades, validation_trades, return_pct,
+			train_return_pct, validation_return_pct, win_rate, profit_factor, expectancy,
+			max_drawdown_pct, sharpe_ratio, stop_loss_percent, take_profit_percent,
+			trailing_stop_percent, allow_short, allowed_regimes, blocked_regimes, regime_stats,
+			promoted_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			status = excluded.status,
+			symbol = excluded.symbol,
+			exchange = excluded.exchange,
+			strategy = excluded.strategy,
+			param_variant = excluded.param_variant,
+			parameters = excluded.parameters,
+			timeframe = excluded.timeframe,
+			setup = excluded.setup,
+			source = excluded.source,
+			verdict = excluded.verdict,
+			reason = excluded.reason,
+			days = excluded.days,
+			candles = excluded.candles,
+			trades = excluded.trades,
+			validation_trades = excluded.validation_trades,
+			return_pct = excluded.return_pct,
+			train_return_pct = excluded.train_return_pct,
+			validation_return_pct = excluded.validation_return_pct,
+			win_rate = excluded.win_rate,
+			profit_factor = excluded.profit_factor,
+			expectancy = excluded.expectancy,
+			max_drawdown_pct = excluded.max_drawdown_pct,
+			sharpe_ratio = excluded.sharpe_ratio,
+			stop_loss_percent = excluded.stop_loss_percent,
+			take_profit_percent = excluded.take_profit_percent,
+			trailing_stop_percent = excluded.trailing_stop_percent,
+			allow_short = excluded.allow_short,
+			allowed_regimes = excluded.allowed_regimes,
+			blocked_regimes = excluded.blocked_regimes,
+			regime_stats = excluded.regime_stats,
+			updated_at = excluded.updated_at
+	`, candidate.ID, candidate.Status, candidate.Symbol, candidate.Exchange, candidate.Strategy,
+		candidate.ParamVariant, candidate.Parameters, candidate.Timeframe, candidate.Setup,
+		candidate.Source, candidate.Verdict, candidate.Reason, candidate.Days, candidate.Candles,
+		candidate.Trades, candidate.ValidationTrades, candidate.ReturnPct, candidate.TrainReturnPct,
+		candidate.ValidationReturnPct, candidate.WinRate, candidate.ProfitFactor, candidate.Expectancy,
+		candidate.MaxDrawdownPct, candidate.SharpeRatio, candidate.StopLossPercent,
+		candidate.TakeProfitPercent, candidate.TrailingStopPercent, allowShort,
+		string(allowedJSON), string(blockedJSON), string(regimeStatsJSON), candidate.PromotedAt, candidate.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save paper candidate: %w", err)
+	}
+	return nil
+}
+
+// GetPaperCandidates returns promoted paper-soak candidates.
+func (s *SQLiteStore) GetPaperCandidates(ctx context.Context, filter models.PaperCandidateFilter) ([]models.PaperCandidate, error) {
+	query := `
+		SELECT id, status, symbol, exchange, strategy, param_variant, COALESCE(parameters, ''),
+			timeframe, setup, source, verdict, COALESCE(reason, ''), days, candles, trades,
+			validation_trades, return_pct, train_return_pct, validation_return_pct, win_rate,
+			profit_factor, expectancy, max_drawdown_pct, sharpe_ratio, COALESCE(stop_loss_percent, 0),
+			COALESCE(take_profit_percent, 0), COALESCE(trailing_stop_percent, 0), allow_short,
+			allowed_regimes, blocked_regimes, regime_stats, promoted_at, updated_at
+		FROM paper_candidates WHERE 1=1
+	`
+	args := []interface{}{}
+	if filter.Symbol != "" {
+		query += " AND symbol = ?"
+		args = append(args, filter.Symbol)
+	}
+	if filter.Strategy != "" {
+		query += " AND strategy = ?"
+		args = append(args, filter.Strategy)
+	}
+	if filter.Status != "" {
+		query += " AND status = ?"
+		args = append(args, filter.Status)
+	}
+	query += " ORDER BY status ASC, validation_return_pct DESC, return_pct DESC, updated_at DESC"
+	if filter.Limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, filter.Limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query paper candidates: %w", err)
+	}
+	defer rows.Close()
+
+	candidates := make([]models.PaperCandidate, 0)
+	for rows.Next() {
+		var candidate models.PaperCandidate
+		var allowShort int
+		var allowedJSON, blockedJSON, regimeStatsJSON string
+		if err := rows.Scan(
+			&candidate.ID,
+			&candidate.Status,
+			&candidate.Symbol,
+			&candidate.Exchange,
+			&candidate.Strategy,
+			&candidate.ParamVariant,
+			&candidate.Parameters,
+			&candidate.Timeframe,
+			&candidate.Setup,
+			&candidate.Source,
+			&candidate.Verdict,
+			&candidate.Reason,
+			&candidate.Days,
+			&candidate.Candles,
+			&candidate.Trades,
+			&candidate.ValidationTrades,
+			&candidate.ReturnPct,
+			&candidate.TrainReturnPct,
+			&candidate.ValidationReturnPct,
+			&candidate.WinRate,
+			&candidate.ProfitFactor,
+			&candidate.Expectancy,
+			&candidate.MaxDrawdownPct,
+			&candidate.SharpeRatio,
+			&candidate.StopLossPercent,
+			&candidate.TakeProfitPercent,
+			&candidate.TrailingStopPercent,
+			&allowShort,
+			&allowedJSON,
+			&blockedJSON,
+			&regimeStatsJSON,
+			&candidate.PromotedAt,
+			&candidate.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan paper candidate: %w", err)
+		}
+		candidate.AllowShort = allowShort == 1
+		if err := json.Unmarshal([]byte(allowedJSON), &candidate.AllowedRegimes); err != nil {
+			return nil, fmt.Errorf("failed to decode allowed regimes for %s: %w", candidate.ID, err)
+		}
+		if err := json.Unmarshal([]byte(blockedJSON), &candidate.BlockedRegimes); err != nil {
+			return nil, fmt.Errorf("failed to decode blocked regimes for %s: %w", candidate.ID, err)
+		}
+		if err := json.Unmarshal([]byte(regimeStatsJSON), &candidate.RegimeStats); err != nil {
+			return nil, fmt.Errorf("failed to decode regime stats for %s: %w", candidate.ID, err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, rows.Err()
 }
 
 type calibrationAccumulator struct {

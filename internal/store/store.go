@@ -41,6 +41,8 @@ type DataStore interface {
 	GetPaperPredictions(ctx context.Context, filter PaperPredictionFilter) ([]models.PaperPrediction, error)
 	GetPaperPredictionReport(ctx context.Context, filter PaperPredictionFilter) (*models.PaperPredictionReport, error)
 	GetHistoricalCalibrationReport(ctx context.Context, filter PaperPredictionFilter) (*models.HistoricalCalibrationReport, error)
+	SavePaperCandidate(ctx context.Context, candidate *models.PaperCandidate) error
+	GetPaperCandidates(ctx context.Context, filter models.PaperCandidateFilter) ([]models.PaperCandidate, error)
 
 	// Autonomous daemon runtime state
 	SaveDaemonState(ctx context.Context, state *models.DaemonState) error

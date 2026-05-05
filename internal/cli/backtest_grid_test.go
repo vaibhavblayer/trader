@@ -1,11 +1,21 @@
 package cli
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"zerodha-trader/internal/models"
 )
+
+type fakePaperCandidateStore struct {
+	candidates []models.PaperCandidate
+}
+
+func (s *fakePaperCandidateStore) SavePaperCandidate(_ context.Context, candidate *models.PaperCandidate) error {
+	s.candidates = append(s.candidates, *candidate)
+	return nil
+}
 
 func TestParseCSVFlagPreservesTimeframeCase(t *testing.T) {
 	values := parseCSVFlag("15min, 1day,15min")
@@ -27,6 +37,21 @@ func TestParseBacktestSetups(t *testing.T) {
 	}
 	if setups[0].StopLoss != 3 || setups[1].TakeProfit != 4 || !setups[2].AllowShort {
 		t.Fatalf("unexpected setups: %#v", setups)
+	}
+}
+
+func TestStrategyParameterVariants(t *testing.T) {
+	variants := strategyParameterVariants("supertrend", "research")
+	if len(variants) < 3 {
+		t.Fatalf("expected research variants, got %#v", variants)
+	}
+	if variants[0].Name == "" || variants[0].ParameterS == "" {
+		t.Fatalf("expected named variant with formatted params: %#v", variants[0])
+	}
+
+	defaults := strategyParameterVariants("supertrend", "default")
+	if len(defaults) != 1 || defaults[0].Name != "default" || defaults[0].ParameterS != "" {
+		t.Fatalf("unexpected default variants: %#v", defaults)
 	}
 }
 
@@ -94,5 +119,98 @@ func TestClassifyBacktestRegime(t *testing.T) {
 
 	if regime := classifyBacktestRegime(candles); regime != "trend_up" {
 		t.Fatalf("expected trend_up, got %s", regime)
+	}
+}
+
+func TestAggregateBacktestRegimeSummary(t *testing.T) {
+	results := []backtestGridResult{
+		{
+			Verdict:      "WATCH",
+			Strategy:     "supertrend",
+			ParamVariant: "atr10_mult3",
+			Setup:        "sl2tp4",
+			Regimes: []backtestRegimeTradeStat{
+				{Regime: "trend_up", Trades: 2, Wins: 1, TotalPnL: 1000, Expectancy: 500, AvgHoldBars: 5},
+			},
+		},
+		{
+			Verdict:      "REJECT",
+			Strategy:     "supertrend",
+			ParamVariant: "atr10_mult3",
+			Setup:        "sl2tp4",
+			Regimes: []backtestRegimeTradeStat{
+				{Regime: "trend_up", Trades: 1, Wins: 1, TotalPnL: 500, Expectancy: 500, AvgHoldBars: 3},
+			},
+		},
+	}
+
+	summary := aggregateBacktestRegimeSummary(results)
+	if len(summary) != 1 {
+		t.Fatalf("expected 1 summary row, got %d", len(summary))
+	}
+	if summary[0].Trades != 3 || summary[0].Wins != 2 || summary[0].BestVerdict != "WATCH" {
+		t.Fatalf("unexpected summary: %#v", summary[0])
+	}
+	if summary[0].Expectancy != 500 {
+		t.Fatalf("expected expectancy 500, got %.2f", summary[0].Expectancy)
+	}
+}
+
+func TestPromoteBacktestGridCandidatesUsesRegimeGuardrails(t *testing.T) {
+	store := &fakePaperCandidateStore{}
+	results := []backtestGridResult{
+		{
+			Verdict:             "PASS",
+			Symbol:              "HDFCBANK",
+			Exchange:            "NSE",
+			Strategy:            "multi_indicator",
+			ParamVariant:        "fast",
+			Timeframe:           "1day",
+			Setup:               "short_sl2tp4",
+			Days:                1095,
+			Trades:              34,
+			ValidationTrades:    10,
+			ReturnPct:           5.57,
+			TrainReturnPct:      4.8,
+			ValidationReturnPct: 0.77,
+			ProfitFactor:        1.28,
+			AllowShort:          true,
+			Regimes: []backtestRegimeTradeStat{
+				{Regime: "range", Trades: 27, Expectancy: 1611},
+				{Regime: "trend_down", Trades: 2, Expectancy: -5762},
+				{Regime: "thin_sample", Trades: 1, Expectancy: 10000},
+			},
+		},
+		{Verdict: "REJECT", Symbol: "INFY", Strategy: "supertrend"},
+	}
+
+	promoted, err := promoteBacktestGridCandidates(context.Background(), store, results, map[string]bool{"PASS": true}, models.PaperCandidateStatusActive, 2)
+	if err != nil {
+		t.Fatalf("promote candidates: %v", err)
+	}
+	if len(promoted) != 1 || len(store.candidates) != 1 {
+		t.Fatalf("expected one promoted candidate, got %d/%d", len(promoted), len(store.candidates))
+	}
+	if promoted[0].ID == "" || promoted[0].AllowedRegimes[0] != "range" {
+		t.Fatalf("unexpected promoted candidate: %#v", promoted[0])
+	}
+	if len(promoted[0].BlockedRegimes) != 1 || promoted[0].BlockedRegimes[0] != "trend_down" {
+		t.Fatalf("unexpected blocked regimes: %#v", promoted[0].BlockedRegimes)
+	}
+}
+
+func TestParseParameterString(t *testing.T) {
+	params := parseParameterString("short_period=5;multiplier=2.5;require_adx=true;label=fast")
+	if params["short_period"] != 5 {
+		t.Fatalf("expected int param, got %#v", params["short_period"])
+	}
+	if params["multiplier"] != 2.5 {
+		t.Fatalf("expected float param, got %#v", params["multiplier"])
+	}
+	if params["require_adx"] != true {
+		t.Fatalf("expected bool param, got %#v", params["require_adx"])
+	}
+	if params["label"] != "fast" {
+		t.Fatalf("expected string param, got %#v", params["label"])
 	}
 }

@@ -305,6 +305,17 @@ func DefaultStrategyRegistry() *StrategyRegistry {
 		Name:        "multi_indicator",
 		Description: "EMA + RSI + ADX + volume filter",
 		Category:    "composite",
+		Parameters: map[string]interface{}{
+			"short_period":      9,
+			"long_period":       21,
+			"rsi_period":        14,
+			"rsi_min":           30.0,
+			"rsi_max":           70.0,
+			"adx_period":        14,
+			"adx_threshold":     20.0,
+			"volume_period":     20,
+			"volume_multiplier": 1.2,
+		},
 		Gates: []StrategyGate{
 			{Name: "ema_cross", Description: "EMA crossover fires"},
 			{Name: "rsi_filter", Description: "RSI is not overextended"},
@@ -318,7 +329,17 @@ func DefaultStrategyRegistry() *StrategyRegistry {
 		},
 		Metrics: commonStrategyMetrics("composite signals", "filter contribution"),
 		Warmup: func(params map[string]interface{}) int {
-			return 40
+			longPeriod := getIntParam(params, "long_period", 21)
+			rsiPeriod := getIntParam(params, "rsi_period", 14)
+			adxPeriod := getIntParam(params, "adx_period", 14)*2 + 2
+			volumePeriod := getIntParam(params, "volume_period", 20)
+			warmup := longPeriod
+			for _, candidate := range []int{rsiPeriod, adxPeriod, volumePeriod} {
+				if candidate > warmup {
+					warmup = candidate
+				}
+			}
+			return warmup + 2
 		},
 		Build: func(engine *DefaultBacktestEngine, params map[string]interface{}, candles []models.Candle) SignalGenerator {
 			return engine.multiIndicatorStrategy(params, candles)

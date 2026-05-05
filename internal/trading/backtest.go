@@ -63,6 +63,25 @@ func (be *DefaultBacktestEngine) RunOnCandles(ctx context.Context, config Backte
 	return be.RunEventDrivenOnCandles(ctx, config, candles)
 }
 
+// LatestSignal evaluates the configured strategy on the most recent candle.
+func (be *DefaultBacktestEngine) LatestSignal(config BacktestConfig, candles []models.Candle) (string, float64, error) {
+	config = be.applyDefaults(config)
+	if err := be.validateSimulationConfig(config); err != nil {
+		return "", 0, fmt.Errorf("invalid config: %w", err)
+	}
+	if len(candles) < 2 {
+		return "", 0, fmt.Errorf("insufficient data: need at least 2 candles, got %d", len(candles))
+	}
+	warmup := be.warmupPeriod(config.Strategy, config.Parameters)
+	index := len(candles) - 1
+	if index < warmup {
+		return "HOLD", 0, nil
+	}
+	signalGen := be.getSignalGenerator(config.Strategy, config.Parameters, candles)
+	signal, confidence := signalGen(candles, index)
+	return strings.ToUpper(signal), confidence, nil
+}
+
 // calculatePositionSize determines how many shares to buy.
 func (be *DefaultBacktestEngine) calculatePositionSize(capital, price float64, config BacktestConfig) int {
 	maxPct := config.MaxPositionPercent
@@ -414,6 +433,21 @@ func getFloatParam(params map[string]interface{}, key string, defaultVal float64
 			return val
 		case int:
 			return float64(val)
+		}
+	}
+	return defaultVal
+}
+
+func getBoolParam(params map[string]interface{}, key string, defaultVal bool) bool {
+	if params == nil {
+		return defaultVal
+	}
+	if v, ok := params[key]; ok {
+		switch val := v.(type) {
+		case bool:
+			return val
+		case string:
+			return strings.EqualFold(val, "true") || val == "1" || strings.EqualFold(val, "yes")
 		}
 	}
 	return defaultVal

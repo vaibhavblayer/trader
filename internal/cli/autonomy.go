@@ -110,7 +110,7 @@ func addPaperSoakFlags(cmd *cobra.Command) {
 	cmd.Flags().String("symbols", "RELIANCE,INFY,TCS,HDFCBANK,ICICIBANK", "Comma-separated symbols for soak plan")
 	cmd.Flags().String("symbol", "", "Filter reports by one symbol")
 	cmd.Flags().String("watchlist", "", "Watchlist name for soak plan")
-	cmd.Flags().String("window", "5m", "Prediction window for soak plan")
+	cmd.Flags().String("window", "24h", "Candidate paper prediction evaluation window for soak plan")
 	cmd.Flags().Float64("threshold", 65, "Prediction confidence threshold for soak plan")
 	cmd.Flags().Int("interval", 60, "Analysis interval seconds for soak plan")
 	cmd.Flags().Int("min-decisive", 20, "Minimum decisive paper predictions expected")
@@ -590,27 +590,42 @@ func buildPaperSoakReport(ctx context.Context, app *App, opts autonomyReadinessO
 
 func paperSoakCommandFromFlags(cmd *cobra.Command) string {
 	symbols, _ := cmd.Flags().GetString("symbols")
-	watchlist, _ := cmd.Flags().GetString("watchlist")
 	window, _ := cmd.Flags().GetString("window")
-	threshold, _ := cmd.Flags().GetFloat64("threshold")
-	interval, _ := cmd.Flags().GetInt("interval")
-	parts := []string{"trader", "paper"}
-	if watchlist != "" {
-		parts = append(parts, "--watchlist", watchlist)
-	} else {
-		for _, symbol := range strings.Split(symbols, ",") {
-			symbol = strings.ToUpper(strings.TrimSpace(symbol))
-			if symbol != "" {
-				parts = append(parts, symbol)
-			}
+	minDecisive, _ := cmd.Flags().GetInt("min-decisive")
+	minReviewed, _ := cmd.Flags().GetInt("min-reviewed-trades")
+	minWinRate, _ := cmd.Flags().GetFloat64("min-win-rate")
+	minExpectancy, _ := cmd.Flags().GetFloat64("min-expectancy")
+
+	candidateRun := []string{"trader", "paper", "candidate-run", "--window", window, "--limit", "100"}
+	symbolList := parseAutonomySoakSymbols(symbols)
+	if len(symbolList) == 1 {
+		candidateRun = append(candidateRun, "--symbol", symbolList[0])
+	}
+	evaluate := []string{"trader", "paper", "evaluate", "--limit", "100"}
+	review := []string{"trader", "paper", "candidate-review", "--limit", "100"}
+	readiness := []string{
+		"trader", "autonomy", "readiness",
+		"--phase", autonomyPhasePaperSoak,
+		"--min-decisive", fmt.Sprintf("%d", minDecisive),
+		"--min-reviewed-trades", fmt.Sprintf("%d", minReviewed),
+		"--min-win-rate", fmt.Sprintf("%.0f", minWinRate),
+		"--min-expectancy", fmt.Sprintf("%.2f", minExpectancy),
+	}
+	return strings.Join([]string{
+		strings.Join(candidateRun, " "),
+		strings.Join(evaluate, " "),
+		strings.Join(review, " "),
+		strings.Join(readiness, " "),
+	}, " && ")
+}
+
+func parseAutonomySoakSymbols(symbols string) []string {
+	result := make([]string, 0)
+	for _, symbol := range strings.Split(symbols, ",") {
+		symbol = strings.ToUpper(strings.TrimSpace(symbol))
+		if symbol != "" {
+			result = append(result, symbol)
 		}
 	}
-	parts = append(parts,
-		"--window", window,
-		"--threshold", fmt.Sprintf("%.0f", threshold),
-		"--interval", fmt.Sprintf("%d", interval),
-		"--tools",
-		"--verbose",
-	)
-	return strings.Join(parts, " ")
+	return result
 }
