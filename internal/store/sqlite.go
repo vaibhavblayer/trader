@@ -283,6 +283,24 @@ func (s *SQLiteStore) initSchema() error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	-- Durable autonomous daemon state and control gates
+	CREATE TABLE IF NOT EXISTS daemon_state (
+		id TEXT PRIMARY KEY,
+		state TEXT NOT NULL,
+		updated_at DATETIME NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS daemon_events (
+		id TEXT PRIMARY KEY,
+		timestamp DATETIME NOT NULL,
+		type TEXT NOT NULL,
+		status TEXT NOT NULL,
+		reason TEXT,
+		actor TEXT,
+		pid INTEGER,
+		hostname TEXT
+	);
+
 	-- Sync status table
 	CREATE TABLE IF NOT EXISTS sync_status (
 		data_type TEXT PRIMARY KEY,
@@ -311,6 +329,7 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_paper_predictions_symbol ON paper_predictions(symbol);
 	CREATE INDEX IF NOT EXISTS idx_paper_predictions_created ON paper_predictions(created_at);
 	CREATE INDEX IF NOT EXISTS idx_paper_predictions_evaluated ON paper_predictions(evaluated);
+	CREATE INDEX IF NOT EXISTS idx_daemon_events_timestamp ON daemon_events(timestamp);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -1391,6 +1410,109 @@ func confidenceBucket(confidence float64) string {
 	default:
 		return "90-100"
 	}
+}
+
+// SaveDaemonState persists the autonomous daemon runtime state.
+func (s *SQLiteStore) SaveDaemonState(ctx context.Context, state *models.DaemonState) error {
+	if state == nil {
+		return fmt.Errorf("daemon state is required")
+	}
+	if state.ID == "" {
+		state.ID = "default"
+	}
+	now := time.Now()
+	if state.UpdatedAt.IsZero() {
+		state.UpdatedAt = now
+	}
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("failed to encode daemon state: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO daemon_state (id, state, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
+	`, state.ID, string(stateJSON), state.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to save daemon state: %w", err)
+	}
+	return nil
+}
+
+// LoadDaemonState loads the current autonomous daemon runtime state.
+func (s *SQLiteStore) LoadDaemonState(ctx context.Context) (*models.DaemonState, error) {
+	var stateJSON string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT state FROM daemon_state WHERE id = 'default'
+	`).Scan(&stateJSON)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to load daemon state: %w", err)
+	}
+	var state models.DaemonState
+	if err := json.Unmarshal([]byte(stateJSON), &state); err != nil {
+		return nil, fmt.Errorf("failed to decode daemon state: %w", err)
+	}
+	return &state, nil
+}
+
+// AppendDaemonEvent records a daemon control state change.
+func (s *SQLiteStore) AppendDaemonEvent(ctx context.Context, event *models.DaemonEvent) error {
+	if event == nil {
+		return fmt.Errorf("daemon event is required")
+	}
+	if event.ID == "" {
+		event.ID = fmt.Sprintf("DEVT_%d", time.Now().UnixNano())
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO daemon_events (id, timestamp, type, status, reason, actor, pid, hostname)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, event.ID, event.Timestamp, event.Type, event.Status, event.Reason, event.Actor, event.PID, event.Hostname)
+	if err != nil {
+		return fmt.Errorf("failed to append daemon event: %w", err)
+	}
+	return nil
+}
+
+// GetDaemonEvents returns recent daemon control events.
+func (s *SQLiteStore) GetDaemonEvents(ctx context.Context, limit int) ([]models.DaemonEvent, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, timestamp, type, status, COALESCE(reason, ''), COALESCE(actor, ''), COALESCE(pid, 0), COALESCE(hostname, '')
+		FROM daemon_events
+		ORDER BY timestamp DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query daemon events: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]models.DaemonEvent, 0, limit)
+	for rows.Next() {
+		var event models.DaemonEvent
+		if err := rows.Scan(
+			&event.ID,
+			&event.Timestamp,
+			&event.Type,
+			&event.Status,
+			&event.Reason,
+			&event.Actor,
+			&event.PID,
+			&event.Hostname,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan daemon event: %w", err)
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
 }
 
 // UpdateDecisionOutcome updates the outcome and P&L of a decision.

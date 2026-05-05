@@ -41,6 +41,12 @@ type DataStore interface {
 	GetPaperPredictions(ctx context.Context, filter PaperPredictionFilter) ([]models.PaperPrediction, error)
 	GetPaperPredictionReport(ctx context.Context, filter PaperPredictionFilter) (*models.PaperPredictionReport, error)
 
+	// Autonomous daemon runtime state
+	SaveDaemonState(ctx context.Context, state *models.DaemonState) error
+	LoadDaemonState(ctx context.Context) (*models.DaemonState, error)
+	AppendDaemonEvent(ctx context.Context, event *models.DaemonEvent) error
+	GetDaemonEvents(ctx context.Context, limit int) ([]models.DaemonEvent, error)
+
 	// Watchlist
 	AddToWatchlist(ctx context.Context, symbol, listName string) error
 	RemoveFromWatchlist(ctx context.Context, symbol, listName string) error

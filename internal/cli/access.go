@@ -75,7 +75,10 @@ func (app *App) checkModifyWatchlist(ctx context.Context) error {
 }
 
 func (app *App) checkAutoTrade(ctx context.Context) error {
-	return app.checkPermission(ctx, security.OpAutoTrade)
+	if err := app.checkPermission(ctx, security.OpAutoTrade); err != nil {
+		return err
+	}
+	return app.checkDaemonExecutionGate(ctx)
 }
 
 func (app *App) checkModifyConfig(ctx context.Context) error {

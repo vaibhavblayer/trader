@@ -32,6 +32,7 @@ func addTraderCommands(rootCmd *cobra.Command, app *App) {
 	cmd.AddCommand(newTraderStatusCmd(app))
 	cmd.AddCommand(newTraderPauseCmd(app))
 	cmd.AddCommand(newTraderResumeCmd(app))
+	cmd.AddCommand(newTraderKillSwitchCmd(app))
 	cmd.AddCommand(newTraderDecisionsCmd(app))
 	cmd.AddCommand(newTraderConfigCmd(app))
 	cmd.AddCommand(newTraderHealthCmd(app))
@@ -89,9 +90,40 @@ The daemon will:
 			dryRun, _ := cmd.Flags().GetBool("dry-run")
 			watchlist, _ := cmd.Flags().GetString("watchlist")
 			interval, _ := cmd.Flags().GetInt("interval")
+			controlCtx, controlCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer controlCancel()
 
 			output.Bold("Starting Autonomous Trading Daemon")
 			output.Println()
+
+			persistedState, err := loadDaemonStateOrDefault(controlCtx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
+			if persistedState.KillSwitchActive {
+				reason := persistedState.KillSwitchReason
+				if reason == "" {
+					reason = "no reason recorded"
+				}
+				err := fmt.Errorf("daemon kill switch is active: %s", reason)
+				output.Error("%v", err)
+				output.Dim("Run 'trader trader kill-switch clear --reason <reason>' before starting again.")
+				return err
+			}
+			if persistedState.Paused || persistedState.Status == models.DaemonStatusPaused {
+				err := fmt.Errorf("daemon is paused; run 'trader trader resume' before starting")
+				output.Error("%v", err)
+				return err
+			}
+			if daemonHeartbeatFresh(persistedState) && (persistedState.Status == models.DaemonStatusRunning || persistedState.Status == models.DaemonStatusPaused) {
+				err := fmt.Errorf("daemon already appears active: pid %d on %s, last heartbeat %s",
+					persistedState.PID,
+					persistedState.Hostname,
+					FormatDateTime(persistedState.LastHeartbeatAt))
+				output.Error("%v", err)
+				return err
+			}
 
 			// Validate prerequisites
 			if app.Broker == nil {
@@ -140,12 +172,34 @@ The daemon will:
 			output.Printf("  Monitoring %d symbols\n", len(symbols))
 			output.Println()
 
-			// Create orchestrator with agents
-			orchestrator := createOrchestrator(app)
-
 			// Start the daemon
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			startedAt := time.Now()
+			runtimeState := &models.DaemonState{
+				ID:              defaultDaemonStateID,
+				Status:          models.DaemonStatusRunning,
+				PID:             os.Getpid(),
+				Hostname:        daemonHostname(),
+				StartedAt:       startedAt,
+				UpdatedAt:       startedAt,
+				LastHeartbeatAt: startedAt,
+				Watchlist:       watchlist,
+				Symbols:         symbols,
+				DryRun:          dryRun,
+				IntervalSeconds: interval,
+				Mode:            app.Config.Agents.AutonomousMode,
+				SafetyProfile:   app.Config.SafetyProfile(),
+				Message:         "daemon started",
+			}
+			if err := saveDaemonStateWithEvent(ctx, app, runtimeState, "START", "daemon started"); err != nil {
+				output.Error("Failed to persist daemon state: %v", err)
+				return err
+			}
+			defer markDaemonStopped(context.Background(), app, "daemon process exited")
+
+			// Create orchestrator with agents
+			orchestrator := createOrchestrator(app)
 
 			// Handle graceful shutdown
 			sigChan := make(chan os.Signal, 1)
@@ -173,12 +227,31 @@ The daemon will:
 			defer ticker.Stop()
 
 			scanCount := 0
+			lastControlMessage := ""
 			for {
 				select {
 				case <-ctx.Done():
 					output.Info("Daemon stopped")
 					return nil
 				case <-ticker.C:
+					controlState, stopRequested, blocked, message, err := refreshDaemonRuntimeState(ctx, app, runtimeState)
+					if err != nil {
+						output.Warning("Failed to refresh daemon state: %v", err)
+					} else if controlState != nil {
+						runtimeState = controlState
+					}
+					if stopRequested {
+						output.Info("Stop requested; daemon exiting")
+						return nil
+					}
+					if blocked {
+						if message != "" && message != lastControlMessage {
+							output.Warning("%s", message)
+							lastControlMessage = message
+						}
+						continue
+					}
+					lastControlMessage = ""
 					scanCount++
 					output.Dim("[%s] Scan #%d - Analyzing %d symbols...",
 						time.Now().Format("15:04:05"), scanCount, len(symbols))
@@ -221,10 +294,37 @@ func newTraderStopCmd(app *App) *cobra.Command {
 		Short: "Stop the autonomous trading daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 
-			err := fmt.Errorf("persistent daemon control is not implemented; stop the foreground trader process with Ctrl+C or your process manager")
-			output.Error("%v", err)
-			return err
+			state, err := loadDaemonStateOrDefault(ctx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
+			if !daemonHeartbeatFresh(state) {
+				state.Status = models.DaemonStatusStopped
+				state.StopRequested = false
+				state.Paused = false
+				state.PID = 0
+				state.Message = "no active daemon heartbeat"
+				if err := saveDaemonStateWithEvent(ctx, app, state, "STOP", state.Message); err != nil {
+					output.Error("Failed to save daemon state: %v", err)
+					return err
+				}
+				output.Info("No active daemon heartbeat found; state marked stopped")
+				return nil
+			}
+
+			state.Status = models.DaemonStatusStopRequested
+			state.StopRequested = true
+			state.Message = "stop requested from CLI"
+			if err := saveDaemonStateWithEvent(ctx, app, state, "STOP_REQUESTED", state.Message); err != nil {
+				output.Error("Failed to request daemon stop: %v", err)
+				return err
+			}
+			output.Success("Stop requested. The daemon will exit on its next control check.")
+			return nil
 		},
 	}
 }
@@ -235,31 +335,40 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 		Short: "Show daemon status",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			state, err := loadDaemonStateOrDefault(ctx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
 
 			status := struct {
-				Tracked               bool     `json:"tracked"`
-				Mode                  string   `json:"mode"`
-				SafetyProfile         string   `json:"safety_profile"`
-				AutoTradeAllowed      bool     `json:"auto_trade_allowed"`
-				LLMOrderAuthority     bool     `json:"llm_order_authority"`
-				AutoExecuteThreshold  float64  `json:"auto_execute_threshold"`
-				MaxDailyTrades        int      `json:"max_daily_trades"`
-				MaxDailyLoss          float64  `json:"max_daily_loss"`
-				ConsecutiveLossLimit  int      `json:"consecutive_loss_limit"`
-				EnabledAgents         []string `json:"enabled_agents"`
-				PersistentStateStatus string   `json:"persistent_state_status"`
+				Tracked              bool                `json:"tracked"`
+				Runtime              *models.DaemonState `json:"runtime"`
+				HeartbeatFresh       bool                `json:"heartbeat_fresh"`
+				Mode                 string              `json:"mode"`
+				SafetyProfile        string              `json:"safety_profile"`
+				AutoTradeAllowed     bool                `json:"auto_trade_allowed"`
+				LLMOrderAuthority    bool                `json:"llm_order_authority"`
+				AutoExecuteThreshold float64             `json:"auto_execute_threshold"`
+				MaxDailyTrades       int                 `json:"max_daily_trades"`
+				MaxDailyLoss         float64             `json:"max_daily_loss"`
+				ConsecutiveLossLimit int                 `json:"consecutive_loss_limit"`
+				EnabledAgents        []string            `json:"enabled_agents"`
 			}{
-				Tracked:               false,
-				Mode:                  app.Config.Agents.AutonomousMode,
-				SafetyProfile:         app.Config.SafetyProfile(),
-				AutoTradeAllowed:      app.Config.SafetyCapabilities().AutoTrade,
-				LLMOrderAuthority:     app.Config.SafetyCapabilities().LLMOrderAuthority,
-				AutoExecuteThreshold:  app.Config.Agents.AutoExecuteThreshold,
-				MaxDailyTrades:        app.Config.Agents.MaxDailyTrades,
-				MaxDailyLoss:          app.Config.Agents.MaxDailyLoss,
-				ConsecutiveLossLimit:  app.Config.Agents.ConsecutiveLossLimit,
-				EnabledAgents:         app.Config.Agents.EnabledAgents,
-				PersistentStateStatus: "not implemented",
+				Tracked:              true,
+				Runtime:              state,
+				HeartbeatFresh:       daemonHeartbeatFresh(state),
+				Mode:                 app.Config.Agents.AutonomousMode,
+				SafetyProfile:        app.Config.SafetyProfile(),
+				AutoTradeAllowed:     app.Config.SafetyCapabilities().AutoTrade,
+				LLMOrderAuthority:    app.Config.SafetyCapabilities().LLMOrderAuthority,
+				AutoExecuteThreshold: app.Config.Agents.AutoExecuteThreshold,
+				MaxDailyTrades:       app.Config.Agents.MaxDailyTrades,
+				MaxDailyLoss:         app.Config.Agents.MaxDailyLoss,
+				ConsecutiveLossLimit: app.Config.Agents.ConsecutiveLossLimit,
+				EnabledAgents:        app.Config.Agents.EnabledAgents,
 			}
 
 			if output.IsJSON() {
@@ -269,8 +378,20 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 			output.Bold("Autonomous Trading Daemon Status")
 			output.Println()
 
-			output.Printf("  Runtime State: %s\n", output.Yellow("not tracked by this command"))
-			output.Printf("  Mode:          %s\n", status.Mode)
+			output.Printf("  Runtime State:  %s\n", state.Status)
+			output.Printf("  Heartbeat:      %s\n", formatPassStatus(output, status.HeartbeatFresh))
+			if !state.LastHeartbeatAt.IsZero() {
+				output.Printf("  Last Heartbeat: %s\n", FormatDateTime(state.LastHeartbeatAt))
+			}
+			if state.PID > 0 {
+				output.Printf("  PID/Host:       %d on %s\n", state.PID, state.Hostname)
+			}
+			output.Printf("  Paused:         %s\n", formatPausedStatus(output, state.Paused))
+			output.Printf("  Kill Switch:    %s\n", formatActiveStatus(output, state.KillSwitchActive))
+			if state.KillSwitchReason != "" {
+				output.Printf("  Kill Reason:    %s\n", state.KillSwitchReason)
+			}
+			output.Printf("  Mode:           %s\n", status.Mode)
 			output.Printf("  Safety Profile: %s\n", status.SafetyProfile)
 			output.Printf("  Profile Auto Trading: %s\n", formatBoolStatus(output, status.AutoTradeAllowed))
 			output.Printf("  Profile LLM Orders:   %s\n", formatBoolStatus(output, status.LLMOrderAuthority))
@@ -287,8 +408,6 @@ func newTraderStatusCmd(app *App) *cobra.Command {
 			for _, agent := range status.EnabledAgents {
 				output.Printf("  • %s\n", agent)
 			}
-			output.Println()
-			output.Dim("Persistent daemon runtime state is not available yet; this command reports configuration only.")
 
 			return nil
 		},
@@ -307,6 +426,20 @@ func formatPassStatus(output *Output, passed bool) string {
 		return output.Green("PASS")
 	}
 	return output.Yellow("WARN")
+}
+
+func formatActiveStatus(output *Output, active bool) string {
+	if active {
+		return output.Red("active")
+	}
+	return output.Green("inactive")
+}
+
+func formatPausedStatus(output *Output, paused bool) string {
+	if paused {
+		return output.Yellow("paused")
+	}
+	return output.Green("no")
 }
 
 func uniqueDecisionDisplayIDs(decisions []models.Decision) map[string]string {
@@ -385,10 +518,23 @@ func newTraderPauseCmd(app *App) *cobra.Command {
 		Long:  "Pause trading without stopping the daemon. Analysis continues but no trades are executed.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 
-			err := fmt.Errorf("persistent daemon pause/resume state is not implemented yet")
-			output.Error("%v", err)
-			return err
+			state, err := loadDaemonStateOrDefault(ctx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
+			state.Status = models.DaemonStatusPaused
+			state.Paused = true
+			state.Message = "paused from CLI"
+			if err := saveDaemonStateWithEvent(ctx, app, state, "PAUSE", state.Message); err != nil {
+				output.Error("Failed to pause daemon: %v", err)
+				return err
+			}
+			output.Success("Daemon paused. Autonomous scans will stay halted until resume.")
+			return nil
 		},
 	}
 }
@@ -399,12 +545,160 @@ func newTraderResumeCmd(app *App) *cobra.Command {
 		Short: "Resume the trading daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
 
-			err := fmt.Errorf("persistent daemon pause/resume state is not implemented yet")
-			output.Error("%v", err)
-			return err
+			state, err := loadDaemonStateOrDefault(ctx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
+			if state.KillSwitchActive {
+				err := fmt.Errorf("kill switch is active; clear it before resuming")
+				output.Error("%v", err)
+				return err
+			}
+			state.Paused = false
+			state.StopRequested = false
+			if daemonHeartbeatFresh(state) {
+				state.Status = models.DaemonStatusRunning
+				state.Message = "resumed from CLI"
+			} else {
+				state.Status = models.DaemonStatusStopped
+				state.Message = "resume cleared pause, but no active daemon heartbeat exists"
+			}
+			if err := saveDaemonStateWithEvent(ctx, app, state, "RESUME", state.Message); err != nil {
+				output.Error("Failed to resume daemon: %v", err)
+				return err
+			}
+			output.Success("%s", state.Message)
+			return nil
 		},
 	}
+}
+
+func newTraderKillSwitchCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "kill-switch",
+		Short: "Manage the autonomous daemon kill switch",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return newTraderKillSwitchStatusCmd(app).RunE(cmd, args)
+		},
+	}
+	cmd.AddCommand(newTraderKillSwitchStatusCmd(app))
+	cmd.AddCommand(newTraderKillSwitchEngageCmd(app))
+	cmd.AddCommand(newTraderKillSwitchClearCmd(app))
+	return cmd
+}
+
+func newTraderKillSwitchStatusCmd(app *App) *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show kill switch state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			state, err := loadDaemonStateOrDefault(ctx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
+			if output.IsJSON() {
+				return output.JSON(state)
+			}
+			output.Bold("Daemon Kill Switch")
+			output.Printf("  Active: %s\n", formatActiveStatus(output, state.KillSwitchActive))
+			if state.KillSwitchReason != "" {
+				output.Printf("  Reason: %s\n", state.KillSwitchReason)
+			}
+			if state.KillSwitchActivatedAt != nil && !state.KillSwitchActivatedAt.IsZero() {
+				output.Printf("  Since:  %s\n", FormatDateTime(*state.KillSwitchActivatedAt))
+			}
+			if state.KillSwitchActivatedBy != "" {
+				output.Printf("  Actor:  %s\n", state.KillSwitchActivatedBy)
+			}
+			return nil
+		},
+	}
+}
+
+func newTraderKillSwitchEngageCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "engage",
+		Short: "Engage the kill switch and halt autonomous daemon execution",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			reason, _ := cmd.Flags().GetString("reason")
+			reason = strings.TrimSpace(reason)
+			if reason == "" {
+				reason = "manual kill switch"
+			}
+			state, err := loadDaemonStateOrDefault(ctx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
+			now := time.Now()
+			state.KillSwitchActive = true
+			state.KillSwitchReason = reason
+			state.KillSwitchActivatedAt = &now
+			state.KillSwitchActivatedBy = daemonActor()
+			state.Paused = true
+			state.Status = models.DaemonStatusPaused
+			state.Message = "kill switch engaged: " + reason
+			if err := saveDaemonStateWithEvent(ctx, app, state, "KILL_SWITCH_ENGAGED", reason); err != nil {
+				output.Error("Failed to engage kill switch: %v", err)
+				return err
+			}
+			output.Success("Kill switch engaged. Autonomous daemon execution is blocked.")
+			return nil
+		},
+	}
+	cmd.Flags().String("reason", "", "Reason for engaging the kill switch")
+	return cmd
+}
+
+func newTraderKillSwitchClearCmd(app *App) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "clear",
+		Short: "Clear the kill switch without automatically resuming the daemon",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			reason, _ := cmd.Flags().GetString("reason")
+			reason = strings.TrimSpace(reason)
+			if reason == "" {
+				reason = "manual clear"
+			}
+			state, err := loadDaemonStateOrDefault(ctx, app)
+			if err != nil {
+				output.Error("Failed to load daemon state: %v", err)
+				return err
+			}
+			state.KillSwitchActive = false
+			state.KillSwitchReason = ""
+			state.KillSwitchActivatedAt = nil
+			state.KillSwitchActivatedBy = ""
+			state.Paused = true
+			state.Status = models.DaemonStatusPaused
+			state.Message = "kill switch cleared; daemon remains paused until resume"
+			if err := saveDaemonStateWithEvent(ctx, app, state, "KILL_SWITCH_CLEARED", reason); err != nil {
+				output.Error("Failed to clear kill switch: %v", err)
+				return err
+			}
+			output.Success("Kill switch cleared. Run 'trader trader resume' to allow the daemon to continue.")
+			return nil
+		},
+	}
+	cmd.Flags().String("reason", "", "Reason for clearing the kill switch")
+	return cmd
 }
 
 func newTraderDecisionsCmd(app *App) *cobra.Command {
@@ -901,6 +1195,7 @@ func newTraderHealthCmd(app *App) *cobra.Command {
 				ProfileAutoTrade       bool   `json:"profile_auto_trade"`
 				ProfileLLMOrders       bool   `json:"profile_llm_orders"`
 				RuntimeStateTracked    bool   `json:"runtime_state_tracked"`
+				KillSwitchActive       bool   `json:"kill_switch_active"`
 				ExternalServicesProbed bool   `json:"external_services_probed"`
 			}{
 				MemoryMB:               mem.Alloc / 1024 / 1024,
@@ -909,7 +1204,7 @@ func newTraderHealthCmd(app *App) *cobra.Command {
 				StoreReady:             app.Store != nil,
 				BrokerInitialized:      app.Broker != nil,
 				LLMClientConfigured:    app.LLMClient != nil,
-				RuntimeStateTracked:    false,
+				RuntimeStateTracked:    app.Store != nil,
 				ExternalServicesProbed: false,
 			}
 			if app.Config != nil {
@@ -921,6 +1216,13 @@ func newTraderHealthCmd(app *App) *cobra.Command {
 			}
 			if app.Broker != nil {
 				health.BrokerAuthenticated = app.Broker.IsAuthenticated()
+			}
+			if app.Store != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if state, err := app.Store.LoadDaemonState(ctx); err == nil && state != nil {
+					health.KillSwitchActive = state.KillSwitchActive
+				}
 			}
 
 			if output.IsJSON() {
@@ -948,10 +1250,10 @@ func newTraderHealthCmd(app *App) *cobra.Command {
 			output.Printf("  Safety Profile: %s\n", health.SafetyProfile)
 			output.Printf("  Auto Trading:  %s\n", formatBoolStatus(output, health.ProfileAutoTrade))
 			output.Printf("  LLM Orders:    %s\n", formatBoolStatus(output, health.ProfileLLMOrders))
+			output.Printf("  Kill Switch:   %s\n", formatActiveStatus(output, health.KillSwitchActive))
 			output.Println()
 
 			output.Dim("External Zerodha/OpenAI/WebSocket connectivity is not probed by this local health command.")
-			output.Dim("Persistent daemon runtime state is not available yet.")
 
 			return nil
 		},
