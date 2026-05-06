@@ -346,6 +346,50 @@ func DefaultStrategyRegistry() *StrategyRegistry {
 		},
 	})
 	mustRegisterStrategy(r, StrategyDefinition{
+		Name:        "intraday_momentum",
+		Description: "Intraday EMA-aligned momentum breakout/continuation",
+		Category:    "intraday",
+		Parameters: map[string]interface{}{
+			"mode":              "breakout",
+			"lookback_period":   8,
+			"ema_period":        9,
+			"volume_period":     20,
+			"volume_multiplier": 1.1,
+			"min_move_pct":      0.08,
+			"min_range_pct":     0.12,
+			"require_volume":    false,
+			"require_range":     false,
+		},
+		Gates: []StrategyGate{
+			{Name: "momentum_trigger", Description: "price breaks a recent range or continues with enough candle movement"},
+			{Name: "ema_alignment", Description: "close is aligned with the intraday EMA direction"},
+			{Name: "activity_confirmation", Description: "volume expansion or candle range confirms participation"},
+		},
+		Risk: StrategyRiskModel{
+			DefaultStopLossPercent:    1,
+			DefaultTakeProfitPercent:  2,
+			DefaultMaxPositionPercent: 25,
+			MinRiskReward:             1.5,
+			AllowShort:                true,
+		},
+		Metrics: commonStrategyMetrics("intraday momentum signals", "forward paper signal activity"),
+		Warmup: func(params map[string]interface{}) int {
+			lookback := getIntParam(params, "lookback_period", 8)
+			emaPeriod := getIntParam(params, "ema_period", 9)
+			volumePeriod := getIntParam(params, "volume_period", 20)
+			warmup := lookback
+			for _, candidate := range []int{emaPeriod, volumePeriod} {
+				if candidate > warmup {
+					warmup = candidate
+				}
+			}
+			return warmup + 2
+		},
+		Build: func(engine *DefaultBacktestEngine, params map[string]interface{}, candles []models.Candle) SignalGenerator {
+			return engine.intradayMomentumStrategy(params, candles)
+		},
+	})
+	mustRegisterStrategy(r, StrategyDefinition{
 		Name:        "buy_and_hold",
 		Description: "Baseline next-bar buy-and-hold",
 		Category:    "baseline",

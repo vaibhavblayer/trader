@@ -22,9 +22,9 @@ var (
 	// API key patterns for detection (not validation)
 	apiKeyPatterns = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(api[_-]?key|apikey|api[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer)[=:\s]+["']?([A-Za-z0-9_\-\.]{20,})["']?`),
-		regexp.MustCompile(`(?i)(sk-[A-Za-z0-9]{20,})`),                    // OpenAI keys
-		regexp.MustCompile(`(?i)(tvly-[A-Za-z0-9]{20,})`),                  // Tavily keys
-		regexp.MustCompile(`(?i)([A-Za-z0-9]{32,})`),                       // Generic long tokens
+		regexp.MustCompile(`(?i)(sk-[A-Za-z0-9]{20,})`),   // OpenAI keys
+		regexp.MustCompile(`(?i)(tvly-[A-Za-z0-9]{20,})`), // Legacy web-search keys
+		regexp.MustCompile(`(?i)([A-Za-z0-9]{32,})`),      // Generic long tokens
 	}
 
 	// SQL injection patterns

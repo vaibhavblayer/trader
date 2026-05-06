@@ -14,13 +14,13 @@ import (
 // Requirements: 11.2, 35.1-35.11
 type ResearchAgent struct {
 	BaseAgent
-	llmClient   LLMClient
-	webSearch   WebSearchClient
-	cache       *ResearchCache
-	cacheTTL    time.Duration
+	llmClient LLMClient
+	webSearch WebSearchClient
+	cache     *ResearchCache
+	cacheTTL  time.Duration
 }
 
-// WebSearchClient defines the interface for web search operations (e.g., Tavily API).
+// WebSearchClient defines the interface for external web search operations.
 type WebSearchClient interface {
 	// Search performs a web search and returns results.
 	Search(ctx context.Context, query string, maxResults int) ([]SearchResult, error)

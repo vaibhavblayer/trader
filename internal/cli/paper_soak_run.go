@@ -82,6 +82,11 @@ evidence for pause/ready status, and optionally prints autonomy readiness.`,
 			return runPaperSoakRun(cmd, app)
 		},
 	}
+	addPaperSoakRunFlags(cmd)
+	return cmd
+}
+
+func addPaperSoakRunFlags(cmd *cobra.Command) {
 	cmd.Flags().String("symbol", "", "Filter by symbol")
 	cmd.Flags().String("strategy", "", "Filter by strategy")
 	cmd.Flags().String("status", models.PaperCandidateStatusActive, "Candidate status to run")
@@ -103,7 +108,6 @@ evidence for pause/ready status, and optionally prints autonomy readiness.`,
 	cmd.Flags().Int("min-reviewed-trades", 0, "Minimum post-trade reviews for readiness")
 	cmd.Flags().Float64("min-win-rate", 50, "Minimum paper prediction win rate for readiness")
 	cmd.Flags().Float64("min-expectancy", 0, "Minimum expectancy per decisive prediction for readiness")
-	return cmd
 }
 
 func runPaperSoakRun(cmd *cobra.Command, app *App) error {
@@ -118,6 +122,25 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 		return fmt.Errorf("broker not configured")
 	}
 
+	opts, err := paperSoakRunOptionsFromFlags(cmd, "cli")
+	if err != nil {
+		return err
+	}
+	opts.Command = paperSoakRunCommandSummary(opts.Symbol, opts.Strategy, opts.RegimeMode, opts.DryRun, opts.Limit)
+
+	report, err := executePaperSoakRun(ctx, app, opts)
+	if err != nil {
+		return err
+	}
+
+	if output.IsJSON() {
+		return output.JSON(report)
+	}
+	displayPaperSoakRunReport(output, report)
+	return nil
+}
+
+func paperSoakRunOptionsFromFlags(cmd *cobra.Command, source string) (paperSoakRunOptions, error) {
 	symbol, _ := cmd.Flags().GetString("symbol")
 	strategy, _ := cmd.Flags().GetString("strategy")
 	status, _ := cmd.Flags().GetString("status")
@@ -142,13 +165,13 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 
 	timeWindow, err := time.ParseDuration(windowFlag)
 	if err != nil {
-		return fmt.Errorf("invalid window %q: %w", windowFlag, err)
+		return paperSoakRunOptions{}, fmt.Errorf("invalid window %q: %w", windowFlag, err)
 	}
 	regimeMode, err := parseCandidateRegimeMode(regimeModeFlag)
 	if err != nil {
-		return err
+		return paperSoakRunOptions{}, err
 	}
-	report, err := executePaperSoakRun(ctx, app, paperSoakRunOptions{
+	opts := paperSoakRunOptions{
 		Symbol:            symbol,
 		Strategy:          strategy,
 		Status:            status,
@@ -170,18 +193,9 @@ func runPaperSoakRun(cmd *cobra.Command, app *App) error {
 		MinReviewedTrades: minReviewedTrades,
 		MinWinRate:        minWinRate,
 		MinExpectancy:     minExpectancy,
-		Source:            "cli",
-		Command:           paperSoakRunCommandSummary(symbol, strategy, regimeMode, dryRun, limit),
-	})
-	if err != nil {
-		return err
+		Source:            source,
 	}
-
-	if output.IsJSON() {
-		return output.JSON(report)
-	}
-	displayPaperSoakRunReport(output, report)
-	return nil
+	return opts, nil
 }
 
 func executePaperSoakRun(ctx context.Context, app *App, opts paperSoakRunOptions) (paperSoakRunReport, error) {

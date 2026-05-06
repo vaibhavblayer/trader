@@ -8,10 +8,18 @@ None.
 
 ## Later
 
-None.
+- [ ] Migrate the general LLM client and tool-calling flows from Chat Completions to the OpenAI Responses API while preserving the current no-direct-live-order authority boundary.
 
 ## Done
 
+- [x] Manual activation and pause controls for promoted paper candidates.
+- [x] Repeatable paper soak loop command that reuses the candidate-aware soak-run engine.
+- [x] Discovery-to-paper feedback loop with score-cohort paper outcome review and stale/no-forward-evidence auto-demotion through paper candidate review.
+- [x] Evidence-aware candidate scoring that combines technical discovery, signal activity, backtest quality, regime expectancy, and cited LLM research evidence into one promotion score.
+- [x] LLM web-research evidence layer using OpenAI Responses API web search for cited news, catalyst, event-risk, and sector-context reports with no direct trade authority.
+- [x] Intraday discovery workflow with configurable scan timeframe, lookback, minimum candles, candle freshness filters, and candle metadata in discovery output.
+- [x] Backtest/discovery signal-rate metrics for BUY/SELL/HOLD activity, signal rate, and trade conversion by grid row and promoted paper candidate.
+- [x] Strategy signal diagnostics for latest-bar no-signal outcomes, including gate-level reasons for multi-indicator, SuperTrend, and Donchian discovery candidates.
 - [x] Autonomy readiness report with pass/warn/block decisions across safety, kill switch, calibration, execution quality, and post-trade review.
 - [x] Paper soak workflow for readiness-gated soak planning, status, and reporting.
 - [x] Removed the unimplemented public `api start` surface.

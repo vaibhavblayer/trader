@@ -98,7 +98,6 @@ type EmailConfig struct {
 type Credentials struct {
 	Zerodha ZerodhaCredentials `mapstructure:"zerodha"`
 	OpenAI  OpenAICredentials  `mapstructure:"openai"`
-	Tavily  TavilyCredentials  `mapstructure:"tavily"`
 }
 
 // ZerodhaCredentials holds Zerodha API credentials.
@@ -112,11 +111,6 @@ type ZerodhaCredentials struct {
 
 // OpenAICredentials holds OpenAI API credentials.
 type OpenAICredentials struct {
-	APIKey string `mapstructure:"api_key"`
-}
-
-// TavilyCredentials holds Tavily API credentials.
-type TavilyCredentials struct {
 	APIKey string `mapstructure:"api_key"`
 }
 
@@ -255,11 +249,6 @@ func applyEnvOverrides(cfg *Config) {
 	// OpenAI credentials
 	if v := os.Getenv("OPENAI_API_KEY"); v != "" {
 		cfg.Credentials.OpenAI.APIKey = v
-	}
-
-	// Tavily credentials
-	if v := os.Getenv("TAVILY_API_KEY"); v != "" {
-		cfg.Credentials.Tavily.APIKey = v
 	}
 
 	// Trading mode

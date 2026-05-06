@@ -31,6 +31,13 @@ func TestSQLitePaperCandidateRoundTrip(t *testing.T) {
 		Verdict:             "PASS",
 		Days:                1095,
 		Candles:             742,
+		SignalBars:          700,
+		BuySignals:          12,
+		SellSignals:         10,
+		HoldSignals:         678,
+		DirectionalSignals:  22,
+		SignalRatePct:       3.14,
+		TradeConversionPct:  90.91,
 		Trades:              34,
 		ValidationTrades:    10,
 		ReturnPct:           5.57,
@@ -41,6 +48,12 @@ func TestSQLitePaperCandidateRoundTrip(t *testing.T) {
 		Expectancy:          1600,
 		MaxDrawdownPct:      5,
 		SharpeRatio:         0.7,
+		CandidateScore:      78.5,
+		EvidenceScore:       63,
+		EvidenceSentiment:   "mixed",
+		EvidenceConfidence:  72,
+		EvidenceSources:     6,
+		ScoreReason:         "backtest=80;evidence=63",
 		StopLossPercent:     2,
 		TakeProfitPercent:   4,
 		AllowShort:          true,
@@ -70,5 +83,19 @@ func TestSQLitePaperCandidateRoundTrip(t *testing.T) {
 	}
 	if len(got[0].RegimeStats) != 1 || got[0].RegimeStats[0].Regime != "range" {
 		t.Fatalf("regime stats not restored: %#v", got[0].RegimeStats)
+	}
+	if got[0].SignalBars != candidate.SignalBars || got[0].BuySignals != candidate.BuySignals || got[0].SignalRatePct != candidate.SignalRatePct {
+		t.Fatalf("signal activity not restored: %#v", got[0])
+	}
+	if got[0].CandidateScore != candidate.CandidateScore || got[0].EvidenceScore != candidate.EvidenceScore || got[0].EvidenceSentiment != candidate.EvidenceSentiment {
+		t.Fatalf("candidate scoring not restored: %#v", got[0])
+	}
+
+	byID, err := store.GetPaperCandidates(ctx, models.PaperCandidateFilter{ID: candidate.ID})
+	if err != nil {
+		t.Fatalf("get candidate by id: %v", err)
+	}
+	if len(byID) != 1 || byID[0].ID != candidate.ID {
+		t.Fatalf("expected candidate by id, got %#v", byID)
 	}
 }

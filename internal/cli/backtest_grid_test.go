@@ -28,14 +28,14 @@ func TestParseCSVFlagPreservesTimeframeCase(t *testing.T) {
 }
 
 func TestParseBacktestSetups(t *testing.T) {
-	setups, err := parseBacktestSetups("base,sl2tp4,short_sl2tp4")
+	setups, err := parseBacktestSetups("base,sl1tp2,sl2tp4,short_sl1tp2,short_sl2tp4")
 	if err != nil {
 		t.Fatalf("parse setups: %v", err)
 	}
-	if len(setups) != 3 {
-		t.Fatalf("expected 3 setups, got %d", len(setups))
+	if len(setups) != 5 {
+		t.Fatalf("expected 5 setups, got %d", len(setups))
 	}
-	if setups[0].StopLoss != 3 || setups[1].TakeProfit != 4 || !setups[2].AllowShort {
+	if setups[0].StopLoss != 3 || setups[1].TakeProfit != 2 || setups[2].TakeProfit != 4 || !setups[3].AllowShort || setups[3].StopLoss != 1 || !setups[4].AllowShort {
 		t.Fatalf("unexpected setups: %#v", setups)
 	}
 }
@@ -52,6 +52,14 @@ func TestStrategyParameterVariants(t *testing.T) {
 	defaults := strategyParameterVariants("supertrend", "default")
 	if len(defaults) != 1 || defaults[0].Name != "default" || defaults[0].ParameterS != "" {
 		t.Fatalf("unexpected default variants: %#v", defaults)
+	}
+
+	intraday := strategyParameterVariants("intraday_momentum", "research")
+	if len(intraday) < 4 {
+		t.Fatalf("expected intraday momentum research variants, got %#v", intraday)
+	}
+	if intraday[0].Name == "" || intraday[0].ParameterS == "" {
+		t.Fatalf("expected named intraday variant with formatted params: %#v", intraday[0])
 	}
 }
 
@@ -168,6 +176,13 @@ func TestPromoteBacktestGridCandidatesUsesRegimeGuardrails(t *testing.T) {
 			Timeframe:           "1day",
 			Setup:               "short_sl2tp4",
 			Days:                1095,
+			SignalBars:          700,
+			BuySignals:          12,
+			SellSignals:         10,
+			HoldSignals:         678,
+			DirectionalSignals:  22,
+			SignalRatePct:       3.14,
+			TradeConversionPct:  90.91,
 			Trades:              34,
 			ValidationTrades:    10,
 			ReturnPct:           5.57,
@@ -184,7 +199,8 @@ func TestPromoteBacktestGridCandidatesUsesRegimeGuardrails(t *testing.T) {
 		{Verdict: "REJECT", Symbol: "INFY", Strategy: "supertrend"},
 	}
 
-	promoted, err := promoteBacktestGridCandidates(context.Background(), store, results, map[string]bool{"PASS": true}, models.PaperCandidateStatusActive, 2)
+	applyEvidenceAwareCandidateScores(results, nil, nil)
+	promoted, err := promoteBacktestGridCandidates(context.Background(), store, results, map[string]bool{"PASS": true}, models.PaperCandidateStatusActive, 2, 0)
 	if err != nil {
 		t.Fatalf("promote candidates: %v", err)
 	}
@@ -196,6 +212,9 @@ func TestPromoteBacktestGridCandidatesUsesRegimeGuardrails(t *testing.T) {
 	}
 	if len(promoted[0].BlockedRegimes) != 1 || promoted[0].BlockedRegimes[0] != "trend_down" {
 		t.Fatalf("unexpected blocked regimes: %#v", promoted[0].BlockedRegimes)
+	}
+	if promoted[0].SignalBars != 700 || promoted[0].BuySignals != 12 || promoted[0].SignalRatePct != 3.14 {
+		t.Fatalf("signal activity not promoted: %#v", promoted[0])
 	}
 }
 

@@ -36,6 +36,7 @@ type App struct {
 	Ticker    broker.Ticker
 	Store     store.DataStore
 	LLMClient agents.LLMClient
+	Research  agents.ResearchEvidenceClient
 	Access    *security.AccessController
 	Validator *security.InputValidator
 	Risk      *trading.RiskManager
@@ -130,6 +131,10 @@ func NewRootCmd(cfg *config.Config, logger zerolog.Logger) *cobra.Command {
 			app.LLMClient = agents.NewOpenAIClient(cfg.Credentials.OpenAI.APIKey, cfg.Agents.Model)
 			logger.Debug().Str("model", cfg.Agents.Model).Msg("OpenAI LLM client initialized")
 		}
+		app.Research = agents.NewOpenAIResponsesResearchClient(
+			cfg.Credentials.OpenAI.APIKey, cfg.Agents.Model, cfg.Agents.ReasoningEffort,
+		)
+		logger.Debug().Str("model", cfg.Agents.Model).Msg("OpenAI Responses research client initialized")
 	}
 
 	rootCmd := &cobra.Command{
@@ -299,7 +304,6 @@ func newConfigCmd(app *App) *cobra.Command {
 					"credentials": map[string]interface{}{
 						"zerodha_configured": app.Config.Credentials.Zerodha.APIKey != "",
 						"openai_configured":  app.Config.Credentials.OpenAI.APIKey != "",
-						"tavily_configured":  app.Config.Credentials.Tavily.APIKey != "",
 					},
 				}
 				return output.JSON(safe)

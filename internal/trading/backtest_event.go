@@ -102,6 +102,7 @@ func (be *DefaultBacktestEngine) RunEventDrivenOnCandles(ctx context.Context, co
 		if i >= warmup {
 			signal, _ := signalGen(candles[:i+1], i)
 			signal = strings.ToUpper(signal)
+			recordBacktestSignalActivity(result, signal)
 			if state.position == 0 && pending == nil && isExecutableBacktestSignal(signal) {
 				pending = &pendingBacktestOrder{
 					Signal:    signal,
@@ -138,7 +139,41 @@ func (be *DefaultBacktestEngine) RunEventDrivenOnCandles(ctx context.Context, co
 		equity:      result.EndCapital,
 		maxDrawdown: state.maxDrawdown,
 	})
+	finalizeBacktestSignalActivity(result)
 	return result, nil
+}
+
+func recordBacktestSignalActivity(result *BacktestResult, signal string) {
+	if result == nil {
+		return
+	}
+	result.SignalActivity.EvaluatedBars++
+	switch strings.ToUpper(signal) {
+	case "BUY":
+		result.SignalActivity.BuySignals++
+	case "SELL":
+		result.SignalActivity.SellSignals++
+	default:
+		result.SignalActivity.HoldSignals++
+	}
+}
+
+func finalizeBacktestSignalActivity(result *BacktestResult) {
+	if result == nil {
+		return
+	}
+	activity := &result.SignalActivity
+	activity.DirectionalSignals = activity.BuySignals + activity.SellSignals
+	if activity.EvaluatedBars <= 0 {
+		return
+	}
+	bars := float64(activity.EvaluatedBars)
+	activity.SignalRatePct = float64(activity.DirectionalSignals) / bars * 100
+	activity.BuySignalRatePct = float64(activity.BuySignals) / bars * 100
+	activity.SellSignalRatePct = float64(activity.SellSignals) / bars * 100
+	if activity.DirectionalSignals > 0 {
+		activity.TradeConversionPct = float64(result.TotalTrades) / float64(activity.DirectionalSignals) * 100
+	}
 }
 
 func canExecutePending(config BacktestConfig, pending *pendingBacktestOrder, candle models.Candle, index int) bool {

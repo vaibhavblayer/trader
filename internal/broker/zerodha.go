@@ -549,18 +549,19 @@ func (z *ZerodhaBroker) GetInstrumentToken(ctx context.Context, symbol string, e
 }
 
 func mapTimeframeToInterval(tf string) string {
+	tf = strings.ToLower(strings.TrimSpace(tf))
 	switch tf {
-	case "1min":
+	case "1min", "1m", "minute", "1minute":
 		return "minute"
-	case "5min":
+	case "5min", "5m", "5minute":
 		return "5minute"
-	case "15min":
+	case "15min", "15m", "15minute":
 		return "15minute"
-	case "30min":
+	case "30min", "30m", "30minute":
 		return "30minute"
-	case "1hour":
+	case "1hour", "1h", "60min", "60minute":
 		return "60minute"
-	case "1day":
+	case "1day", "day", "1d":
 		return "day"
 	default:
 		return "day"

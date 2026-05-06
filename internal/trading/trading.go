@@ -172,6 +172,7 @@ type BacktestResult struct {
 	AvgLossHoldBars int
 	PartialFills    int
 	RejectedSignals int
+	SignalActivity  SignalActivity
 
 	// Capital
 	StartCapital float64
@@ -180,6 +181,35 @@ type BacktestResult struct {
 	// Curves
 	EquityCurve []EquityPoint
 	Trades      []BacktestTrade
+}
+
+// SignalActivity summarizes how often a strategy emits actionable signals.
+type SignalActivity struct {
+	EvaluatedBars      int
+	BuySignals         int
+	SellSignals        int
+	HoldSignals        int
+	DirectionalSignals int
+	SignalRatePct      float64
+	BuySignalRatePct   float64
+	SellSignalRatePct  float64
+	TradeConversionPct float64
+}
+
+// StrategySignalDiagnostic explains the latest strategy signal and its gates.
+type StrategySignalDiagnostic struct {
+	Signal     string
+	Confidence float64
+	Reason     string
+	Gates      []StrategyGateDiagnostic
+}
+
+// StrategyGateDiagnostic records one signal gate outcome.
+type StrategyGateDiagnostic struct {
+	Name      string
+	Passed    bool
+	Value     string
+	Threshold string
 }
 
 // EquityPoint represents a point on the equity curve.

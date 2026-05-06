@@ -239,6 +239,23 @@ func (be *DefaultBacktestEngine) donchianStrategy(params map[string]interface{},
 	}
 }
 
+// intradayMomentumStrategy trades short-horizon momentum with explicit activity gates.
+func (be *DefaultBacktestEngine) intradayMomentumStrategy(params map[string]interface{}, allCandles []models.Candle) SignalGenerator {
+	emaPeriod := getIntParam(params, "ema_period", 9)
+	emaVals, _ := indicators.NewEMA(emaPeriod).Calculate(allCandles)
+
+	return func(candles []models.Candle, index int) (string, float64) {
+		if index < 1 || index >= len(candles) {
+			return "HOLD", 0
+		}
+		if emaVals == nil || index >= len(emaVals) {
+			return "HOLD", 0
+		}
+		signal, confidence, _ := evaluateIntradayMomentum(params, candles, index, emaVals[index])
+		return signal, confidence
+	}
+}
+
 // multiIndicatorStrategy combines EMA crossover with RSI, ADX, and volume filters.
 func (be *DefaultBacktestEngine) multiIndicatorStrategy(params map[string]interface{}, allCandles []models.Candle) SignalGenerator {
 	shortPeriod := getIntParam(params, "short_period", 9)

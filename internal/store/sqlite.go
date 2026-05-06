@@ -302,6 +302,13 @@ func (s *SQLiteStore) initSchema() error {
 		reason TEXT,
 		days INTEGER NOT NULL,
 		candles INTEGER NOT NULL,
+		signal_bars INTEGER NOT NULL DEFAULT 0,
+		buy_signals INTEGER NOT NULL DEFAULT 0,
+		sell_signals INTEGER NOT NULL DEFAULT 0,
+		hold_signals INTEGER NOT NULL DEFAULT 0,
+		directional_signals INTEGER NOT NULL DEFAULT 0,
+		signal_rate_pct REAL NOT NULL DEFAULT 0,
+		trade_conversion_pct REAL NOT NULL DEFAULT 0,
 		trades INTEGER NOT NULL,
 		validation_trades INTEGER NOT NULL,
 		return_pct REAL NOT NULL,
@@ -312,6 +319,13 @@ func (s *SQLiteStore) initSchema() error {
 		expectancy REAL NOT NULL,
 		max_drawdown_pct REAL NOT NULL,
 		sharpe_ratio REAL NOT NULL,
+		candidate_score REAL NOT NULL DEFAULT 0,
+		evidence_score REAL NOT NULL DEFAULT 0,
+		evidence_sentiment TEXT,
+		evidence_confidence REAL NOT NULL DEFAULT 0,
+		evidence_sources INTEGER NOT NULL DEFAULT 0,
+		evidence_error TEXT,
+		score_reason TEXT,
 		stop_loss_percent REAL,
 		take_profit_percent REAL,
 		trailing_stop_percent REAL,
@@ -429,8 +443,84 @@ func (s *SQLiteStore) initSchema() error {
 	`); err != nil {
 		return fmt.Errorf("failed to backfill alert IDs: %w", err)
 	}
+	if err := s.ensurePaperCandidateSignalColumns(); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+func (s *SQLiteStore) ensurePaperCandidateSignalColumns() error {
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{"signal_bars", "INTEGER NOT NULL DEFAULT 0"},
+		{"buy_signals", "INTEGER NOT NULL DEFAULT 0"},
+		{"sell_signals", "INTEGER NOT NULL DEFAULT 0"},
+		{"hold_signals", "INTEGER NOT NULL DEFAULT 0"},
+		{"directional_signals", "INTEGER NOT NULL DEFAULT 0"},
+		{"signal_rate_pct", "REAL NOT NULL DEFAULT 0"},
+		{"trade_conversion_pct", "REAL NOT NULL DEFAULT 0"},
+		{"candidate_score", "REAL NOT NULL DEFAULT 0"},
+		{"evidence_score", "REAL NOT NULL DEFAULT 0"},
+		{"evidence_sentiment", "TEXT"},
+		{"evidence_confidence", "REAL NOT NULL DEFAULT 0"},
+		{"evidence_sources", "INTEGER NOT NULL DEFAULT 0"},
+		{"evidence_error", "TEXT"},
+		{"score_reason", "TEXT"},
+	}
+	for _, column := range columns {
+		exists, err := s.sqliteColumnExists("paper_candidates", column.name)
+		if err != nil {
+			return fmt.Errorf("checking paper_candidates.%s: %w", column.name, err)
+		}
+		if exists {
+			continue
+		}
+		if _, err := s.db.Exec(fmt.Sprintf("ALTER TABLE paper_candidates ADD COLUMN %s %s", column.name, column.definition)); err != nil {
+			return fmt.Errorf("adding paper_candidates.%s: %w", column.name, err)
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteStore) sqliteColumnExists(table, column string) (bool, error) {
+	if !safeSQLiteIdentifier(table) || !safeSQLiteIdentifier(column) {
+		return false, fmt.Errorf("unsafe sqlite identifier")
+	}
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull int
+		var defaultValue interface{}
+		var pk int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func safeSQLiteIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Close closes the database connection.
@@ -2266,12 +2356,15 @@ func (s *SQLiteStore) SavePaperCandidate(ctx context.Context, candidate *models.
 		INSERT INTO paper_candidates (
 			id, status, symbol, exchange, strategy, param_variant, parameters, timeframe, setup,
 			source, verdict, reason, days, candles, trades, validation_trades, return_pct,
-			train_return_pct, validation_return_pct, win_rate, profit_factor, expectancy,
-			max_drawdown_pct, sharpe_ratio, stop_loss_percent, take_profit_percent,
-			trailing_stop_percent, allow_short, allowed_regimes, blocked_regimes, regime_stats,
-			promoted_at, updated_at
+			signal_bars, buy_signals, sell_signals, hold_signals, directional_signals,
+			signal_rate_pct, trade_conversion_pct, train_return_pct, validation_return_pct,
+			win_rate, profit_factor, expectancy, max_drawdown_pct, sharpe_ratio,
+			candidate_score, evidence_score, evidence_sentiment, evidence_confidence,
+			evidence_sources, evidence_error, score_reason,
+			stop_loss_percent, take_profit_percent, trailing_stop_percent, allow_short,
+			allowed_regimes, blocked_regimes, regime_stats, promoted_at, updated_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			status = excluded.status,
 			symbol = excluded.symbol,
@@ -2286,6 +2379,13 @@ func (s *SQLiteStore) SavePaperCandidate(ctx context.Context, candidate *models.
 			reason = excluded.reason,
 			days = excluded.days,
 			candles = excluded.candles,
+			signal_bars = excluded.signal_bars,
+			buy_signals = excluded.buy_signals,
+			sell_signals = excluded.sell_signals,
+			hold_signals = excluded.hold_signals,
+			directional_signals = excluded.directional_signals,
+			signal_rate_pct = excluded.signal_rate_pct,
+			trade_conversion_pct = excluded.trade_conversion_pct,
 			trades = excluded.trades,
 			validation_trades = excluded.validation_trades,
 			return_pct = excluded.return_pct,
@@ -2296,6 +2396,13 @@ func (s *SQLiteStore) SavePaperCandidate(ctx context.Context, candidate *models.
 			expectancy = excluded.expectancy,
 			max_drawdown_pct = excluded.max_drawdown_pct,
 			sharpe_ratio = excluded.sharpe_ratio,
+			candidate_score = excluded.candidate_score,
+			evidence_score = excluded.evidence_score,
+			evidence_sentiment = excluded.evidence_sentiment,
+			evidence_confidence = excluded.evidence_confidence,
+			evidence_sources = excluded.evidence_sources,
+			evidence_error = excluded.evidence_error,
+			score_reason = excluded.score_reason,
 			stop_loss_percent = excluded.stop_loss_percent,
 			take_profit_percent = excluded.take_profit_percent,
 			trailing_stop_percent = excluded.trailing_stop_percent,
@@ -2307,9 +2414,14 @@ func (s *SQLiteStore) SavePaperCandidate(ctx context.Context, candidate *models.
 	`, candidate.ID, candidate.Status, candidate.Symbol, candidate.Exchange, candidate.Strategy,
 		candidate.ParamVariant, candidate.Parameters, candidate.Timeframe, candidate.Setup,
 		candidate.Source, candidate.Verdict, candidate.Reason, candidate.Days, candidate.Candles,
-		candidate.Trades, candidate.ValidationTrades, candidate.ReturnPct, candidate.TrainReturnPct,
+		candidate.Trades, candidate.ValidationTrades, candidate.ReturnPct, candidate.SignalBars,
+		candidate.BuySignals, candidate.SellSignals, candidate.HoldSignals, candidate.DirectionalSignals,
+		candidate.SignalRatePct, candidate.TradeConversionPct, candidate.TrainReturnPct,
 		candidate.ValidationReturnPct, candidate.WinRate, candidate.ProfitFactor, candidate.Expectancy,
-		candidate.MaxDrawdownPct, candidate.SharpeRatio, candidate.StopLossPercent,
+		candidate.MaxDrawdownPct, candidate.SharpeRatio,
+		candidate.CandidateScore, candidate.EvidenceScore, candidate.EvidenceSentiment,
+		candidate.EvidenceConfidence, candidate.EvidenceSources, candidate.EvidenceError,
+		candidate.ScoreReason, candidate.StopLossPercent,
 		candidate.TakeProfitPercent, candidate.TrailingStopPercent, allowShort,
 		string(allowedJSON), string(blockedJSON), string(regimeStatsJSON), candidate.PromotedAt, candidate.UpdatedAt)
 	if err != nil {
@@ -2325,11 +2437,19 @@ func (s *SQLiteStore) GetPaperCandidates(ctx context.Context, filter models.Pape
 			timeframe, setup, source, verdict, COALESCE(reason, ''), days, candles, trades,
 			validation_trades, return_pct, train_return_pct, validation_return_pct, win_rate,
 			profit_factor, expectancy, max_drawdown_pct, sharpe_ratio, COALESCE(stop_loss_percent, 0),
+			candidate_score, evidence_score, COALESCE(evidence_sentiment, ''), evidence_confidence,
+			evidence_sources, COALESCE(evidence_error, ''), COALESCE(score_reason, ''),
 			COALESCE(take_profit_percent, 0), COALESCE(trailing_stop_percent, 0), allow_short,
-			allowed_regimes, blocked_regimes, regime_stats, promoted_at, updated_at
+			allowed_regimes, blocked_regimes, regime_stats,
+			signal_bars, buy_signals, sell_signals, hold_signals, directional_signals,
+			signal_rate_pct, trade_conversion_pct, promoted_at, updated_at
 		FROM paper_candidates WHERE 1=1
 	`
 	args := []interface{}{}
+	if filter.ID != "" {
+		query += " AND id = ?"
+		args = append(args, filter.ID)
+	}
 	if filter.Symbol != "" {
 		query += " AND symbol = ?"
 		args = append(args, filter.Symbol)
@@ -2385,12 +2505,26 @@ func (s *SQLiteStore) GetPaperCandidates(ctx context.Context, filter models.Pape
 			&candidate.MaxDrawdownPct,
 			&candidate.SharpeRatio,
 			&candidate.StopLossPercent,
+			&candidate.CandidateScore,
+			&candidate.EvidenceScore,
+			&candidate.EvidenceSentiment,
+			&candidate.EvidenceConfidence,
+			&candidate.EvidenceSources,
+			&candidate.EvidenceError,
+			&candidate.ScoreReason,
 			&candidate.TakeProfitPercent,
 			&candidate.TrailingStopPercent,
 			&allowShort,
 			&allowedJSON,
 			&blockedJSON,
 			&regimeStatsJSON,
+			&candidate.SignalBars,
+			&candidate.BuySignals,
+			&candidate.SellSignals,
+			&candidate.HoldSignals,
+			&candidate.DirectionalSignals,
+			&candidate.SignalRatePct,
+			&candidate.TradeConversionPct,
 			&candidate.PromotedAt,
 			&candidate.UpdatedAt,
 		); err != nil {

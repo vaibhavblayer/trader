@@ -519,6 +519,7 @@ No actual trades are executed - this is for tracking AI accuracy only.`,
 	cmd.AddCommand(newPaperCandidateReviewCmd(app))
 	cmd.AddCommand(newPaperEvaluateCmd(app))
 	cmd.AddCommand(newPaperSoakRunCmd(app))
+	cmd.AddCommand(newPaperSoakLoopCmd(app))
 	cmd.AddCommand(newPaperExperimentsCmd(app))
 	cmd.AddCommand(newPaperStatsCmd(app))
 
@@ -1229,7 +1230,7 @@ func newPaperCandidatesCmd(app *App) *cobra.Command {
 
 			output.Bold("Paper Soak Candidates")
 			output.Println()
-			headers := []string{"Status", "Symbol", "Strategy", "Variant", "TF", "Setup", "Ret", "Val", "Tr", "VTr", "PF", "DD", "Allowed", "Blocked"}
+			headers := []string{"Status", "Symbol", "Strategy", "Variant", "TF", "Setup", "CScore", "Ev", "Sig%", "B/S", "Ret", "Val", "Tr", "VTr", "PF", "DD", "Allowed", "Blocked"}
 			if regime != "" {
 				headers = append(headers, "Regime Gate")
 			}
@@ -1242,6 +1243,10 @@ func newPaperCandidatesCmd(app *App) *cobra.Command {
 					candidate.ParamVariant,
 					candidate.Timeframe,
 					candidate.Setup,
+					formatScoreOrDash(candidate.CandidateScore),
+					formatScoreOrDash(candidate.EvidenceScore),
+					fmt.Sprintf("%.2f%%", candidate.SignalRatePct),
+					fmt.Sprintf("%d/%d", candidate.BuySignals, candidate.SellSignals),
 					FormatPercent(candidate.ReturnPct),
 					FormatPercent(candidate.ValidationReturnPct),
 					fmt.Sprintf("%d", candidate.Trades),
@@ -1265,7 +1270,86 @@ func newPaperCandidatesCmd(app *App) *cobra.Command {
 	cmd.Flags().String("strategy", "", "Filter by strategy")
 	cmd.Flags().String("status", models.PaperCandidateStatusActive, "Filter by status")
 	cmd.Flags().String("regime", "", "Show candidate gate decision for a current regime")
+	cmd.AddCommand(newPaperCandidateStatusCmd(app, "activate", models.PaperCandidateStatusActive))
+	cmd.AddCommand(newPaperCandidateStatusCmd(app, "pause", models.PaperCandidateStatusPaused))
 	return cmd
+}
+
+type paperCandidateStatusChangeResult struct {
+	ID        string `json:"id"`
+	Symbol    string `json:"symbol"`
+	Strategy  string `json:"strategy"`
+	Variant   string `json:"variant"`
+	OldStatus string `json:"old_status"`
+	NewStatus string `json:"new_status"`
+}
+
+func newPaperCandidateStatusCmd(app *App, use string, status string) *cobra.Command {
+	verb := "Activate"
+	if status == models.PaperCandidateStatusPaused {
+		verb = "Pause"
+	}
+	cmd := &cobra.Command{
+		Use:   use,
+		Short: strings.ToLower(verb) + " a promoted paper candidate",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			output := NewOutput(cmd)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if app.Store == nil {
+				return fmt.Errorf("paper candidate store is not available")
+			}
+			id, _ := cmd.Flags().GetString("id")
+			id = strings.TrimSpace(id)
+			if id == "" {
+				return fmt.Errorf("candidate id is required")
+			}
+			result, err := setPaperCandidateStatus(ctx, app.Store, id, status)
+			if err != nil {
+				return err
+			}
+			if output.IsJSON() {
+				return output.JSON(result)
+			}
+			output.Success("%s candidate %s: %s -> %s", verb, result.ID, result.OldStatus, result.NewStatus)
+			return nil
+		},
+	}
+	cmd.Flags().String("id", "", "Paper candidate ID")
+	_ = cmd.MarkFlagRequired("id")
+	return cmd
+}
+
+func setPaperCandidateStatus(ctx context.Context, dataStore store.DataStore, id string, status string) (paperCandidateStatusChangeResult, error) {
+	id = strings.TrimSpace(id)
+	status = strings.ToUpper(strings.TrimSpace(status))
+	if id == "" {
+		return paperCandidateStatusChangeResult{}, fmt.Errorf("candidate id is required")
+	}
+	if status != models.PaperCandidateStatusActive && status != models.PaperCandidateStatusPaused {
+		return paperCandidateStatusChangeResult{}, fmt.Errorf("unsupported paper candidate status %q", status)
+	}
+	candidates, err := dataStore.GetPaperCandidates(ctx, models.PaperCandidateFilter{ID: id, Limit: 1})
+	if err != nil {
+		return paperCandidateStatusChangeResult{}, err
+	}
+	if len(candidates) == 0 {
+		return paperCandidateStatusChangeResult{}, fmt.Errorf("paper candidate %q not found", id)
+	}
+	candidate := candidates[0]
+	oldStatus := candidate.Status
+	candidate.Status = status
+	if err := dataStore.SavePaperCandidate(ctx, &candidate); err != nil {
+		return paperCandidateStatusChangeResult{}, err
+	}
+	return paperCandidateStatusChangeResult{
+		ID:        candidate.ID,
+		Symbol:    candidate.Symbol,
+		Strategy:  candidate.Strategy,
+		Variant:   candidate.ParamVariant,
+		OldStatus: oldStatus,
+		NewStatus: status,
+	}, nil
 }
 
 func paperCandidateRegimeGate(candidate models.PaperCandidate, regime string) string {

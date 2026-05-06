@@ -99,9 +99,6 @@ user_id = ""
 
 [openai]
 api_key = ""
-
-[tavily]
-api_key = ""
 `
 
 const agentsTemplate = `# Zerodha Go Trader Agent Configuration

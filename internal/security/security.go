@@ -52,7 +52,6 @@ type EncryptedCredentials struct {
 type PlainCredentials struct {
 	Zerodha ZerodhaCredentials `json:"zerodha"`
 	OpenAI  OpenAICredentials  `json:"openai"`
-	Tavily  TavilyCredentials  `json:"tavily"`
 }
 
 // ZerodhaCredentials holds Zerodha API credentials.
@@ -64,11 +63,6 @@ type ZerodhaCredentials struct {
 
 // OpenAICredentials holds OpenAI API credentials.
 type OpenAICredentials struct {
-	APIKey string `json:"api_key"`
-}
-
-// TavilyCredentials holds Tavily API credentials.
-type TavilyCredentials struct {
 	APIKey string `json:"api_key"`
 }
 
@@ -105,7 +99,6 @@ func (cm *CredentialManager) Initialize(masterPassword string) error {
 	// Load and decrypt existing credentials
 	return cm.loadEncryptedCredentials(masterPassword, encryptedPath)
 }
-
 
 // deriveKey derives an encryption key from a password using PBKDF2.
 func deriveKey(password string, salt []byte) []byte {
@@ -218,10 +211,6 @@ func parseTOMLCredentials(content string, creds *PlainCredentials) error {
 		case "openai":
 			if key == "api_key" {
 				creds.OpenAI.APIKey = value
-			}
-		case "tavily":
-			if key == "api_key" {
-				creds.Tavily.APIKey = value
 			}
 		}
 	}

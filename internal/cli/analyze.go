@@ -1765,21 +1765,32 @@ func getIndexConstituents(indexName string) []string {
 }
 
 type ScanResult struct {
-	Symbol   string
-	LTP      float64
-	Change   float64
-	RSI      float64
-	Volume   float64
-	ATRPct   float64 // ATR as percentage of price (volatility measure)
-	DayRange float64 // Today's high-low range as percentage
-	Signal   string
+	Symbol               string
+	Timeframe            string     `json:",omitempty"`
+	Candles              int        `json:",omitempty"`
+	LastCandleAt         *time.Time `json:",omitempty"`
+	LastCandleAgeMinutes int64      `json:",omitempty"`
+	LTP                  float64
+	Change               float64
+	RSI                  float64
+	Volume               float64
+	ATRPct               float64 // ATR as percentage of price (volatility measure)
+	DayRange             float64 // Today's high-low range as percentage
+	Signal               string
 }
 
 func displayScanResults(output *Output, results []ScanResult) error {
 	output.Bold("Scan Results")
 	output.Printf("  Found %d stocks\n\n", len(results))
 
-	table := NewTable(output, "Symbol", "LTP", "Change", "ATR%", "RSI", "Volume", "Signal")
+	showCandleMeta := scanResultsHaveCandleMetadata(results)
+	headers := []string{"Symbol"}
+	if showCandleMeta {
+		headers = append(headers, "TF", "Candles", "Age")
+	}
+	headers = append(headers, "LTP", "Change", "ATR%", "RSI", "Volume", "Signal")
+
+	table := NewTable(output, headers...)
 	for _, r := range results {
 		// Color ATR based on volatility level
 		atrColor := ColorYellow
@@ -1789,8 +1800,15 @@ func displayScanResults(output *Output, results []ScanResult) error {
 			atrColor = ColorRed // Low volatility
 		}
 
-		table.AddRow(
-			r.Symbol,
+		row := []string{r.Symbol}
+		if showCandleMeta {
+			row = append(row,
+				emptyAsDash(r.Timeframe),
+				formatIntOrDash(r.Candles),
+				formatScanCandleAge(r.LastCandleAgeMinutes),
+			)
+		}
+		row = append(row,
 			FormatPrice(r.LTP),
 			output.ColoredString(output.PnLColor(r.Change), FormatPercent(r.Change)),
 			output.ColoredString(atrColor, fmt.Sprintf("%.1f%%", r.ATRPct)),
@@ -1798,6 +1816,7 @@ func displayScanResults(output *Output, results []ScanResult) error {
 			fmt.Sprintf("%.1fx", r.Volume),
 			r.Signal,
 		)
+		table.AddRow(row...)
 	}
 	table.Render()
 
@@ -1805,6 +1824,52 @@ func displayScanResults(output *Output, results []ScanResult) error {
 	output.Dim("Tip: Use 'trader analyze <symbol>' for detailed analysis")
 
 	return nil
+}
+
+func scanResultsHaveCandleMetadata(results []ScanResult) bool {
+	for _, result := range results {
+		if result.Timeframe != "" || result.Candles > 0 || result.LastCandleAt != nil || result.LastCandleAgeMinutes > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func formatScanCandleAge(minutes int64) string {
+	if minutes <= 0 {
+		return "-"
+	}
+	if minutes < 60 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	if minutes < 24*60 {
+		hours := minutes / 60
+		remainingMinutes := minutes % 60
+		if remainingMinutes == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh%dm", hours, remainingMinutes)
+	}
+	days := minutes / (24 * 60)
+	hours := (minutes % (24 * 60)) / 60
+	if hours == 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return fmt.Sprintf("%dd%dh", days, hours)
+}
+
+func emptyAsDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
+}
+
+func formatIntOrDash(value int) string {
+	if value <= 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", value)
 }
 
 func newResearchCmd(app *App) *cobra.Command {
@@ -1827,8 +1892,13 @@ func newResearchCmd(app *App) *cobra.Command {
 
 			symbol := strings.ToUpper(args[0])
 			exchange, _ := cmd.Flags().GetString("exchange")
+			webResearch, _ := cmd.Flags().GetBool("web-research")
+			webDomainsFlag, _ := cmd.Flags().GetString("web-domains")
+			webLive, _ := cmd.Flags().GetBool("web-live")
 
-			output.Info("Generating research report for %s...", symbol)
+			if !output.IsJSON() {
+				output.Info("Generating research report for %s...", symbol)
+			}
 
 			// Company data mapping (basic info for major stocks)
 			companyData := map[string]struct {
@@ -1947,10 +2017,14 @@ func newResearchCmd(app *App) *cobra.Command {
 
 			// Use AI to generate insights if LLM client is available
 			if app.LLMClient != nil {
-				output.Info("Analyzing with AI...")
+				if !output.IsJSON() {
+					output.Info("Analyzing with AI...")
+				}
 				aiHighlights, aiRisks, err := generateAIInsights(ctx, app.LLMClient, research)
 				if err != nil {
-					output.Warning("AI analysis failed, using rule-based analysis: %v", err)
+					if !output.IsJSON() {
+						output.Warning("AI analysis failed, using rule-based analysis: %v", err)
+					}
 					// Fall back to rule-based
 					research.Highlights, research.Risks = generateRuleBasedInsights(research, company.sector)
 				} else {
@@ -1962,18 +2036,46 @@ func newResearchCmd(app *App) *cobra.Command {
 				// Rule-based fallback when no LLM
 				research.Highlights, research.Risks = generateRuleBasedInsights(research, company.sector)
 			}
-
-			output.Println()
+			if webResearch {
+				if app.Research == nil {
+					return fmt.Errorf("OpenAI Responses research client is not configured")
+				}
+				if !output.IsJSON() {
+					output.Info("Fetching cited web evidence...")
+				}
+				evidence, err := app.Research.ResearchSymbol(ctx, agents.ResearchEvidenceRequest{
+					Symbol:         symbol,
+					CompanyName:    research.CompanyName,
+					Sector:         research.Sector,
+					Industry:       research.Industry,
+					Exchange:       exchange,
+					CurrentPrice:   research.LTP,
+					AllowedDomains: parseDomainList(webDomainsFlag),
+					LiveWebAccess:  webLive,
+				})
+				if err != nil {
+					research.EvidenceError = err.Error()
+					if !output.IsJSON() {
+						output.Warning("Web research failed: %v", err)
+					}
+				} else {
+					research.Evidence = evidence
+				}
+			}
 
 			if output.IsJSON() {
 				return output.JSON(research)
 			}
 
+			output.Println()
 			return displayResearch(output, research)
 		},
 	}
 
 	cmd.Flags().Bool("detailed", false, "Show detailed research")
+	cmd.Flags().Bool("web-research", false, "Fetch cited current web evidence through OpenAI Responses web search")
+	cmd.Flags().String("web-domains", "", "Comma-separated allowed domains for web research; empty allows broad search")
+	cmd.Flags().Bool("web-live", true, "Allow live external web access for OpenAI web research")
 	cmd.Flags().StringP("exchange", "e", "NSE", "Exchange (NSE, BSE)")
 
 	return cmd
@@ -2003,6 +2105,8 @@ type ResearchResult struct {
 	Highlights    []string
 	Risks         []string
 	AIGenerated   bool
+	Evidence      *agents.ResearchEvidenceReport `json:",omitempty"`
+	EvidenceError string                         `json:",omitempty"`
 }
 
 func displayResearch(output *Output, r ResearchResult) error {
@@ -2079,8 +2183,79 @@ func displayResearch(output *Output, r ResearchResult) error {
 	for _, risk := range r.Risks {
 		output.Printf("  %s %s\n", output.Yellow("⚠"), risk)
 	}
+	if r.Evidence != nil {
+		output.Println()
+		displayResearchEvidence(output, r.Evidence)
+	} else if r.EvidenceError != "" {
+		output.Println()
+		output.Bold("Web Evidence %s", output.SourceTag(SourceAI))
+		output.Warning("Unavailable: %s", r.EvidenceError)
+	}
 
 	return nil
+}
+
+func displayResearchEvidence(output *Output, report *agents.ResearchEvidenceReport) {
+	output.Bold("Web Evidence %s", output.SourceTag(SourceAI))
+	if report.Summary != "" {
+		output.Printf("  Summary: %s\n", report.Summary)
+	}
+	if report.Sentiment != "" || report.Confidence > 0 {
+		output.Printf("  Sentiment: %s | confidence: %.0f/100 | score: %.2f\n",
+			emptyAsDash(report.Sentiment), report.Confidence, report.SentimentScore)
+	}
+	displayEvidencePoints(output, "Catalysts", report.Catalysts)
+	displayEvidencePoints(output, "Risks", report.Risks)
+	displayEvidencePoints(output, "Event Risk", report.EventRisks)
+	displayEvidencePoints(output, "Sector Context", report.SectorContext)
+	if len(report.Sources) > 0 {
+		output.Println("  Sources:")
+		for i, source := range report.Sources {
+			if i >= 8 {
+				output.Printf("    ... %d more\n", len(report.Sources)-i)
+				break
+			}
+			title := source.Title
+			if title == "" {
+				title = source.URL
+			}
+			output.Printf("    - %s: %s\n", title, source.URL)
+		}
+	}
+}
+
+func displayEvidencePoints(output *Output, label string, points []agents.ResearchEvidencePoint) {
+	if len(points) == 0 {
+		return
+	}
+	output.Printf("  %s:\n", label)
+	for _, point := range points {
+		text := strings.TrimSpace(point.Text)
+		if text == "" {
+			continue
+		}
+		meta := strings.Trim(strings.Join([]string{point.Impact, point.TimeHorizon}, " "), " ")
+		if meta != "" {
+			output.Printf("    - %s (%s)\n", text, meta)
+		} else {
+			output.Printf("    - %s\n", text)
+		}
+	}
+}
+
+func parseDomainList(value string) []string {
+	parts := strings.Split(value, ",")
+	domains := make([]string, 0, len(parts))
+	for _, part := range parts {
+		domain := strings.TrimSpace(part)
+		domain = strings.TrimPrefix(domain, "https://")
+		domain = strings.TrimPrefix(domain, "http://")
+		domain = strings.TrimSuffix(domain, "/")
+		if domain != "" {
+			domains = append(domains, domain)
+		}
+	}
+	return domains
 }
 
 // generateAIInsights uses LLM to generate research insights

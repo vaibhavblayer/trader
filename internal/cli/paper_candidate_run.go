@@ -117,7 +117,7 @@ paper prediction only when the latest candle emits BUY or SELL.`,
 	cmd.Flags().String("symbol", "", "Filter candidates by symbol")
 	cmd.Flags().String("strategy", "", "Filter candidates by strategy")
 	cmd.Flags().String("status", models.PaperCandidateStatusActive, "Candidate status to run")
-	cmd.Flags().Int("days", 120, "Historical lookback days for signal evaluation")
+	cmd.Flags().Int("days", 120, "Minimum historical calendar lookback days for signal evaluation")
 	cmd.Flags().Int("min-candles", 80, "Minimum candles required")
 	cmd.Flags().Int("regime-window", 50, "Candles used to classify current regime")
 	cmd.Flags().String("regime-mode", regimeModeStrict, "Regime guardrail mode: strict, allow-unknown, or explore")
@@ -188,11 +188,12 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 			}
 		}
 
+		lookbackDays := candidateRunLookbackDays(opts.Days, opts.MinCandles, candidate.Timeframe)
 		candles, _, err := app.getQualityHistorical(ctx, broker.HistoricalRequest{
 			Symbol:    candidate.Symbol,
 			Exchange:  models.Exchange(candidate.Exchange),
 			Timeframe: candidate.Timeframe,
-			From:      time.Now().AddDate(0, 0, -opts.Days),
+			From:      time.Now().AddDate(0, 0, -lookbackDays),
 			To:        time.Now(),
 		}, opts.MinCandles, false)
 		if err != nil {
@@ -224,7 +225,7 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 		}
 
 		params := parseParameterString(candidate.Parameters)
-		signal, confidence, err := engine.LatestSignal(trading.BacktestConfig{
+		diagnostic, err := engine.LatestSignalDiagnostic(trading.BacktestConfig{
 			Symbol:              candidate.Symbol,
 			Timeframe:           candidate.Timeframe,
 			Strategy:            candidate.Strategy,
@@ -241,11 +242,13 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 			results = append(results, result)
 			continue
 		}
+		signal := diagnostic.Signal
+		confidence := diagnostic.Confidence
 		result.Signal = signal
 		result.Confidence = confidence
 		if !isPaperCandidateSignalTradeable(signal, candidate.AllowShort) {
 			result.Status = "NO_SIGNAL"
-			result.Reason = "latest_signal_" + strings.ToLower(signal)
+			result.Reason = diagnostic.Reason
 			results = append(results, result)
 			continue
 		}
@@ -267,6 +270,51 @@ func runPaperCandidates(ctx context.Context, app *App, candidates []models.Paper
 		results = append(results, result)
 	}
 	return results
+}
+
+func candidateRunLookbackDays(requestedDays int, minCandles int, timeframe string) int {
+	if requestedDays <= 0 {
+		requestedDays = 120
+	}
+	if minCandles <= 0 {
+		minCandles = 80
+	}
+	neededDays := requestedDays
+	duration := historicalTimeframeDuration(timeframe)
+	switch {
+	case duration >= 24*time.Hour:
+		neededDays = maxInt(neededDays, minCandles*2+10)
+	case duration > 0:
+		sessionMinutes := int((6*time.Hour + 15*time.Minute) / time.Minute)
+		candleMinutes := int(duration / time.Minute)
+		if candleMinutes <= 0 {
+			break
+		}
+		candlesPerSession := sessionMinutes / candleMinutes
+		if candlesPerSession < 1 {
+			candlesPerSession = 1
+		}
+		tradingDays := ceilDivInt(minCandles, candlesPerSession)
+		neededDays = maxInt(neededDays, ceilDivInt(tradingDays*7, 5)+10)
+	}
+	return neededDays
+}
+
+func ceilDivInt(value int, divisor int) int {
+	if divisor <= 0 {
+		return 0
+	}
+	if value <= 0 {
+		return 0
+	}
+	return (value + divisor - 1) / divisor
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func parseCandidateRegimeMode(value string) (string, error) {

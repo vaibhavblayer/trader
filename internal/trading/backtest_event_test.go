@@ -97,6 +97,32 @@ func TestEventBacktestPartialFillCapsQuantityByVolume(t *testing.T) {
 	}
 }
 
+func TestEventBacktestRecordsSignalActivity(t *testing.T) {
+	engine := NewBacktestEngine(nil)
+	candles := backtestCandles([]float64{100, 101, 102, 103, 104}, 1000)
+
+	result, err := engine.RunEventDrivenOnCandles(context.Background(), BacktestConfig{
+		Symbol:             "TEST",
+		InitialCapital:     100000,
+		Strategy:           "buy_and_hold",
+		MaxPositionPercent: 10,
+		Slippage:           0.001,
+		Commission:         0.0003,
+	}, candles)
+	if err != nil {
+		t.Fatalf("run backtest: %v", err)
+	}
+	if result.SignalActivity.EvaluatedBars != 4 {
+		t.Fatalf("expected 4 evaluated bars, got %#v", result.SignalActivity)
+	}
+	if result.SignalActivity.BuySignals != 1 || result.SignalActivity.SellSignals != 0 || result.SignalActivity.HoldSignals != 3 {
+		t.Fatalf("unexpected signal counts: %#v", result.SignalActivity)
+	}
+	if math.Abs(result.SignalActivity.SignalRatePct-25) > 0.0001 {
+		t.Fatalf("expected 25%% signal rate, got %.4f", result.SignalActivity.SignalRatePct)
+	}
+}
+
 func backtestCandles(opens []float64, volume int64) []models.Candle {
 	candles := make([]models.Candle, len(opens))
 	start := time.Date(2026, 5, 4, 9, 15, 0, 0, time.UTC)

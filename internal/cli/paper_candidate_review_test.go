@@ -71,6 +71,48 @@ func TestBuildPaperCandidateReviewKeepsInsufficientSample(t *testing.T) {
 	}
 }
 
+func TestBuildPaperCandidateReviewPausesStaleNoForwardEvidence(t *testing.T) {
+	candidate := models.PaperCandidate{
+		ID:             "HDFCBANK_multi_fast",
+		Status:         models.PaperCandidateStatusActive,
+		Symbol:         "HDFCBANK",
+		Strategy:       "multi_indicator",
+		ParamVariant:   "fast",
+		CandidateScore: 72,
+		PromotedAt:     time.Now().AddDate(0, 0, -45),
+	}
+
+	result := buildPaperCandidateReview(candidate, nil, paperCandidateReviewOptions{
+		MaxStaleDays: 30,
+	})
+
+	if result.Action != "PAUSE" || !strings.Contains(result.Reason, "stale_no_predictions") {
+		t.Fatalf("expected stale pause, got %#v", result)
+	}
+	if result.ScoreBand != "B" {
+		t.Fatalf("expected score band B, got %s", result.ScoreBand)
+	}
+}
+
+func TestBuildPaperCandidateScoreCohorts(t *testing.T) {
+	results := []paperCandidateReviewResult{
+		{ScoreBand: "A", EvidenceSentiment: "positive", Evaluated: 4, Decisive: 4, WinRate: 75, Expectancy: 0.5, ProfitFactor: 2, Action: "READY"},
+		{ScoreBand: "A", EvidenceSentiment: "positive", Evaluated: 2, Decisive: 2, WinRate: 50, Expectancy: -0.2, ProfitFactor: 0.8, Action: "KEEP"},
+		{ScoreBand: "C", EvidenceSentiment: "mixed", Evaluated: 3, Decisive: 3, WinRate: 33.3, Expectancy: -0.4, ProfitFactor: 0.5, Action: "PAUSE"},
+	}
+
+	cohorts := buildPaperCandidateScoreCohorts(results)
+	if len(cohorts) != 2 {
+		t.Fatalf("expected 2 cohorts, got %#v", cohorts)
+	}
+	if cohorts[0].ScoreBand != "A" || cohorts[0].Candidates != 2 || cohorts[0].ReadyActions != 1 {
+		t.Fatalf("unexpected A cohort: %#v", cohorts[0])
+	}
+	if cohorts[1].ScoreBand != "C" || cohorts[1].PauseActions != 1 {
+		t.Fatalf("unexpected C cohort: %#v", cohorts[1])
+	}
+}
+
 func TestBuildPaperCandidateReviewMarksGraduationReady(t *testing.T) {
 	now := time.Date(2026, 5, 5, 10, 0, 0, 0, time.UTC)
 	candidate := models.PaperCandidate{

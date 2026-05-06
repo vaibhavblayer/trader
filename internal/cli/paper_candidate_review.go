@@ -20,6 +20,11 @@ type paperCandidateReviewResult struct {
 	Strategy               string                            `json:"strategy"`
 	Variant                string                            `json:"variant"`
 	Status                 string                            `json:"status"`
+	CandidateScore         float64                           `json:"candidate_score"`
+	EvidenceScore          float64                           `json:"evidence_score"`
+	EvidenceSentiment      string                            `json:"evidence_sentiment,omitempty"`
+	ScoreBand              string                            `json:"score_band"`
+	CandidateAgeDays       float64                           `json:"candidate_age_days"`
 	Action                 string                            `json:"action"`
 	Reason                 string                            `json:"reason"`
 	TotalPredictions       int                               `json:"total_predictions"`
@@ -66,6 +71,19 @@ type paperCandidateRegimeReviewStats struct {
 	ForwardBlockReason string  `json:"forward_block_reason,omitempty"`
 }
 
+type paperCandidateScoreCohortReview struct {
+	ScoreBand         string  `json:"score_band"`
+	EvidenceSentiment string  `json:"evidence_sentiment"`
+	Candidates        int     `json:"candidates"`
+	Evaluated         int     `json:"evaluated"`
+	Decisive          int     `json:"decisive"`
+	WinRate           float64 `json:"win_rate"`
+	Expectancy        float64 `json:"expectancy"`
+	ProfitFactor      float64 `json:"profit_factor"`
+	PauseActions      int     `json:"pause_actions"`
+	ReadyActions      int     `json:"ready_actions"`
+}
+
 type paperCandidateReviewOptions struct {
 	Days              int
 	MinEvaluated      int
@@ -75,6 +93,7 @@ type paperCandidateReviewOptions struct {
 	MaxExpiredRate    float64
 	MaxLossStreak     int
 	MaxDDMultiple     float64
+	MaxStaleDays      int
 	MinRegimeDecisive int
 	Graduate          paperCandidateGraduationOptions
 	Apply             bool
@@ -96,8 +115,9 @@ func newPaperCandidateReviewCmd(app *App) *cobra.Command {
 		Long: `Review promoted paper candidates against their forward paper outcomes.
 
 The command links predictions by setup name candidate:<candidate_id>, computes
-paper expectancy, profit factor, expiry rate, loss streak, and drawdown, then
-flags candidates that should be paused. It is report-only unless --apply is set.`,
+paper expectancy, profit factor, expiry rate, loss streak, drawdown, stale
+forward-evidence status, and score-cohort outcome quality. It is report-only
+unless --apply is set.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPaperCandidateReview(cmd, app)
 		},
@@ -114,6 +134,7 @@ flags candidates that should be paused. It is report-only unless --apply is set.
 	cmd.Flags().Float64("max-expired-rate", 60, "Maximum expired percentage after min-evaluated")
 	cmd.Flags().Int("max-loss-streak", 5, "Maximum consecutive WRONG predictions before pause")
 	cmd.Flags().Float64("max-dd-multiple", 1.5, "Pause if paper drawdown exceeds historical drawdown times this multiple")
+	cmd.Flags().Int("max-stale-days", 30, "Pause candidates with no evaluated forward evidence after this many days; 0 disables")
 	cmd.Flags().Int("min-regime-decisive", 3, "Minimum decisive predictions before flagging a weak forward regime")
 	cmd.Flags().Int("graduate-min-evaluated", 30, "Minimum evaluated predictions for graduation readiness")
 	cmd.Flags().Int("graduate-min-decisive", 20, "Minimum decisive predictions for graduation readiness")
@@ -146,6 +167,7 @@ func runPaperCandidateReview(cmd *cobra.Command, app *App) error {
 	maxExpiredRate, _ := cmd.Flags().GetFloat64("max-expired-rate")
 	maxLossStreak, _ := cmd.Flags().GetInt("max-loss-streak")
 	maxDDMultiple, _ := cmd.Flags().GetFloat64("max-dd-multiple")
+	maxStaleDays, _ := cmd.Flags().GetInt("max-stale-days")
 	minRegimeDecisive, _ := cmd.Flags().GetInt("min-regime-decisive")
 	graduateMinEvaluated, _ := cmd.Flags().GetInt("graduate-min-evaluated")
 	graduateMinDecisive, _ := cmd.Flags().GetInt("graduate-min-decisive")
@@ -174,6 +196,7 @@ func runPaperCandidateReview(cmd *cobra.Command, app *App) error {
 		MaxExpiredRate:    maxExpiredRate,
 		MaxLossStreak:     maxLossStreak,
 		MaxDDMultiple:     maxDDMultiple,
+		MaxStaleDays:      maxStaleDays,
 		MinRegimeDecisive: minRegimeDecisive,
 		Graduate: paperCandidateGraduationOptions{
 			MinEvaluated:   graduateMinEvaluated,
@@ -250,13 +273,20 @@ func reviewPaperCandidates(ctx context.Context, dataStore store.DataStore, candi
 func buildPaperCandidateReview(candidate models.PaperCandidate, predictions []models.PaperPrediction, opts paperCandidateReviewOptions) paperCandidateReviewResult {
 	opts.Graduate = normalizeGraduationOptions(opts.Graduate)
 	result := paperCandidateReviewResult{
-		CandidateID: candidate.ID,
-		Symbol:      candidate.Symbol,
-		Strategy:    candidate.Strategy,
-		Variant:     candidate.ParamVariant,
-		Status:      candidate.Status,
-		Action:      "KEEP",
-		Reason:      "insufficient_forward_evidence",
+		CandidateID:       candidate.ID,
+		Symbol:            candidate.Symbol,
+		Strategy:          candidate.Strategy,
+		Variant:           candidate.ParamVariant,
+		Status:            candidate.Status,
+		CandidateScore:    candidate.CandidateScore,
+		EvidenceScore:     candidate.EvidenceScore,
+		EvidenceSentiment: candidate.EvidenceSentiment,
+		ScoreBand:         candidateScoreBand(candidate.CandidateScore),
+		Action:            "KEEP",
+		Reason:            "insufficient_forward_evidence",
+	}
+	if !candidate.PromotedAt.IsZero() {
+		result.CandidateAgeDays = time.Since(candidate.PromotedAt).Hours() / 24
 	}
 	trustedPredictions, exploratoryPredictions := splitTrustedPaperCandidatePredictions(predictions)
 	allStats := calculatePaperCandidateOutcomeStats(predictions)
@@ -287,6 +317,16 @@ func buildPaperCandidateReview(candidate models.PaperCandidate, predictions []mo
 	}
 
 	if result.Evaluated == 0 {
+		if opts.MaxStaleDays > 0 && result.CandidateAgeDays >= float64(opts.MaxStaleDays) {
+			result.Action = "PAUSE"
+			if result.TotalPredictions == 0 {
+				result.Reason = fmt.Sprintf("stale_no_predictions %.1fd >= %dd", result.CandidateAgeDays, opts.MaxStaleDays)
+			} else {
+				result.Reason = fmt.Sprintf("stale_no_evaluated_outcomes %.1fd >= %dd", result.CandidateAgeDays, opts.MaxStaleDays)
+			}
+			result.Flags = append(result.Flags, result.Reason)
+			result.GraduationReason = "blocked_by_stale_forward_evidence"
+		}
 		return result
 	}
 	result.Reason = "forward_evidence_ok"
@@ -321,6 +361,21 @@ func buildPaperCandidateReview(candidate models.PaperCandidate, predictions []mo
 		result.Reason = "graduation_ready"
 	}
 	return result
+}
+
+func candidateScoreBand(score float64) string {
+	switch {
+	case score >= 75:
+		return "A"
+	case score >= 60:
+		return "B"
+	case score >= 45:
+		return "C"
+	case score > 0:
+		return "D"
+	default:
+		return "UNSCORED"
+	}
 }
 
 func normalizeGraduationOptions(opts paperCandidateGraduationOptions) paperCandidateGraduationOptions {
@@ -577,7 +632,7 @@ func displayPaperCandidateReviewResults(output *Output, results []paperCandidate
 		output.Info("No paper candidates matched")
 		return
 	}
-	table := NewTable(output, "Action", "Status", "Symbol", "Strategy", "Variant", "Eval", "Dec", "Xplr", "Win", "Exp", "PF", "Expect", "DD", "Grad", "Reason")
+	table := NewTable(output, "Action", "Status", "Symbol", "Strategy", "Variant", "Score", "Band", "Eval", "Dec", "Xplr", "Win", "Exp", "PF", "Expect", "DD", "Grad", "Reason")
 	for _, result := range results {
 		graduation := "NO"
 		if result.GraduationReady {
@@ -589,6 +644,8 @@ func displayPaperCandidateReviewResults(output *Output, results []paperCandidate
 			result.Symbol,
 			result.Strategy,
 			result.Variant,
+			formatScoreOrDash(result.CandidateScore),
+			result.ScoreBand,
 			fmt.Sprintf("%d", result.Evaluated),
 			fmt.Sprintf("%d", result.Decisive),
 			fmt.Sprintf("%d", result.ExploratoryPredictions),
@@ -602,7 +659,93 @@ func displayPaperCandidateReviewResults(output *Output, results []paperCandidate
 		)
 	}
 	table.Render()
+	printPaperCandidateScoreCohorts(output, buildPaperCandidateScoreCohorts(results))
 	printPaperCandidateRegimeReview(output, results)
+}
+
+func buildPaperCandidateScoreCohorts(results []paperCandidateReviewResult) []paperCandidateScoreCohortReview {
+	type accum struct {
+		paperCandidateScoreCohortReview
+		expectancySum float64
+		pfSum         float64
+	}
+	byKey := make(map[string]*accum)
+	order := make([]string, 0)
+	for _, result := range results {
+		sentiment := strings.ToLower(strings.TrimSpace(result.EvidenceSentiment))
+		if sentiment == "" {
+			sentiment = "unknown"
+		}
+		band := result.ScoreBand
+		if band == "" {
+			band = candidateScoreBand(result.CandidateScore)
+		}
+		key := band + "|" + sentiment
+		item := byKey[key]
+		if item == nil {
+			item = &accum{paperCandidateScoreCohortReview: paperCandidateScoreCohortReview{
+				ScoreBand:         band,
+				EvidenceSentiment: sentiment,
+			}}
+			byKey[key] = item
+			order = append(order, key)
+		}
+		item.Candidates++
+		item.Evaluated += result.Evaluated
+		item.Decisive += result.Decisive
+		item.expectancySum += result.Expectancy * float64(result.Decisive)
+		item.pfSum += result.ProfitFactor * float64(result.Decisive)
+		if result.Action == "PAUSE" {
+			item.PauseActions++
+		}
+		if result.Action == "READY" {
+			item.ReadyActions++
+		}
+		if result.Decisive > 0 {
+			item.WinRate += result.WinRate * float64(result.Decisive)
+		}
+	}
+	out := make([]paperCandidateScoreCohortReview, 0, len(order))
+	for _, key := range order {
+		item := byKey[key]
+		if item.Decisive > 0 {
+			item.WinRate /= float64(item.Decisive)
+			item.Expectancy = item.expectancySum / float64(item.Decisive)
+			item.ProfitFactor = item.pfSum / float64(item.Decisive)
+		}
+		out = append(out, item.paperCandidateScoreCohortReview)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ScoreBand == out[j].ScoreBand {
+			return out[i].EvidenceSentiment < out[j].EvidenceSentiment
+		}
+		return out[i].ScoreBand < out[j].ScoreBand
+	})
+	return out
+}
+
+func printPaperCandidateScoreCohorts(output *Output, cohorts []paperCandidateScoreCohortReview) {
+	if len(cohorts) == 0 {
+		return
+	}
+	output.Println()
+	output.Bold("Score Cohort Review")
+	table := NewTable(output, "Band", "Evidence", "Candidates", "Eval", "Dec", "Win", "Expect", "PF", "Pause", "Ready")
+	for _, cohort := range cohorts {
+		table.AddRow(
+			cohort.ScoreBand,
+			cohort.EvidenceSentiment,
+			fmt.Sprintf("%d", cohort.Candidates),
+			fmt.Sprintf("%d", cohort.Evaluated),
+			fmt.Sprintf("%d", cohort.Decisive),
+			fmt.Sprintf("%.1f%%", cohort.WinRate),
+			FormatPercent(cohort.Expectancy),
+			fmt.Sprintf("%.2f", cohort.ProfitFactor),
+			fmt.Sprintf("%d", cohort.PauseActions),
+			fmt.Sprintf("%d", cohort.ReadyActions),
+		)
+	}
+	table.Render()
 }
 
 func printPaperCandidateRegimeReview(output *Output, results []paperCandidateReviewResult) {

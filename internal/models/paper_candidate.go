@@ -23,6 +23,13 @@ type PaperCandidate struct {
 	Reason              string
 	Days                int
 	Candles             int
+	SignalBars          int
+	BuySignals          int
+	SellSignals         int
+	HoldSignals         int
+	DirectionalSignals  int
+	SignalRatePct       float64
+	TradeConversionPct  float64
 	Trades              int
 	ValidationTrades    int
 	ReturnPct           float64
@@ -33,6 +40,13 @@ type PaperCandidate struct {
 	Expectancy          float64
 	MaxDrawdownPct      float64
 	SharpeRatio         float64
+	CandidateScore      float64
+	EvidenceScore       float64
+	EvidenceSentiment   string
+	EvidenceConfidence  float64
+	EvidenceSources     int
+	EvidenceError       string
+	ScoreReason         string
 	StopLossPercent     float64
 	TakeProfitPercent   float64
 	TrailingStopPercent float64
@@ -57,6 +71,7 @@ type PaperCandidateRegimeStat struct {
 
 // PaperCandidateFilter filters promoted paper-soak candidates.
 type PaperCandidateFilter struct {
+	ID       string
 	Symbol   string
 	Strategy string
 	Status   string

@@ -453,6 +453,18 @@ func getBoolParam(params map[string]interface{}, key string, defaultVal bool) bo
 	return defaultVal
 }
 
+func getStringParam(params map[string]interface{}, key string, defaultVal string) string {
+	if params == nil {
+		return defaultVal
+	}
+	if v, ok := params[key]; ok {
+		if val, ok := v.(string); ok && strings.TrimSpace(val) != "" {
+			return strings.TrimSpace(val)
+		}
+	}
+	return defaultVal
+}
+
 // GenerateEquityCurveASCII generates an ASCII chart of the equity curve.
 func (be *DefaultBacktestEngine) GenerateEquityCurveASCII(result *BacktestResult, width, height int) string {
 	if len(result.EquityCurve) == 0 {

@@ -31,7 +31,7 @@ var sensitiveFields = map[string]bool{
 var sensitivePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token|bearer|password)[=:\s]+["']?([^\s"']+)["']?`),
 	regexp.MustCompile(`(?i)(sk-[A-Za-z0-9]{20,})`),   // OpenAI keys
-	regexp.MustCompile(`(?i)(tvly-[A-Za-z0-9]{20,})`), // Tavily keys
+	regexp.MustCompile(`(?i)(tvly-[A-Za-z0-9]{20,})`), // Legacy web-search keys
 }
 
 // SafeLogger wraps zerolog.Logger to automatically mask sensitive data.
